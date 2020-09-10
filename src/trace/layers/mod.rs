@@ -106,6 +106,52 @@ pub trait Cursor<Storage> {
     fn reposition(&mut self, storage: &Storage, lower: usize, upper: usize);
 }
 
+/// A general-purpose container resembling `Vec<T>`.
+pub trait Container {
+    /// The type of contained item.
+    type Item;
+    /// Inserts an owned item.
+    fn push(&mut self, Self::Item);
+    /// Inserts a borrowed item.
+    fn copy(&mut self, &Self::Item);
+    /// Extends from a slice of items.
+    fn copy_slice(&mut self, &[Self::Item]);
+    /// Creates a new container.
+    fn new() -> Self;
+    /// Creates a new container with sufficient capacity.
+    fn with_capacity(usize) -> Self;
+    /// Reserves additional capacity.
+    fn reserve(&mut self, usize);
+    /// Creates a new container with sufficient capacity.
+    fn merge_capacity(&Self, &Self) -> Self;
+}
+
+impl<T: Clone> Container for Vec<T> {
+    type Item = T;
+    fn push(&mut self, item: T) {
+        self.push(item);
+    }
+    fn copy(&mut self, item: &T) {
+        self.push(item.clone());
+    }
+    fn copy_slice(&mut self, slice: &[T]) {
+        self.extend_from_slice(slice);
+    }
+    fn new() -> Self {
+        Vec::new()
+    }
+    fn with_capacity(size: usize) -> Self {
+        Vec::with_capacity(size)
+    }
+    fn reserve(&mut self, additional: usize) {
+        self.reserve(additional);
+    }
+    fn merge_capacity(cont1: &Self, cont2: &Self) -> Self {
+        Vec::with_capacity(cont1.len() + cont2.len())
+    }
+}
+
+
 /// Reports the number of elements satisfing the predicate.
 ///
 /// This methods *relies strongly* on the assumption that the predicate

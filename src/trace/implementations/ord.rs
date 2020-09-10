@@ -51,9 +51,10 @@ pub type OrdKeySpineAbom<K, T, R, O=usize> = Spine<K, (), T, R, Rc<Abomonated<Or
 #[derive(Debug, Abomonation)]
 pub struct OrdValBatch<K, V, T, R, O=usize>
 where
-    K: Ord,
-    V: Ord,
-    T: Lattice,
+    K: Ord+Clone,
+    V: Ord+Clone,
+	T: Clone+Lattice,
+	R: Clone,
     O: OrdOffset, <O as TryFrom<usize>>::Error: Debug, <O as TryInto<usize>>::Error: Debug
 {
     /// Where all the dataz is.
@@ -349,10 +350,10 @@ where
 /// A builder for creating layers from unsorted update tuples.
 pub struct OrdValBuilder<K, V, T, R, O=usize>
 where
-    K: Ord,
-    V: Ord,
-    T: Ord+Lattice,
-    R: Semigroup,
+    K: Ord+Clone,
+    V: Ord+Clone,
+    T: Ord+Clone+Lattice,
+    R: Clone+Semigroup,
     O: OrdOffset, <O as TryFrom<usize>>::Error: Debug, <O as TryInto<usize>>::Error: Debug
 {
     builder: OrderedBuilder<K, OrderedBuilder<V, OrderedLeafBuilder<T, R>, O>, O>,
@@ -399,8 +400,9 @@ where
 #[derive(Debug, Abomonation)]
 pub struct OrdKeyBatch<K, T, R, O=usize>
 where
-    K: Ord,
-    T: Lattice,
+    K: Ord+Clone,
+	T: Clone+Lattice,
+	R: Clone,
     O: OrdOffset, <O as TryFrom<usize>>::Error: Debug, <O as TryInto<usize>>::Error: Debug
 {
     /// Where all the dataz is.
@@ -413,7 +415,7 @@ impl<K, T, R, O> BatchReader<K, (), T, R> for OrdKeyBatch<K, T, R, O>
 where
     K: Ord+Clone+'static,
     T: Lattice+Ord+Clone+'static,
-    R: Semigroup,
+    R: Clone+Semigroup,
     O: OrdOffset, <O as TryFrom<usize>>::Error: Debug, <O as TryInto<usize>>::Error: Debug
 {
     type Cursor = OrdKeyCursor<T, R, O>;
@@ -672,9 +674,9 @@ where
 /// A builder for creating layers from unsorted update tuples.
 pub struct OrdKeyBuilder<K, T, R, O=usize>
 where
-    K: Ord,
-    T: Ord+Lattice,
-    R: Semigroup,
+    K: Ord+Clone,
+    T: Ord+Clone+Lattice,
+    R: Clone+Semigroup,
     O: OrdOffset, <O as TryFrom<usize>>::Error: Debug, <O as TryInto<usize>>::Error: Debug
 {
     builder: OrderedBuilder<K, OrderedLeafBuilder<T, R>, O>,
