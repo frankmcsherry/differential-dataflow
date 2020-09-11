@@ -197,29 +197,7 @@ where
 			}
 			else { false }
 		});
-		// for i in key_start .. layer.keys.len() {
-
-		// 	// NB: batch.layer.offs[i+1] must remain as is for the next iteration.
-		// 	//     instead, we update batch.layer.offs[i]
-
-		// 	let lower: usize = layer.offs[i].try_into().unwrap();
-		// 	let upper: usize = layer.offs[i+1].try_into().unwrap();
-
-		// 	layer.offs[i] = O::try_from(write_position).unwrap();
-
-		// 	// values should already be sorted, but some might now be empty.
-		// 	for index in lower .. upper {
-		// 		let val_lower: usize = layer.vals.offs[index].try_into().unwrap();
-		// 		let val_upper: usize = layer.vals.offs[index+1].try_into().unwrap();
-		// 		if val_lower < val_upper {
-		// 			layer.vals.keys.swap(write_position, index);
-		// 			layer.vals.offs[write_position+1] = layer.vals.offs[index+1];
-		// 			write_position += 1;
-		// 		}
-		// 	}
-		// 	// batch.layer.offs[i+1] = write_position;
-		// }
-		// layer.vals.keys.truncate(write_position);
+		debug_assert_eq!(write_position, layer.vals.keys.len());
 		layer.vals.offs.truncate(write_position + 1);
 		layer.offs[layer.keys.len()] = O::try_from(write_position).unwrap();
 
@@ -228,7 +206,7 @@ where
 		let mut write_position = key_start;
 		layer.keys.retain_from(key_start, |index, _item| {
 			let lower =	offs[index].try_into().unwrap();
-			let upper =	offs[index].try_into().unwrap();
+			let upper =	offs[index+1].try_into().unwrap();
 			if lower < upper {
 				offs[write_position+1] = offs[index+1];
 				write_position += 1;
@@ -236,6 +214,7 @@ where
 			}
 			else { false }
 		});
+		debug_assert_eq!(write_position, layer.keys.len());
 		layer.offs.truncate(layer.keys.len()+1);
 	}
 }
@@ -565,7 +544,7 @@ where
 		let mut write_position = key_start;
 		layer.keys.retain_from(key_start, |index, _item| {
 			let lower =	offs[index].try_into().unwrap();
-			let upper =	offs[index].try_into().unwrap();
+			let upper =	offs[index+1].try_into().unwrap();
 			if lower < upper {
 				offs[write_position+1] = offs[index+1];
 				write_position += 1;
@@ -573,6 +552,7 @@ where
 			}
 			else { false }
 		});
+		debug_assert_eq!(write_position, layer.keys.len());
 		layer.offs.truncate(layer.keys.len()+1);
 	}
 }
