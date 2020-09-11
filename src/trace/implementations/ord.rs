@@ -176,44 +176,67 @@ where
 		layer.vals.vals.vals.truncate(write_position);
 		layer.vals.offs[layer.vals.keys.len()] = O::try_from(write_position).unwrap();
 
-		// 3. For each `(key, off)` pair, (values already sorted), filter vals, and rewrite `off`.
-		//    This may leave `key` with an empty range. Filtering happens in step 4.
+		// 3. Remove values with empty histories. In addition, we need to update offsets
+		//    in `layer.offs` to correctly reference the potentially moved values.
 		let mut write_position = val_start;
-		for i in key_start .. layer.keys.len() {
-
-			// NB: batch.layer.offs[i+1] must remain as is for the next iteration.
-			//     instead, we update batch.layer.offs[i]
-
-			let lower: usize = layer.offs[i].try_into().unwrap();
-			let upper: usize = layer.offs[i+1].try_into().unwrap();
-
-			layer.offs[i] = O::try_from(write_position).unwrap();
-
-			// values should already be sorted, but some might now be empty.
-			for index in lower .. upper {
-				let val_lower: usize = layer.vals.offs[index].try_into().unwrap();
-				let val_upper: usize = layer.vals.offs[index+1].try_into().unwrap();
-				if val_lower < val_upper {
-					layer.vals.keys.swap(write_position, index);
-					layer.vals.offs[write_position+1] = layer.vals.offs[index+1];
-					write_position += 1;
-				}
+		let vals_off = &mut layer.vals.offs;
+		let mut keys_pos = key_start;
+		let keys_off = &mut layer.offs;
+		layer.vals.keys.retain_from(val_start, |index, _item| {
+			// As we pass each key offset, record its new position.
+			if index == keys_off[keys_pos].try_into().unwrap() {
+				keys_off[keys_pos] = O::try_from(write_position).unwrap();
+				keys_pos += 1;
 			}
-			// batch.layer.offs[i+1] = write_position;
-		}
-		layer.vals.keys.truncate(write_position);
+			let lower = vals_off[index].try_into().unwrap();
+			let upper =	vals_off[index+1].try_into().unwrap();
+			if lower < upper {
+				vals_off[write_position+1] = vals_off[index+1];
+				write_position += 1;
+				true
+			}
+			else { false }
+		});
+		// for i in key_start .. layer.keys.len() {
+
+		// 	// NB: batch.layer.offs[i+1] must remain as is for the next iteration.
+		// 	//     instead, we update batch.layer.offs[i]
+
+		// 	let lower: usize = layer.offs[i].try_into().unwrap();
+		// 	let upper: usize = layer.offs[i+1].try_into().unwrap();
+
+		// 	layer.offs[i] = O::try_from(write_position).unwrap();
+
+		// 	// values should already be sorted, but some might now be empty.
+		// 	for index in lower .. upper {
+		// 		let val_lower: usize = layer.vals.offs[index].try_into().unwrap();
+		// 		let val_upper: usize = layer.vals.offs[index+1].try_into().unwrap();
+		// 		if val_lower < val_upper {
+		// 			layer.vals.keys.swap(write_position, index);
+		// 			layer.vals.offs[write_position+1] = layer.vals.offs[index+1];
+		// 			write_position += 1;
+		// 		}
+		// 	}
+		// 	// batch.layer.offs[i+1] = write_position;
+		// }
+		// layer.vals.keys.truncate(write_position);
 		layer.vals.offs.truncate(write_position + 1);
 		layer.offs[layer.keys.len()] = O::try_from(write_position).unwrap();
 
 		// 4. Remove empty keys.
-		let offs = &layer.offs;
+		let offs = &mut layer.offs;
+		let mut write_position = key_start;
 		layer.keys.retain_from(key_start, |index, _item| {
-			offs[index].try_into().unwrap() < offs[index+1].try_into().unwrap()
+			let lower =	offs[index].try_into().unwrap();
+			let upper =	offs[index].try_into().unwrap();
+			if lower < upper {
+				offs[write_position+1] = offs[index+1];
+				write_position += 1;
+				true
+			}
+			else { false }
 		});
-
-		layer.offs.dedup();
-		// layer.keys.truncate(write_position);
-		layer.offs.truncate(layer.keys.len() + 1);
+		layer.offs.truncate(layer.keys.len()+1);
 	}
 }
 
@@ -538,24 +561,18 @@ where
 		layer.offs[layer.keys.len()] = O::try_from(write_position).unwrap();
 
 		// 4. Remove empty keys.
-		let offs = &layer.offs;
+		let offs = &mut layer.offs;
+		let mut write_position = key_start;
 		layer.keys.retain_from(key_start, |index, _item| {
-			offs[index].try_into().unwrap() < offs[index+1].try_into().unwrap()
+			let lower =	offs[index].try_into().unwrap();
+			let upper =	offs[index].try_into().unwrap();
+			if lower < upper {
+				offs[write_position+1] = offs[index+1];
+				write_position += 1;
+				true
+			}
+			else { false }
 		});
-		// let mut write_position = key_start;
-		// for i in key_start .. layer.keys.len() {
-
-		// 	let lower: usize = layer.offs[i].try_into().unwrap();
-		// 	let upper: usize = layer.offs[i+1].try_into().unwrap();
-
-		// 	if lower < upper {
-		// 		layer.keys.swap(write_position, i);
-		// 		// batch.layer.offs updated via `dedup` below; keeps me sane.
-		// 		write_position += 1;
-		// 	}
-		// }
-		layer.offs.dedup();
-		// layer.keys.truncate(write_position);
 		layer.offs.truncate(layer.keys.len()+1);
 	}
 }
