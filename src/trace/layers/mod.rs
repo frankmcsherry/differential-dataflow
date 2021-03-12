@@ -151,6 +151,33 @@ impl<T: Clone> Container for Vec<T> {
     }
 }
 
+use columnation::{Columnation, ColumnStack};
+impl<T: Columnation> Container for ColumnStack<T> {
+    type Item = T;
+    fn push(&mut self, item: T) {
+        self.copy(&item);
+    }
+    fn copy(&mut self, item: &T) {
+        self.copy(&item);
+    }
+    fn copy_slice(&mut self, slice: &[T]) {
+        for item in slice.iter() {
+            self.copy(item);
+        }
+    }
+    fn new() -> Self {
+        Self::default()
+    }
+    fn with_capacity(_size: usize) -> Self {
+        Self::default()
+    }
+    fn reserve(&mut self, _additional: usize) {
+    }
+    fn merge_capacity(_cont1: &Self, _cont2: &Self) -> Self {
+        Self::default()
+    }
+}
+
 
 /// Reports the number of elements satisfing the predicate.
 ///

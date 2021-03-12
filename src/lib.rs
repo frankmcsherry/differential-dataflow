@@ -92,6 +92,7 @@ impl<T: timely::ExchangeData + Ord + Debug> ExchangeData for T { }
 
 extern crate fnv;
 extern crate timely;
+extern crate columnation;
 
 #[macro_use]
 extern crate abomonation_derive;

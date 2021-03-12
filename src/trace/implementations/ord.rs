@@ -16,6 +16,8 @@ use std::ops::Deref;
 
 use timely::progress::{Antichain, frontier::AntichainRef};
 
+use columnation::{Columnation, ColumnStack};
+
 use ::difference::Semigroup;
 use lattice::Lattice;
 
@@ -47,6 +49,11 @@ pub type OrdKeySpine<K, T, R, O=usize> = Spine<K, (), T, R, Rc<OrdKeyBatch<K, T,
 /// A trace implementation for empty values using a spine of abomonated ordered lists.
 pub type OrdKeySpineAbom<K, T, R, O=usize> = Spine<K, (), T, R, Rc<Abomonated<OrdKeyBatch<K, T, R, O>, Vec<u8>>>>;
 
+/// A trace implementation backed by columnar storage.
+pub type ColValSpine<K, V, T, R, O=usize> = Spine<K, V, T, R, Rc<OrdValBatch<K, V, T, R, O, ColumnStack<K>, ColumnStack<V>>>>;
+/// A trace implementation backed by columnar storage.
+pub type ColKeySpine<K, T, R, O=usize> = Spine<K, (), T, R, Rc<OrdKeyBatch<K,  T, R, O, ColumnStack<K>>>>;
+
 
 /// A container that can retain/discard from some offset onward.
 pub trait RetainFrom<T> {
@@ -66,6 +73,17 @@ impl<T> RetainFrom<T> for Vec<T> {
 		}
 		self.truncate(write_position);
 	}
+}
+
+impl<T: Columnation> RetainFrom<T> for ColumnStack<T> {
+    fn retain_from<P: FnMut(usize, &T)->bool>(&mut self, index: usize, mut predicate: P) {
+        let mut position = index;
+        self.retain_from(index, |item| {
+            let result = predicate(position, item);
+            position += 1;
+            result
+        })
+    }
 }
 
 /// An immutable collection of update tuples, from a contiguous interval of logical times.
