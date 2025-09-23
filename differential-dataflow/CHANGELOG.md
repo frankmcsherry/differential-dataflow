@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/frankmcsherry/differential-dataflow/compare/differential-dataflow-v0.17.0...differential-dataflow-v0.18.0) - 2025-09-23
+
+### Other
+
+- Batcher implementation that has no opinions about chains, and columnar. ([#626](https://github.com/frankmcsherry/differential-dataflow/pull/626))
+
 ## [0.17.0](https://github.com/TimelyDataflow/differential-dataflow/compare/differential-dataflow-v0.16.2...differential-dataflow-v0.17.0) - 2025-09-15
 
 ### Other
