@@ -173,78 +173,35 @@ pub mod layout {
 pub use container::Column;
 mod container {
 
-    /// A container based on a columnar store, encoded in aligned bytes.
-    pub enum Column<C> {
-        /// The typed variant of the container.
-        Typed(C),
-        /// The binary variant of the container.
-        Bytes(timely::bytes::arc::Bytes),
-        /// Relocated, aligned binary data, if `Bytes` doesn't work for some reason.
-        ///
-        /// Reasons could include misalignment, cloning of data, or wanting
-        /// to release the `Bytes` as a scarce resource.
-        Align(std::sync::Arc<[u64]>),
-    }
+    use columnar::bytes::stash::Stash;
 
-    impl<C: Default> Default for Column<C> {
-        fn default() -> Self { Self::Typed(Default::default()) }
-    }
+    #[derive(Clone, Default)]
+    pub struct Column<C> { pub stash: Stash<C, timely::bytes::arc::Bytes> }
 
-    impl<C> Column<C> {
-        pub fn as_mut(&mut self) -> &mut C { if let Column::Typed(c) = self { c } else { panic!() }}
-    }
+    impl<C> From<C> for Column<C> { fn from(container: C) -> Self { Self { stash: Stash::Typed(container) } } }
 
-    // The clone implementation moves out of the `Bytes` variant into `Align`.
-    // This is optional and non-optimal, as the bytes clone is relatively free.
-    // But, we don't want to leak the uses of `Bytes`, is why we do this I think.
-    impl<C: columnar::Container> Clone for Column<C> where C: Clone {
-        fn clone(&self) -> Self {
-            match self {
-                Column::Typed(t) => Column::Typed(t.clone()),
-                Column::Bytes(b) => {
-                    assert!(b.len() % 8 == 0);
-                    let mut alloc: Vec<u64> = vec![0; b.len() / 8];
-                    bytemuck::cast_slice_mut(&mut alloc[..]).copy_from_slice(&b[..]);
-                    Self::Align(alloc.into())
-                },
-                Column::Align(a) => Column::Align(std::sync::Arc::clone(&a.clone())),
-            }
-        }
-        fn clone_from(&mut self, other: &Self) {
-            match (self, other) {
-                (Column::Typed(t0), Column::Typed(t1)) => {
-                    // Derived `Clone` implementations for e.g. tuples cannot be relied on to call `clone_from`.
-                    let t1 = t1.borrow();
-                    t0.clear();
-                    t0.extend_from_self(t1, 0..t1.len());
-                }
-                (Column::Align(a0), Column::Align(a1)) => { a0.clone_from(a1); }
-                (x, y) => { *x = y.clone(); }
-            }
-        }
-    }
-
-    use columnar::{Len, FromBytes};
-    use columnar::bytes::{EncodeDecode, Indexed};
+    use columnar::Len;
 
     impl<C: columnar::ContainerBytes> Column<C> {
         /// Borrows the contents no matter their representation.
-        ///
-        /// This function is meant to be efficient, but it cannot be relied on to be zero-cost.
-        /// Ideal uses would borrow a container infrequently, and access the borrowed form repeatedly.
-        #[inline(always)] pub fn borrow(&self) -> C::Borrowed<'_> {
-            match self {
-                Column::Typed(t) => t.borrow(),
-                Column::Bytes(b) => <C::Borrowed<'_> as FromBytes>::from_bytes(&mut Indexed::decode(bytemuck::cast_slice(b))),
-                Column::Align(a) => <C::Borrowed<'_> as FromBytes>::from_bytes(&mut Indexed::decode(a)),
-            }
-        }
+        #[inline(always)] pub fn borrow(&self) -> C::Borrowed<'_> { self.stash.borrow() }
+    }
 
+    impl<C: columnar::ContainerBytes> timely::Accountable for Column<C> {
+        #[inline] fn record_count(&self) -> i64 { i64::try_from(self.borrow().len()).unwrap() }
+        #[inline] fn is_empty(&self) -> bool { self.borrow().is_empty() }
+    }
+
+    impl<C> Column<C> {
+        pub fn as_mut(&mut self) -> &mut C { if let Stash::Typed(c) = &mut self.stash { c } else { panic!() }}
+    }
+
+    impl<C: columnar::ContainerBytes> Column<C> {
         pub fn into_typed(self) -> C where C: Default {
-            if let Column::Typed(c) = self { c }
+            if let Stash::Typed(c) = self.stash { c }
             else {
                 let mut result = C::default();
-                let borrow = self.borrow();
+                let borrow = self.stash.borrow();
                 result.extend_from_self(borrow, 0 .. borrow.len());
                 result
             }
@@ -252,44 +209,15 @@ mod container {
     }
 
     impl<C: columnar::Container, T> timely::container::PushInto<T> for Column<C> where C: columnar::Push<T> {
-        #[inline]
-        fn push_into(&mut self, item: T) {
-            match self {
-                Column::Typed(t) => t.push(item),
-                Column::Align(_) | Column::Bytes(_) => {
-                    // We really oughtn't be calling this in this case.
-                    // We could convert to owned, but need more constraints on `C`.
-                    unimplemented!("Pushing into Column::Bytes without first clearing");
-                }
-            }
-        }
+        #[inline] fn push_into(&mut self, item: T) { use columnar::Push; self.stash.push(item) }
     }
 
     impl<C: columnar::ContainerBytes> timely::dataflow::channels::ContainerBytes for Column<C> {
-        fn from_bytes(bytes: timely::bytes::arc::Bytes) -> Self {
-            // Our expectation / hope is that `bytes` is `u64` aligned and sized.
-            // If the alignment is borked, we can relocate. IF the size is borked,
-            // not sure what we do in that case.
-            assert!(bytes.len() % 8 == 0);
-            if bytemuck::try_cast_slice::<_, u64>(&bytes).is_ok() {
-                Self::Bytes(bytes)
-            }
-            else {
-                println!("Re-locating bytes for alignment reasons");
-                let mut alloc: Vec<u64> = vec![0; bytes.len() / 8];
-                bytemuck::cast_slice_mut(&mut alloc[..]).copy_from_slice(&bytes[..]);
-                Self::Align(alloc.into())
-            }
-        }
-
-        // Borrow rather than trust the sizes of the bytes themselves.
-        fn length_in_bytes(&self) -> usize { 8 * Indexed::length_in_words(&self.borrow()) }
-
-        // Borrow rather than trust the sizes of the bytes themselves.
-        fn into_bytes<W: ::std::io::Write>(&self, writer: &mut W) { Indexed::write(writer, &self.borrow()).unwrap() }
+        fn from_bytes(bytes: timely::bytes::arc::Bytes) -> Self { Self { stash: bytes.into() } }
+        fn length_in_bytes(&self) -> usize { self.stash.length_in_bytes() }
+        fn into_bytes<W: ::std::io::Write>(&self, writer: &mut W) { self.stash.into_bytes(writer) }
     }
 }
-
 
 pub use storage::val::ValStorage;
 pub use storage::key::KeyStorage;
@@ -297,21 +225,20 @@ pub mod storage {
 
     pub mod val {
 
-        use std::fmt::Debug;
         use columnar::{Borrow, Container, ContainerOf, Index, Len, Push};
         use columnar::Vecs;
 
+        use crate::Column;
         use crate::layout::ColumnarUpdate as Update;
 
         /// Trie-shaped update storage.
-        #[derive(Debug)]
         pub struct ValStorage<U: Update> {
             /// An ordered list of keys.
-            pub keys: ContainerOf<U::Key>,
+            pub keys: Column<ContainerOf<U::Key>>,
             /// For each key in `keys`, a list of values.
-            pub vals: Vecs<ContainerOf<U::Val>>,
+            pub vals: Column<Vecs<ContainerOf<U::Val>>>,
             /// For each val in `vals`, a list of (time, diff) updates.
-            pub upds: Vecs<(ContainerOf<U::Time>, ContainerOf<U::Diff>)>,
+            pub upds: Column<Vecs<(ContainerOf<U::Time>, ContainerOf<U::Diff>)>>,
         }
 
         impl<U: Update> Default for ValStorage<U> { fn default() -> Self { Self { keys: Default::default(), vals: Default::default(), upds: Default::default(), } } }
@@ -325,74 +252,81 @@ pub mod storage {
             /// Forms `Self` from sorted update tuples.
             pub fn form<'a>(mut sorted: impl Iterator<Item = columnar::Ref<'a, Tuple<U>>>) -> Self {
 
-                let mut output = Self::default();
+                // let mut output = Self::default();
+                let mut keys: ContainerOf<U::Key> = Default::default();
+                let mut vals: Vecs<ContainerOf<U::Val>> = Default::default();
+                let mut upds: Vecs<(ContainerOf<U::Time>, ContainerOf<U::Diff>)> = Default::default();
 
                 if let Some((key,val,time,diff)) = sorted.next() {
-                    output.keys.push(key);
-                    output.vals.values.push(val);
-                    output.upds.values.push((time, diff));
+                    keys.push(key);
+                    vals.values.push(val);
+                    upds.values.push((time, diff));
                     for (key,val,time,diff) in sorted {
                         let mut differs = false;
                         // We would now iterate over layers.
                         // We'll do that manually, as the types are all different.
                         // Keys first; non-standard logic because they are not (yet) a list of lists.
-                        let keys_len = output.keys.len();
-                        differs |= ContainerOf::<U::Key>::reborrow_ref(key) != output.keys.borrow().get(keys_len-1);
-                        if differs { output.keys.push(key); }
+                        let keys_len = keys.len();
+                        differs |= ContainerOf::<U::Key>::reborrow_ref(key) != keys.borrow().get(keys_len-1);
+                        if differs { keys.push(key); }
                         // Vals next
-                        let vals_len = output.vals.values.len();
-                        if differs { output.vals.bounds.push(vals_len as u64); }
-                        differs |= ContainerOf::<U::Val>::reborrow_ref(val) != output.vals.values.borrow().get(vals_len-1);
-                        if differs { output.vals.values.push(val); }
+                        let vals_len = vals.values.len();
+                        if differs { vals.bounds.push(vals_len as u64); }
+                        differs |= ContainerOf::<U::Val>::reborrow_ref(val) != vals.values.borrow().get(vals_len-1);
+                        if differs { vals.values.push(val); }
                         // Upds last
-                        let upds_len = output.upds.values.len();
-                        if differs { output.upds.bounds.push(upds_len as u64); }
+                        let upds_len = upds.values.len();
+                        if differs { upds.bounds.push(upds_len as u64); }
                         // differs |= ContainerOf::<(U::Time,U::Diff)>::reborrow_ref((time,diff)) != output.upds.values.borrow().get(upds_len-1);
                         differs = true;
-                        if differs { output.upds.values.push((time,diff)); }
+                        if differs { upds.values.push((time,diff)); }
                     }
                     // output.keys.bounds.push(vals_len as u64);
-                    output.vals.bounds.push(output.vals.values.len() as u64);
-                    output.upds.bounds.push(output.upds.values.len() as u64);
+                    vals.bounds.push(vals.values.len() as u64);
+                    upds.bounds.push(upds.values.len() as u64);
                 }
 
-                assert_eq!(output.keys.len(), output.vals.len());
-                assert_eq!(output.vals.values.len(), output.upds.len());
+                assert_eq!(keys.len(), vals.len());
+                assert_eq!(vals.values.len(), upds.len());
 
-                output
+                Self {
+                    keys: keys.into(),
+                    vals: vals.into(),
+                    upds: upds.into(),
+                }
             }
 
             pub fn vals_bounds(&self, range: Range<usize>) -> Range<usize> {
                 if !range.is_empty() {
-                    let lower = if range.start == 0 { 0 } else { Index::get(self.vals.bounds.borrow(), range.start-1) as usize };
-                    let upper = Index::get(self.vals.bounds.borrow(), range.end-1) as usize;
+                    let lower = if range.start == 0 { 0 } else { Index::get(self.vals.borrow().bounds, range.start-1) as usize };
+                    let upper = Index::get(self.vals.borrow().bounds, range.end-1) as usize;
                     lower .. upper
                 } else { range }
             }
 
             pub fn upds_bounds(&self, range: Range<usize>) -> Range<usize> {
                 if !range.is_empty() {
-                    let lower = if range.start == 0 { 0 } else { Index::get(self.upds.bounds.borrow(), range.start-1) as usize };
-                    let upper = Index::get(self.upds.bounds.borrow(), range.end-1) as usize;
+                    let lower = if range.start == 0 { 0 } else { Index::get(self.upds.borrow().bounds, range.start-1) as usize };
+                    let upper = Index::get(self.upds.borrow().bounds, range.end-1) as usize;
                     lower .. upper
                 } else { range }
             }
 
             /// Copies `other[range]` into self, keys and all.
             pub fn extend_from_keys(&mut self, other: &Self, range: Range<usize>) {
-                self.keys.extend_from_self(other.keys.borrow(), range.clone());
-                self.vals.extend_from_self(other.vals.borrow(), range.clone());
-                self.upds.extend_from_self(other.upds.borrow(), other.vals_bounds(range));
+                self.keys.as_mut().extend_from_self(other.keys.borrow(), range.clone());
+                self.vals.as_mut().extend_from_self(other.vals.borrow(), range.clone());
+                self.upds.as_mut().extend_from_self(other.upds.borrow(), other.vals_bounds(range));
             }
 
             pub fn extend_from_vals(&mut self, other: &Self, range: Range<usize>) {
-                self.vals.values.extend_from_self(other.vals.values.borrow(), range.clone());
-                self.upds.extend_from_self(other.upds.borrow(), range);
+                self.vals.as_mut().values.extend_from_self(other.vals.borrow().values, range.clone());
+                self.upds.as_mut().extend_from_self(other.upds.borrow(), range);
             }
         }
 
         impl<U: Update> timely::Accountable for ValStorage<U> {
-            #[inline] fn record_count(&self) -> i64 { use columnar::Len; self.upds.values.len() as i64 }
+            #[inline] fn record_count(&self) -> i64 { use columnar::Len; self.upds.borrow().values.len() as i64 }
         }
 
         use timely::dataflow::channels::ContainerBytes;
@@ -457,8 +391,8 @@ pub mod storage {
                 assert_eq!(keys.borrow().len(), upds.borrow().len());
 
                 Self {
-                    keys: Column::Typed(keys),
-                    upds: Column::Typed(upds),
+                    keys: keys.into(),
+                    upds: upds.into(),
                 }
             }
 
@@ -681,7 +615,6 @@ mod distributor {
             fn partition<T: Clone, P: timely::communication::Push<Message<T, KeyStorage<U>>>>(&mut self, container: &mut KeyStorage<U>, time: &T, pushers: &mut [P]) {
 
                 use columnar::{ContainerOf, Vecs, Container, Push};
-                use crate::Column;
 
                 let in_keys = container.keys.borrow();
                 let in_upds = container.upds.borrow();
@@ -698,7 +631,7 @@ mod distributor {
                 }
 
                 for ((pusher, keys), upds) in pushers.iter_mut().zip(out_keys).zip(out_upds) {
-                    let mut container = KeyStorage { keys: Column::Typed(keys), upds: Column::Typed(upds) };
+                    let mut container = KeyStorage { keys: keys.into(), upds: upds.into() };
                     Message::push_at(&mut container, time.clone(), pusher);
                 }
             }
@@ -825,7 +758,7 @@ pub mod arrangement {
 
         impl<U: Update> chainless::BatcherStorage<U::Time> for ValStorage<U> {
 
-            fn len(&self) -> usize { self.upds.values.len() }
+            fn len(&self) -> usize { self.upds.borrow().values.len() }
 
             #[inline(never)]
             fn merge(self, other: Self) -> Self {
@@ -834,10 +767,15 @@ pub mod arrangement {
                 let mut that_sum = U::Diff::default();
 
                 let mut merged = Self::default();
+
                 let this = self;
                 let that = other;
                 let this_keys = this.keys.borrow();
+                let this_vals = this.vals.borrow();
+                let this_upds = this.upds.borrow();
                 let that_keys = that.keys.borrow();
+                let that_vals = that.vals.borrow();
+                let that_upds = that.upds.borrow();
                 let mut this_key_range = 0 .. this_keys.len();
                 let mut that_key_range = 0 .. that_keys.len();
                 while !this_key_range.is_empty() && !that_key_range.is_empty() {
@@ -852,58 +790,59 @@ pub mod arrangement {
                         std::cmp::Ordering::Equal => {
                             // keys are equal; must make a bespoke vals list.
                             // only push the key if merged.vals.values.len() advances.
-                            let values_len = merged.vals.values.len();
+                            let values_len = merged.vals.borrow().values.len();
                             let mut this_val_range = this.vals_bounds(this_key_range.start .. this_key_range.start+1);
                             let mut that_val_range = that.vals_bounds(that_key_range.start .. that_key_range.start+1);
                             while !this_val_range.is_empty() && !that_val_range.is_empty() {
-                                let this_val = this.vals.values.borrow().get(this_val_range.start);
-                                let that_val = that.vals.values.borrow().get(that_val_range.start);
+                                let this_val = this_vals.values.get(this_val_range.start);
+                                let that_val = that_vals.values.get(that_val_range.start);
                                 match this_val.cmp(&that_val) {
                                     std::cmp::Ordering::Less => {
                                         let lower = this_val_range.start;
-                                        gallop(this.vals.values.borrow(), &mut this_val_range, |x| x < that_val);
+                                        gallop(this_vals.values, &mut this_val_range, |x| x < that_val);
                                         merged.extend_from_vals(&this, lower .. this_val_range.start);
                                     },
                                     std::cmp::Ordering::Equal => {
                                         // vals are equal; must make a bespoke upds list.
                                         // only push the val if merged.upds.values.len() advances.
-                                        let updates_len = merged.upds.values.len();
+                                        let updates_len = merged.upds.borrow().values.len();
                                         let mut this_upd_range = this.upds_bounds(this_val_range.start .. this_val_range.start+1);
                                         let mut that_upd_range = that.upds_bounds(that_val_range.start .. that_val_range.start+1);
 
                                         while !this_upd_range.is_empty() && !that_upd_range.is_empty() {
-                                            let (this_time, this_diff) = this.upds.values.borrow().get(this_upd_range.start);
-                                            let (that_time, that_diff) = that.upds.values.borrow().get(that_upd_range.start);
+                                            let (this_time, this_diff) = this_upds.values.get(this_upd_range.start);
+                                            let (that_time, that_diff) = that_upds.values.get(that_upd_range.start);
                                             match this_time.cmp(&that_time) {
                                                 std::cmp::Ordering::Less => {
                                                     let lower = this_upd_range.start;
-                                                    gallop(this.upds.values.0.borrow(), &mut this_upd_range, |x| x < that_time);
-                                                    merged.upds.values.extend_from_self(this.upds.values.borrow(), lower .. this_upd_range.start);
+                                                    gallop(this_upds.values.0, &mut this_upd_range, |x| x < that_time);
+                                                    merged.upds.as_mut().values.extend_from_self(this_upds.values, lower .. this_upd_range.start);
                                                 },
                                                 std::cmp::Ordering::Equal => {
                                                     // times are equal; must add diffs.
                                                     this_sum.copy_from(this_diff);
                                                     that_sum.copy_from(that_diff);
                                                     this_sum.plus_equals(&that_sum);
-                                                    if !this_sum.is_zero() { merged.upds.values.push((this_time, &this_sum)); }
+                                                    if !this_sum.is_zero() { merged.upds.as_mut().values.push((this_time, &this_sum)); }
                                                     // Advance the update ranges by one.
                                                     this_upd_range.start += 1;
                                                     that_upd_range.start += 1;
                                                 },
                                                 std::cmp::Ordering::Greater => {
                                                     let lower = that_upd_range.start;
-                                                    gallop(that.upds.values.0.borrow(), &mut that_upd_range, |x| x < this_time);
-                                                    merged.upds.values.extend_from_self(that.upds.values.borrow(), lower .. that_upd_range.start);
+                                                    gallop(that_upds.values.0, &mut that_upd_range, |x| x < this_time);
+                                                    merged.upds.as_mut().values.extend_from_self(that_upds.values, lower .. that_upd_range.start);
                                                 },
                                             }
                                         }
                                         // Extend with the remaining this and that updates.
-                                        merged.upds.values.extend_from_self(this.upds.values.borrow(), this_upd_range);
-                                        merged.upds.values.extend_from_self(that.upds.values.borrow(), that_upd_range);
+                                        merged.upds.as_mut().values.extend_from_self(this_upds.values, this_upd_range);
+                                        merged.upds.as_mut().values.extend_from_self(that_upds.values, that_upd_range);
                                         // Seal the updates and push the val.
-                                        if merged.upds.values.len() > updates_len {
-                                            merged.upds.bounds.push(merged.upds.values.len() as u64);
-                                            merged.vals.values.push(this_val);
+                                        if merged.upds.borrow().values.len() > updates_len {
+                                            let merged_upds_len = merged.upds.borrow().values.len() as u64;
+                                            merged.upds.as_mut().bounds.push(merged_upds_len);
+                                            merged.vals.as_mut().values.push(this_val);
                                         }
                                         // Advance the val ranges by one.
                                         this_val_range.start += 1;
@@ -911,7 +850,7 @@ pub mod arrangement {
                                     },
                                     std::cmp::Ordering::Greater => {
                                         let lower = that_val_range.start;
-                                        gallop(that.vals.values.borrow(), &mut that_val_range, |x| x < this_val);
+                                        gallop(that_vals.values, &mut that_val_range, |x| x < this_val);
                                         merged.extend_from_vals(&that, lower .. that_val_range.start);
                                     },
                                 }
@@ -920,9 +859,10 @@ pub mod arrangement {
                             merged.extend_from_vals(&this, this_val_range);
                             merged.extend_from_vals(&that, that_val_range);
                             // Seal the values and push the key.
-                            if merged.vals.values.len() > values_len {
-                                merged.vals.bounds.push(merged.vals.values.len() as u64);
-                                merged.keys.push(this_key);
+                            if merged.vals.borrow().values.len() > values_len {
+                                let merged_vals_len = merged.vals.borrow().values.len() as u64;
+                                merged.vals.as_mut().bounds.push(merged_vals_len);
+                                merged.keys.as_mut().push(this_key);
                             }
                             // Advance the key ranges by one.
                             this_key_range.start += 1;
@@ -945,43 +885,52 @@ pub mod arrangement {
             #[inline(never)]
             fn split(&mut self, frontier: AntichainRef<U::Time>) -> Self {
                 // Unfortunately the times are at the leaves, so there can be no bulk copying.
+
+                let keys = self.keys.borrow();
+                let vals = self.vals.borrow();
+                let upds = self.upds.borrow();
+
                 let mut ship = Self::default();
                 let mut keep = Self::default();
                 let mut time = U::Time::default();
-                for key_idx in 0 .. self.keys.len() {
-                    let key = self.keys.borrow().get(key_idx);
-                    let keep_vals_len = keep.vals.values.len();
-                    let ship_vals_len = ship.vals.values.len();
+                for key_idx in 0 .. keys.len() {
+                    let key = keys.get(key_idx);
+                    let keep_vals_len = keep.vals.borrow().values.len();
+                    let ship_vals_len = ship.vals.borrow().values.len();
                     for val_idx in self.vals_bounds(key_idx..key_idx+1) {
-                        let val = self.vals.values.borrow().get(val_idx);
-                        let keep_upds_len = keep.upds.values.len();
-                        let ship_upds_len = ship.upds.values.len();
+                        let val = vals.values.get(val_idx);
+                        let keep_upds_len = keep.upds.borrow().values.len();
+                        let ship_upds_len = ship.upds.borrow().values.len();
                         for upd_idx in self.upds_bounds(val_idx..val_idx+1) {
-                            let (t, diff) = self.upds.values.borrow().get(upd_idx);
+                            let (t, diff) = upds.values.get(upd_idx);
                             time.copy_from(t);
                             if frontier.less_equal(&time) {
-                                keep.upds.values.push((t, diff));
+                                keep.upds.as_mut().values.push((t, diff));
                             }
                             else {
-                                ship.upds.values.push((t, diff));
+                                ship.upds.as_mut().values.push((t, diff));
                             }
                         }
-                        if keep.upds.values.len() > keep_upds_len {
-                            keep.upds.bounds.push(keep.upds.values.len() as u64);
-                            keep.vals.values.push(val);
+                        if keep.upds.borrow().values.len() > keep_upds_len {
+                            let keep_upds_len = keep.upds.borrow().values.len() as u64;
+                            keep.upds.as_mut().bounds.push(keep_upds_len);
+                            keep.vals.as_mut().values.push(val);
                         }
-                        if ship.upds.values.len() > ship_upds_len {
-                            ship.upds.bounds.push(ship.upds.values.len() as u64);
-                            ship.vals.values.push(val);
+                        if ship.upds.borrow().values.len() > ship_upds_len {
+                            let ship_upds_len = ship.upds.borrow().values.len() as u64;
+                            ship.upds.as_mut().bounds.push(ship_upds_len);
+                            ship.vals.as_mut().values.push(val);
                         }
                     }
-                    if keep.vals.values.len() > keep_vals_len {
-                        keep.vals.bounds.push(keep.vals.values.len() as u64);
-                        keep.keys.push(key);
+                    if keep.vals.borrow().values.len() > keep_vals_len {
+                        let keep_vals_len = keep.vals.borrow().values.len() as u64;
+                        keep.vals.as_mut().bounds.push(keep_vals_len);
+                        keep.keys.as_mut().push(key);
                     }
-                    if ship.vals.values.len() > ship_vals_len {
-                        ship.vals.bounds.push(ship.vals.values.len() as u64);
-                        ship.keys.push(key);
+                    if ship.vals.borrow().values.len() > ship_vals_len {
+                        let ship_vals_len = ship.vals.borrow().values.len() as u64;
+                        ship.vals.as_mut().bounds.push(ship_vals_len);
+                        ship.keys.as_mut().push(key);
                     }
                 }
 
@@ -991,7 +940,7 @@ pub mod arrangement {
 
             fn lower(&self, frontier: &mut Antichain<U::Time>) {
                 use columnar::Columnar;
-                let mut times = self.upds.values.0.borrow().into_index_iter();
+                let mut times = self.upds.borrow().values.0.into_index_iter();
                 if let Some(time_ref) = times.next() {
                     let mut time = <U::Time as Columnar>::into_owned(time_ref);
                     frontier.insert_ref(&time);
@@ -1097,7 +1046,6 @@ pub mod arrangement {
             fn split(&mut self, frontier: AntichainRef<U::Time>) -> Self {
                 // Unfortunately the times are at the leaves, so there can be no bulk copying.
 
-                use crate::Column;
                 use columnar::{ContainerOf, Vecs};
 
                 let mut ship_keys: ContainerOf<U::Key> = Default::default();
@@ -1130,14 +1078,14 @@ pub mod arrangement {
                     }
                 }
 
-                self.keys = Column::Typed(keep_keys);
-                self.upds = Column::Typed(keep_upds);
+                self.keys = keep_keys.into();
+                self.upds = keep_upds.into();
 
                 // *self = keep;
                 // ship
                 Self {
-                    keys: Column::Typed(ship_keys),
-                    upds: Column::Typed(ship_upds),
+                    keys: ship_keys.into(),
+                    upds: ship_upds.into(),
                 }
             }
 
@@ -1222,17 +1170,20 @@ pub mod arrangement {
                     else if chain.len() == 1 {
                         use columnar::Len;
                         let storage = chain.pop().unwrap();
-                        let updates = storage.upds.len();
+                        let updates = storage.upds.borrow().len();
+                        let keys = storage.keys.into_typed();
+                        let vals = storage.vals.into_typed();
+                        let upds = storage.upds.into_typed();
                         let storage = OrdValStorage {
-                            keys: Coltainer { container: storage.keys },
+                            keys: Coltainer { container: keys },
                             vals: Vals {
-                                offs: vec_u64_to_offset_list(storage.vals.bounds),
-                                vals: Coltainer { container: storage.vals.values },
+                                offs: vec_u64_to_offset_list(vals.bounds),
+                                vals: Coltainer { container: vals.values },
                             },
                             upds: Upds {
-                                offs: vec_u64_to_offset_list(storage.upds.bounds),
-                                times: Coltainer { container: storage.upds.values.0 },
-                                diffs: Coltainer { container: storage.upds.values.1 },
+                                offs: vec_u64_to_offset_list(upds.bounds),
+                                times: Coltainer { container: upds.values.0 },
+                                diffs: Coltainer { container: upds.values.1 },
                             },
                         };
                         OrdValBatch { storage, description, updates }
