@@ -20,7 +20,7 @@ rand="0.4"
 itertools="^0.13"
 graph_map = "0.1"
 bytemuck = "1.18.0"
-mimalloc = "0.1.48"
+mimalloc = { version = "0.1.48", features = ["v3"] }
 
 [dependencies]
 columnar = { workspace = true }
