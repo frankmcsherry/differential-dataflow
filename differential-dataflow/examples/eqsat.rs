@@ -2,7 +2,7 @@ use timely::dataflow::operators::probe::Handle;
 
 use differential_dataflow::{
     input::InputSession,
-    operators::{Join, Iterate, Reduce, Threshold},
+    operators::Iterate,
 };
 
 // Types for representing an AST as a collection of data.
@@ -29,17 +29,17 @@ fn main() {
 
             // Iteratively develop a map from `Name` to `Name` that closes `equiv` under congruence.
             // Specifically, pairs `(a, b)` where a >= b and b names the equivalence class of a.
-            nodes
+            nodes.clone()
                 .map(|(name, _)| (name, name))
-                .iterate(|eq_class| {
+                .iterate(|_, eq_class| {
 
                     // Collection is loop invariant, but must be brought in scope.
-                    let nodes = nodes.enter(&eq_class.scope());
-                    let equiv = equiv.enter(&eq_class.scope());
+                    let nodes = nodes.enter(eq_class.scope());
+                    let equiv = equiv.enter(eq_class.scope());
 
                     // Separate AST node operators and their arguments.
-                    let ops  = nodes.map(|(name, (op, _))| (name, op));
-                    let args = nodes.flat_map(|(name, (_, args))| args.into_iter().enumerate().map(move |(index, arg)| (arg, (name, index))));
+                    let ops  = nodes.clone().map(|(name, (op, _))| (name, op));
+                    let args = nodes.clone().flat_map(|(name, (_, args))| args.into_iter().enumerate().map(move |(index, arg)| (arg, (name, index))));
 
                     // Update argument identifiers, and then equate `(Ops, Args)` tuples to inform equivalences.
                     let equivalent_asts =
@@ -51,8 +51,8 @@ fn main() {
                             }
                             output.push((args, 1isize));
                         })
-                        .join_map(&ops, |node, children, op| ((children.clone(), op.clone()), *node))
-                        .concat(&nodes.filter(|(_, (_, args))| args.is_empty()).map(|(node, (op, _))| ((vec![], op), node)))
+                        .join_map(ops, |node, children, op| ((children.clone(), op.clone()), *node))
+                        .concat(nodes.filter(|(_, (_, args))| args.is_empty()).map(|(node, (op, _))| ((vec![], op), node)))
                         .reduce(|_key, input, output| {
                             for node in input.iter() {
                                 output.push(((*(node.0), *input[0].0), 1));
@@ -62,10 +62,10 @@ fn main() {
 
                     // Blend exogenous and endogenous equivalence; find connected components.
                     // NB: don't *actually* write connected components this way
-                    let edges = equivalent_asts.concat(&equiv);
-                    let symms = edges.map(|(x,y)|(y,x)).concat(&edges);
-                    symms.iterate(|reach| 
-                        reach.join_map(&reach, |_b, a, c| (*a, *c))
+                    let edges = equivalent_asts.concat(equiv);
+                    let symms = edges.clone().map(|(x,y)|(y,x)).concat(edges);
+                    symms.iterate(|_, reach|
+                        reach.clone().join_map(reach, |_b, a, c| (*a, *c))
                              .distinct()
                     )
                     .reduce(|_a, input, output| output.push((*input[0].0, 1)))
