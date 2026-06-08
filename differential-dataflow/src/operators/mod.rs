@@ -36,7 +36,7 @@ impl<V: Copy, T: Ord + Lattice, D: crate::difference::Semigroup> EditList<V, T, 
     /// Walks the cursor's vals at the current key into `self`, advancing times by `meet` if supplied.
     ///
     /// The cursor is assumed to be positioned at a key already; callers that need
-    /// to seek should use [`Cursor::populate_key`] (or [`ValueHistory::replay_key`])
+    /// to seek should use [`Cursor::populate_key`] (or [`ValueHistory::replay_staged`])
     /// instead. This split avoids a redundant seek in the merge-join inner loop,
     /// where the cursor is positioned by the upstream merge step.
     fn load<'a, C>(&mut self, cursor: &mut C, storage: &'a C::Storage, meet: Option<&T>)
@@ -89,11 +89,11 @@ impl<V: Copy, T: Ord + Lattice, D: crate::difference::Semigroup> EditList<V, T, 
 
 struct ValueHistory<V, T, D> {
     edits: EditList<V, T, D>,
-    history: Vec<(T, T, usize, usize)>,     // (time, meet, value_index, edit_offset)
+    history: Vec<(T, T, V, D)>,             // (time, meet, value, diff)
     buffer: Vec<((V, T), D)>,               // where we accumulate / collapse updates.
 }
 
-impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: crate::difference::Semigroup> ValueHistory<V, T, D> {
+impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::difference::Semigroup> ValueHistory<V, T, D> {
     fn new() -> Self {
         ValueHistory {
             edits: EditList::new(),
@@ -107,10 +107,36 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: crate::difference::Semigroup> V
         self.buffer.clear();
     }
 
-    /// Loads and replays a specified key.
+    /// Organizes history based on current contents of edits.
     ///
-    /// If the key is absent, the replayed history will be empty.
-    fn replay_key<'a, 'history, C>(
+    /// Used by `join`, which fills `edits` from a positioned cursor via
+    /// [`EditList::load`] and then replays. (`reduce` uses [`replay_staged`](Self::replay_staged).)
+    fn replay<'history>(&'history mut self) -> HistoryReplay<'history, V, T, D> {
+
+        self.buffer.clear();
+        self.history.clear();
+        for value_index in 0 .. self.edits.values.len() {
+            let lower = if value_index > 0 { self.edits.values[value_index-1].1 } else { 0 };
+            let upper = self.edits.values[value_index].1;
+            let value = self.edits.values[value_index].0;
+            for edit_index in lower .. upper {
+                let time = self.edits.edits[edit_index].0.clone();
+                let diff = self.edits.edits[edit_index].1.clone();
+                self.history.push((time.clone(), time, value, diff));
+            }
+        }
+        self.sort_history();
+        HistoryReplay { replay: self }
+    }
+
+    /// Loads and replays `key` by walking `cursor` directly into `history`,
+    /// advancing times by `meet` — *without* the intermediate `EditList` copy.
+    ///
+    /// This is the read-through-staging path: the cursor (e.g. a `StagingCursor`
+    /// over an unloaded key range) is walked once into the sorted `history`,
+    /// carrying the value and diff inline, so there is no separate per-key
+    /// `EditList` materialization. If the key is absent the history is empty.
+    fn replay_staged<'a, 'history, C>(
         &'history mut self,
         cursor: &mut C,
         storage: &'a C::Storage,
@@ -120,29 +146,30 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: crate::difference::Semigroup> V
     where
         C: Cursor<Val<'a> = V, Time = T, Diff = D>,
     {
-        self.clear();
-        cursor.populate_key(storage, key, meet, &mut self.edits);
-        self.replay()
-    }
-
-    /// Organizes history based on current contents of edits.
-    fn replay<'history>(&'history mut self) -> HistoryReplay<'history, V, T, D> {
-
         self.buffer.clear();
         self.history.clear();
-        for value_index in 0 .. self.edits.values.len() {
-            let lower = if value_index > 0 { self.edits.values[value_index-1].1 } else { 0 };
-            let upper = self.edits.values[value_index].1;
-            for edit_index in lower .. upper {
-                let time = self.edits.edits[edit_index].0.clone();
-                self.history.push((time.clone(), time, value_index, edit_index));
+        cursor.seek_key(storage, key);
+        if cursor.get_key(storage) == Some(key) {
+            cursor.rewind_vals(storage);
+            while let Some(val) = cursor.get_val(storage) {
+                cursor.map_times(storage, |t, d| {
+                    let mut time = C::owned_time(t);
+                    if let Some(meet) = meet { time.join_assign(meet); }
+                    self.history.push((time.clone(), time, val, C::owned_diff(d)));
+                });
+                cursor.step_val(storage);
             }
         }
-
-        self.history.sort_by(|x,y| y.cmp(x));
-        self.history.iter_mut().reduce(|prev, cur| { cur.1.meet_assign(&prev.1); cur });
-
+        self.sort_history();
         HistoryReplay { replay: self }
+    }
+
+    /// Sorts `history` by time (descending) and folds the per-suffix meet into the
+    /// second field, so `history.last()` carries the meet of all remaining times.
+    /// Keyed on `(time, value)` to avoid requiring `Ord` on the diff type.
+    fn sort_history(&mut self) {
+        self.history.sort_by(|x, y| (&y.0, &y.2).cmp(&(&x.0, &x.2)));
+        self.history.iter_mut().reduce(|prev, cur| { cur.1.meet_assign(&prev.1); cur });
     }
 }
 
@@ -154,7 +181,7 @@ impl<'history, V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::differ
     fn time(&self) -> Option<&T> { self.replay.history.last().map(|x| &x.0) }
     fn meet(&self) -> Option<&T> { self.replay.history.last().map(|x| &x.1) }
     fn edit(&self) -> Option<(V, &T, &D)> {
-        self.replay.history.last().map(|&(ref t, _, v, e)| (self.replay.edits.values[v].0, t, &self.replay.edits.edits[e].1))
+        self.replay.history.last().map(|(t, _, v, d)| (*v, t, d))
     }
 
     fn buffer(&self) -> &[((V, T), D)] {
@@ -162,8 +189,8 @@ impl<'history, V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::differ
     }
 
     fn step(&mut self) {
-        let (time, _, value_index, edit_offset) = self.replay.history.pop().unwrap();
-        self.replay.buffer.push(((self.replay.edits.values[value_index].0, time), self.replay.edits.edits[edit_offset].1.clone()));
+        let (time, _, value, diff) = self.replay.history.pop().unwrap();
+        self.replay.buffer.push(((value, time), diff));
     }
     fn step_while_time_is(&mut self, time: &T) -> bool {
         let mut found = false;

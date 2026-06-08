@@ -10,6 +10,8 @@
 pub mod cursor;
 pub mod description;
 pub mod implementations;
+pub mod staging;
+pub mod unload;
 pub mod wrappers;
 
 use timely::container::PushInto;

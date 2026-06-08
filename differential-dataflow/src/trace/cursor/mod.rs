@@ -77,6 +77,38 @@ pub trait Cursor : LayoutExt {
         }
     }
 
+    /// Loads `staging` with all updates associated with `key`, advancing each time
+    /// by `meet` (if supplied) and consolidating per value.
+    ///
+    /// The container-filling counterpart to [`populate_key`](Cursor::populate_key)'s
+    /// `EditList` fill: `staging` is cleared first, a value whose updates all
+    /// consolidate away is dropped, and the key is sealed iff it is present. The
+    /// cursor is positioned by an internal `seek_key`, like `populate_key`.
+    fn populate_staging<'a>(
+        &mut self,
+        storage: &'a Self::Storage,
+        key: Self::Key<'a>,
+        meet: Option<&Self::Time>,
+        staging: &mut crate::trace::staging::Staging<Self::Layout>,
+    ) {
+        use crate::lattice::Lattice;
+        staging.clear();
+        self.seek_key(storage, key);
+        if self.get_key(storage) == Some(key) {
+            self.rewind_vals(storage);
+            while let Some(val) = self.get_val(storage) {
+                self.map_times(storage, |time, diff| {
+                    let mut time = Self::owned_time(time);
+                    if let Some(meet) = meet { time.join_assign(meet); }
+                    staging.stage_update(time, Self::owned_diff(diff));
+                });
+                staging.seal_scratch_val(val);
+                self.step_val(storage);
+            }
+            staging.seal_key(key);
+        }
+    }
+
     /// Rewinds the cursor and outputs its contents to a Vec
     fn to_vec<K, IK, V, IV>(&mut self, storage: &Self::Storage, into_key: IK, into_val: IV) -> Vec<((K, V), Vec<(Self::Time, Self::Diff)>)>
     where

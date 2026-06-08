@@ -16,6 +16,8 @@ use crate::operators::arrange::{Arranged, TraceAgent};
 use crate::trace::{BatchReader, Cursor, Trace, Builder, ExertionLogic, Description};
 use crate::trace::cursor::CursorList;
 use crate::trace::implementations::containers::BatchContainer;
+use crate::trace::staging::Staging;
+use crate::trace::unload::Unload;
 use crate::trace::TraceReader;
 
 /// A key-wise reduction of values in an input trace.
@@ -131,6 +133,34 @@ where
                         let (mut output_cursor, ref output_storage): (Tr2::Cursor, _) = output_reader.cursor_through(lower_limit.borrow()).expect("failed to acquire output cursor");
                         let (mut batch_cursor, ref batch_storage) = (CursorList::new(batch_cursors, &batch_storage), batch_storage);
 
+                        // Read the input and output histories through staging. We extract the
+                        // keys we will work on — those in the batch or pending — once, up front,
+                        // into staging areas that then stay immutable for the rest of this
+                        // invocation. The per-key histories borrow these exactly as they
+                        // borrowed the trace storage; filling once (rather than per key) is what
+                        // keeps that borrow stable. `extract` drops keys absent from a trace,
+                        // reproducing a cursor seek that misses.
+                        let mut work_keys: Vec<Tr1::Key<'_>> = Vec::new();
+                        batch_cursor.rewind_keys(batch_storage);
+                        while let Some(key) = batch_cursor.get_key(batch_storage) {
+                            work_keys.push(key);
+                            batch_cursor.step_key(batch_storage);
+                        }
+                        for index in 0 .. pending_keys.len() {
+                            work_keys.push(pending_keys.index(index));
+                        }
+                        work_keys.sort();
+                        work_keys.dedup();
+                        batch_cursor.rewind_keys(batch_storage);
+
+                        let mut source_staging: Staging<_> = Default::default();
+                        source_cursor.extract(source_storage, &work_keys, &mut source_staging);
+                        let mut output_staging: Staging<_> = Default::default();
+                        output_cursor.extract(output_storage, &work_keys, &mut output_staging);
+                        drop(work_keys);
+                        let mut source_staged = source_staging.cursor();
+                        let mut output_staged = output_staging.cursor();
+
                         // Prepare an output buffer and builder for each capability.
                         // TODO: It would be better if all updates went into one batch, but timely dataflow prevents
                         //       this as long as it requires that there is only one capability for each message.
@@ -182,8 +212,8 @@ where
                                 // do the per-key computation.
                                 thinker.compute(
                                     key,
-                                    (&mut source_cursor, source_storage),
-                                    (&mut output_cursor, output_storage),
+                                    (&mut source_staged, &source_staging),
+                                    (&mut output_staged, &output_staging),
                                     (&mut batch_cursor, batch_storage),
                                     &interesting_times,
                                     &mut logic,
@@ -388,7 +418,7 @@ mod history_replay {
             // loaded times by performing the lattice `join` with this value.
 
             // Load the batch contents.
-            let mut batch_replay = self.batch_history.replay_key(batch_cursor, batch_storage, key, None);
+            let mut batch_replay = self.batch_history.replay_staged(batch_cursor, batch_storage, key, None);
 
             // We determine the meet of times we must reconsider (those from `batch` and `times`). This meet
             // can be used to advance other historical times, which may consolidate their representation. As
@@ -412,9 +442,9 @@ mod history_replay {
 
             // Load the input and output histories.
             let mut input_replay =
-            self.input_history.replay_key(source_cursor, source_storage, key, meet.as_ref());
+            self.input_history.replay_staged(source_cursor, source_storage, key, meet.as_ref());
             let mut output_replay =
-            self.output_history.replay_key(output_cursor, output_storage, key, meet.as_ref());
+            self.output_history.replay_staged(output_cursor, output_storage, key, meet.as_ref());
 
             self.synth_times.clear();
             self.times_current.clear();

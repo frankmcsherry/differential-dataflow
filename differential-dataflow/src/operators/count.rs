@@ -12,6 +12,8 @@ use crate::hashable::Hashable;
 use crate::collection::AsCollection;
 use crate::operators::arrange::Arranged;
 use crate::trace::{BatchReader, Cursor, TraceReader};
+use crate::trace::staging::Staging;
+use crate::trace::unload::Unload;
 
 /// Extension trait for the `count` differential dataflow method.
 pub trait CountTotal<'scope, T: Timestamp + TotalOrder + Lattice, K: ExchangeData, R: Semigroup> : Sized {
@@ -101,12 +103,18 @@ where
                     let mut batch_cursor = CursorList::new(batch_cursors, &batch_storage);
                     let (mut trace_cursor, trace_storage) = trace.cursor_through(lower_limit.borrow()).unwrap();
 
+                    // Staging buffer for the trace-side per-key lookup; reused across keys.
+                    let mut staging: Staging<_> = Default::default();
+
                     while let Some(key) = batch_cursor.get_key(&batch_storage) {
                         let mut count: Option<Tr::Diff> = None;
 
-                        trace_cursor.seek_key(&trace_storage, key);
-                        if trace_cursor.get_key(&trace_storage) == Some(key) {
-                            trace_cursor.map_times(&trace_storage, |_, diff| {
+                        // Unload the key's history from the trace into staging, then read
+                        // it back: a one-key `extract` reproduces the old `seek_key` probe.
+                        trace_cursor.extract(&trace_storage, &[key], &mut staging);
+                        let mut staged = staging.cursor();
+                        if staged.get_key(&staging) == Some(key) {
+                            staged.map_times(&staging, |_, diff| {
                                 count.as_mut().map(|c| c.plus_equals(&diff));
                                 if count.is_none() { count = Some(Tr::owned_diff(diff)); }
                             });

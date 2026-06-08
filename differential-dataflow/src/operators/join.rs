@@ -18,6 +18,8 @@ use crate::lattice::Lattice;
 use crate::operators::arrange::Arranged;
 use crate::trace::{BatchReader, Cursor};
 use crate::operators::ValueHistory;
+use crate::trace::staging::{Staging, StagingCursor};
+use crate::trace::unload::Unload;
 
 use crate::trace::TraceReader;
 
@@ -320,6 +322,12 @@ where
     batch_storage: C2::Storage,
     capability: Capability<T>,
     done: bool,
+    /// Trace-side updates, unloaded once from the trace into staging (filled on the
+    /// first `work` call) so the lockstep reads them without the trace cursor.
+    staging: Option<Staging<C1::Layout>>,
+    /// Persistent cursor over `staging`; its position survives across fuel-limited
+    /// `work` calls, as the trace cursor's position did.
+    staging_cursor: Option<StagingCursor<C1::Layout>>,
 }
 
 impl<T, C1, C2> Deferred<T, C1, C2>
@@ -336,6 +344,8 @@ where
             batch_storage,
             capability,
             done: false,
+            staging: None,
+            staging_cursor: None,
         }
     }
 
@@ -350,15 +360,39 @@ where
         L: for<'a> FnMut(C1::Key<'a>, C1::Val<'a>, C2::Val<'a>, T, &C1::Diff, &C2::Diff, &mut JoinSession<T, CB, Capability<T>>),
     {
 
+        // One-time, fill-once unload of the trace side through staging: extract the
+        // batch's keys from the trace into a staging area that persists across the
+        // fuel-limited `work` calls. The lockstep below then reads the trace side
+        // from this staging (via a `StagingCursor`) rather than the trace cursor.
+        // Only matched keys are present, so the merge still gallops past misses.
+        // NB: this is the extra copy the join brief flags — the place to measure.
+        if self.staging.is_none() {
+            let mut batch_keys = Vec::new();
+            self.batch.rewind_keys(&self.batch_storage);
+            while let Some(key) = self.batch.get_key(&self.batch_storage) {
+                batch_keys.push(key);
+                self.batch.step_key(&self.batch_storage);
+            }
+            let mut staging = Staging::default();
+            self.trace.rewind_keys(&self.trace_storage);
+            self.trace.extract(&self.trace_storage, &batch_keys, &mut staging);
+            drop(batch_keys);
+            self.batch.rewind_keys(&self.batch_storage);
+            self.staging = Some(staging);
+            self.staging_cursor = Some(self.staging.as_ref().unwrap().cursor());
+        }
+
         let meet = self.capability.time();
 
         let mut effort = 0;
         let mut session = output.session_with_builder(&self.capability);
 
-        let trace_storage = &self.trace_storage;
+        // The trace side now reads from staging; alias it as `trace` so the
+        // lockstep below is unchanged.
+        let trace_storage = self.staging.as_ref().unwrap();
         let batch_storage = &self.batch_storage;
 
-        let trace = &mut self.trace;
+        let trace = self.staging_cursor.as_mut().unwrap();
         let batch = &mut self.batch;
 
         let mut thinker = JoinThinker::new();

@@ -452,6 +452,16 @@ pub mod containers {
         /// Push an item into this container
         fn push_own(&mut self, item: &Self::Owned);
 
+        /// Copies the contiguous range `[lower, upper)` of `other` onto the end of `self`.
+        ///
+        /// Defaults to a per-element `push_ref` loop; implementors whose layout
+        /// permits it should override with a bulk copy (e.g. `extend_from_slice`,
+        /// a `memcpy` for `Copy` elements). This is the primitive a native,
+        /// range-copy `extract` uses instead of walking a cursor element by element.
+        fn copy_range(&mut self, other: &Self, lower: usize, upper: usize) {
+            for index in lower .. upper { self.push_ref(other.index(index)); }
+        }
+
         /// Clears the container. May not release resources.
         fn clear(&mut self);
 
@@ -546,6 +556,8 @@ pub mod containers {
 
         fn push_ref(&mut self, item: Self::ReadItem<'_>) { self.push_into(item) }
         fn push_own(&mut self, item: &Self::Owned) { self.push_into(item.clone()) }
+
+        fn copy_range(&mut self, other: &Self, lower: usize, upper: usize) { self.extend_from_slice(&other[lower .. upper]); }
 
         fn clear(&mut self) { self.clear() }
 
