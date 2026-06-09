@@ -367,10 +367,13 @@ where
         // Only matched keys are present, so the merge still gallops past misses.
         // NB: this is the extra copy the join brief flags — the place to measure.
         if self.staging.is_none() {
-            let mut batch_keys = Vec::new();
+            use crate::trace::implementations::BatchContainer;
+            // The batch's keys, copied into the trace layout's key container (the
+            // batch may use a different layout, but the key read types coincide).
+            let mut batch_keys = <C1::KeyContainer as BatchContainer>::with_capacity(0);
             self.batch.rewind_keys(&self.batch_storage);
             while let Some(key) = self.batch.get_key(&self.batch_storage) {
-                batch_keys.push(key);
+                batch_keys.push_ref(key);
                 self.batch.step_key(&self.batch_storage);
             }
             let mut staging = Staging::default();

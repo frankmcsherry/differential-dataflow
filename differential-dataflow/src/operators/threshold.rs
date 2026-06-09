@@ -15,6 +15,7 @@ use crate::hashable::Hashable;
 use crate::collection::AsCollection;
 use crate::operators::arrange::Arranged;
 use crate::trace::{BatchReader, Cursor, TraceReader};
+use crate::trace::implementations::BatchContainer;
 use crate::trace::staging::Staging;
 use crate::trace::unload::Unload;
 
@@ -153,15 +154,19 @@ where
                     let mut batch_cursor = CursorList::new(batch_cursors, &batch_storage);
                     let (mut trace_cursor, trace_storage) = trace.cursor_through(lower_limit.borrow()).unwrap();
 
-                    // Staging buffer for the trace-side per-key lookup; reused across keys.
+                    // Staging buffer for the trace-side per-key lookup; reused across keys,
+                    // as is the one-key container naming the probed key.
                     let mut staging: Staging<_> = Default::default();
+                    let mut probe_keys = Tr::KeyContainer::with_capacity(1);
 
                     while let Some(key) = batch_cursor.get_key(&batch_storage) {
                         let mut count: Option<Tr::Diff> = None;
 
                         // Compute the multiplicity of this key before the current batch.
                         // A one-key `extract` reproduces the old `seek_key` probe through staging.
-                        trace_cursor.extract(&trace_storage, &[key], &mut staging);
+                        probe_keys.clear();
+                        probe_keys.push_ref(key);
+                        trace_cursor.extract(&trace_storage, &probe_keys, &mut staging);
                         let mut staged = staging.cursor();
                         if staged.get_key(&staging) == Some(key) {
                             staged.map_times(&staging, |_, diff| {

@@ -140,17 +140,28 @@ where
                         // borrowed the trace storage; filling once (rather than per key) is what
                         // keeps that borrow stable. `extract` drops keys absent from a trace,
                         // reproducing a cursor seek that misses.
-                        let mut work_keys: Vec<Tr1::Key<'_>> = Vec::new();
+                        //
+                        // Both sources are sorted (batch keys by cursor order, pending keys by
+                        // maintenance below), so a merge assembles the work keys; pending keys
+                        // repeat once per pending time, hence the dedup against the last push.
+                        let mut work_keys = Tr1::KeyContainer::with_capacity(pending_keys.len());
                         batch_cursor.rewind_keys(batch_storage);
-                        while let Some(key) = batch_cursor.get_key(batch_storage) {
-                            work_keys.push(key);
-                            batch_cursor.step_key(batch_storage);
+                        let mut pending_pos = 0;
+                        while batch_cursor.key_valid(batch_storage) || pending_pos < pending_keys.len() {
+                            let key = match (pending_keys.get(pending_pos), batch_cursor.get_key(batch_storage)) {
+                                (Some(key1), Some(key2)) => ::std::cmp::min(key1, key2),
+                                (Some(key1), None)       => key1,
+                                (None, Some(key2))       => key2,
+                                (None, None)             => unreachable!(),
+                            };
+                            // Reborrow `key` so the comparison's borrow of `work_keys` ends here.
+                            let fresh = work_keys.last() != Some(<Tr1::KeyContainer as BatchContainer>::reborrow(key));
+                            if fresh {
+                                work_keys.push_ref(key);
+                            }
+                            while pending_keys.get(pending_pos) == Some(key) { pending_pos += 1; }
+                            if batch_cursor.get_key(batch_storage) == Some(key) { batch_cursor.step_key(batch_storage); }
                         }
-                        for index in 0 .. pending_keys.len() {
-                            work_keys.push(pending_keys.index(index));
-                        }
-                        work_keys.sort();
-                        work_keys.dedup();
                         batch_cursor.rewind_keys(batch_storage);
 
                         let mut source_staging: Staging<_> = Default::default();

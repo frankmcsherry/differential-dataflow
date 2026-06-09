@@ -39,7 +39,13 @@ pub trait Unload: Cursor {
 
     /// Extracts the updates for `keys` into `staging`, replacing its contents.
     ///
-    /// `keys` must be sorted and distinct. Keys absent from storage are dropped,
+    /// The keys are named by a key container — a column, not a slice of borrows —
+    /// since they always originate somewhere columnar (a batch's keys, an
+    /// [`enumerate_keys`](Unload::enumerate_keys) result, a pending-key buffer).
+    /// Any container with the right read type serves; it need not be this
+    /// storage's own `KeyContainer` (an output trace can be probed with keys
+    /// assembled in its input's container, for example).
+    /// They must be sorted and distinct. Keys absent from storage are dropped,
     /// so the staged keys are the intersection of `keys` with storage; callers
     /// learn which matched from the staged keys (e.g. `staging.len()`). This is
     /// the single random-access primitive: a one-element `keys` reproduces a
@@ -49,7 +55,9 @@ pub trait Unload: Cursor {
     /// successive `extract` calls with ascending key lists march the cursor once
     /// through storage (the operator probing pattern), rather than restarting each
     /// time. Rewind the cursor first ([`Cursor::rewind_keys`]) for a full pass.
-    fn extract(&mut self, storage: &Self::Storage, keys: &[Self::Key<'_>], staging: &mut Staging<Self::Layout>);
+    fn extract<KC>(&mut self, storage: &Self::Storage, keys: &KC, staging: &mut Staging<Self::Layout>)
+    where
+        KC: for<'a> crate::trace::implementations::BatchContainer<ReadItem<'a> = Self::Key<'a>>;
 }
 
 impl<C: Cursor> Unload for C {
@@ -73,13 +81,16 @@ impl<C: Cursor> Unload for C {
         }
     }
 
-    fn extract(&mut self, storage: &Self::Storage, keys: &[Self::Key<'_>], staging: &mut Staging<Self::Layout>) {
+    fn extract<KC>(&mut self, storage: &Self::Storage, keys: &KC, staging: &mut Staging<Self::Layout>)
+    where
+        KC: for<'a> crate::trace::implementations::BatchContainer<ReadItem<'a> = Self::Key<'a>>,
+    {
         use crate::trace::implementations::BatchContainer;
         staging.clear();
-        for key in keys {
+        for index in 0 .. keys.len() {
             // Reborrow to a local lifetime: `Self::Key` is an opaque GAT, so the
             // compiler will not shorten it to match `storage` on its own.
-            let key = <Self::KeyContainer as BatchContainer>::reborrow(*key);
+            let key = <Self::KeyContainer as BatchContainer>::reborrow(keys.index(index));
             self.seek_key(storage, key);
             if self.get_key(storage) == Some(key) {
                 self.rewind_vals(storage);
@@ -138,17 +149,17 @@ mod tests {
         let (mut cursor, storage) = trace.cursor();
         let baseline = cursor.to_vec(&storage, |k| *k, |v| *v);
 
-        // Enumerate keys, then extract them all into staging.
+        // Enumerate keys, then extract them all into staging: the `enumerate_keys`
+        // output is a key container, exactly what `extract` consumes.
         let mut keys = Vec::<u64>::with_capacity(0);
         cursor.enumerate_keys(&storage, &mut keys);
-        let key_refs: Vec<&u64> = (0..keys.len()).map(|i| keys.index(i)).collect();
 
-        assert_eq!(cursor.count_keys(&storage), key_refs.len());
+        assert_eq!(cursor.count_keys(&storage), keys.len());
 
         // `extract` seeks forward from the current position; rewind for a full pass.
         let mut staging = Stage::default();
         cursor.rewind_keys(&storage);
-        cursor.extract(&storage, &key_refs, &mut staging);
+        cursor.extract(&storage, &keys, &mut staging);
 
         let mut staging_cursor = staging.cursor();
         let unloaded = staging_cursor.to_vec(&staging, |k| *k, |v| *v);
@@ -162,8 +173,7 @@ mod tests {
         let (mut cursor, storage) = trace.cursor();
 
         // Keys 2 and 4 are present; 3 is absent and must be dropped.
-        let two = 2u64; let three = 3u64; let four = 4u64;
-        let subset = [&two, &three, &four];
+        let subset: Vec<u64> = vec![2, 3, 4];
         let mut staging = Stage::default();
         cursor.extract(&storage, &subset, &mut staging);
 
@@ -232,14 +242,12 @@ mod tests {
         // Build a staging source holding the whole trace.
         let mut keys = Vec::<u64>::with_capacity(0);
         cursor.enumerate_keys(&storage, &mut keys);
-        let key_refs: Vec<&u64> = (0..keys.len()).map(|i| keys.index(i)).collect();
         let mut source = Stage::default();
         cursor.rewind_keys(&storage);
-        cursor.extract(&storage, &key_refs, &mut source);
+        cursor.extract(&storage, &keys, &mut source);
 
         // Full set, and a subset with an absent key (3 is not present).
-        let two = 2u64; let three = 3u64; let four = 4u64;
-        for query in [key_refs.clone(), vec![&two, &three, &four]] {
+        for query in [keys.clone(), vec![2u64, 3, 4]] {
             let mut a = Stage::default();
             let mut b = Stage::default();
             source.cursor().extract(&source, &query, &mut a);

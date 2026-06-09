@@ -161,14 +161,18 @@ impl<L: Layout> Staging<L> {
 /// cheap offset bookkeeping. It prototypes what a native `extract` on real
 /// storage (e.g. `ord_neu`) would do. `keys` must be sorted and distinct; absent
 /// keys are dropped.
-pub fn extract_bulk<L: Layout>(
+pub fn extract_bulk<L: Layout, KC>(
     src: &Staging<L>,
-    keys: &[<L::KeyContainer as BatchContainer>::ReadItem<'_>],
+    keys: &KC,
     dest: &mut Staging<L>,
-) {
+)
+where
+    KC: for<'a> BatchContainer<ReadItem<'a> = <L::KeyContainer as BatchContainer>::ReadItem<'a>>,
+{
     dest.clear();
     let mut pos = 0;
-    for &key in keys {
+    for index in 0 .. keys.len() {
+        let key = keys.index(index);
         // Gallop to the first source key >= `key` (forward, like a cursor seek).
         pos += src.keys.advance(pos, src.keys.len(), |k| <L::KeyContainer as BatchContainer>::reborrow(k).lt(&<L::KeyContainer as BatchContainer>::reborrow(key)));
         if pos < src.keys.len() && src.keys.index(pos) == <L::KeyContainer as BatchContainer>::reborrow(key) {
