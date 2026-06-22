@@ -1,0 +1,12 @@
+-- ANALYZER: imports the "rate" trace from another installed program and
+-- maintains the line's throughput and which stage(s) are the binding bottleneck.
+-- Separately installed from `rates`; the server maintains it incrementally over
+-- the shared trace as capacities are poked.
+
+let rate = import "rate";                                 -- (stage ; rate)
+
+let thru = rate | key(0 ; $1) | min;                      -- (0 ; throughput = min rate)
+let binders = (rate | key($1 ; $0)) | join((thru | key($1 ;)), ($1 ;));  -- (stage ;) at the bottleneck
+
+export "throughput" = thru;
+export "bottleneck" = binders;

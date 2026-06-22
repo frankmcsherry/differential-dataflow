@@ -1,0 +1,6 @@
+-- Source of truth: publish the capacities and the chain as shared traces, so
+-- several physics readings can import the same inputs.
+-- input 0: (stage, capacity ;)    input 1: (pred, succ ;)
+
+export "cap"   = input 0 | key($0[0] ; $0[1]);   -- (stage ; capacity)
+export "chain" = input 1 | key($0[0] ; $0[1]);   -- (pred ; succ)

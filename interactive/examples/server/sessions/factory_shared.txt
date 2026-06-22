@@ -1,0 +1,55 @@
+# Physics -> analyzer over a shared trace.
+#   `rates` computes per-stage flow and publishes trace "rate".
+#   `bott`  imports "rate" and maintains throughput + binding stage(s).
+# Poke a capacity in `rates`; peek the analyzer; watch it maintain across the
+# two separately-installed dataflows. Run from interactive/:
+#   cargo run --release --example ddir_server -- examples/server/sessions/factory_shared.txt
+install rates examples/server/programs/rates.ddp
+install bott  examples/server/programs/bottleneck.ddp
+list
+
+# capacities (stage,cap): bottleneck at stage 2 = 3
+feed rates 0 0,9
+feed rates 0 1,9
+feed rates 0 2,3
+feed rates 0 3,9
+feed rates 0 4,9
+feed rates 0 5,9
+feed rates 0 6,9
+feed rates 0 7,9
+# chain (pred,succ)
+feed rates 1 0,1
+feed rates 1 1,2
+feed rates 1 2,3
+feed rates 1 3,4
+feed rates 1 4,5
+feed rates 1 5,6
+feed rates 1 6,7
+tick
+peek rate
+peek throughput
+peek bottleneck
+
+# poke 1: raise a NON-bottleneck (stage 5 -> 20): analyzer should not move.
+feed rates 0 5,9 diff=-1
+feed rates 0 5,20
+tick
+peek throughput
+peek bottleneck
+
+# poke 2: raise THE bottleneck (stage 2 -> 9): throughput climbs, across the split.
+feed rates 0 2,3 diff=-1
+feed rates 0 2,9
+tick
+peek throughput
+peek bottleneck
+
+# poke 3: drop a DOWNSTREAM stage (stage 6 -> 2): prefix keeps upstream untouched.
+feed rates 0 6,9 diff=-1
+feed rates 0 6,2
+tick
+peek rate
+peek throughput
+peek bottleneck
+list
+exit

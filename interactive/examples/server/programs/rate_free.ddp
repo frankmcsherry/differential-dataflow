@@ -1,0 +1,12 @@
+-- NO backpressure (infinite buffers): rate[i] = min(capacity over stages 0..i),
+-- a forward prefix-min along the chain. A capacity change flows DOWNSTREAM only.
+-- Imports the shared cap/chain traces published by `caps`.
+
+let caps  = import "cap";      -- (stage ; capacity)
+let chain = import "chain";    -- (pred ; succ)
+
+prop: {
+    var rate = caps + ((chain | key($0 ; $1)) | join(rate, ($1 ; $2))) | min;
+}
+
+export "rate_free" = prop::rate;

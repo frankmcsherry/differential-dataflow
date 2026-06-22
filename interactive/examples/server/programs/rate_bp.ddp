@@ -1,0 +1,10 @@
+-- WITH backpressure (finite buffers, steady state): every stage runs at the
+-- GLOBAL bottleneck, so a capacity change at the binding constraint re-derives
+-- the rate EVERYWHERE -- upstream and downstream alike.
+-- Imports the same shared cap trace as `rate_free`.
+
+let caps   = import "cap";                              -- (stage ; capacity)
+let allmin = caps | key(0 ; $1) | min;                  -- (0 ; global bottleneck)
+let rate   = (caps | key(0 ; $0)) | join(allmin, ($1 ; $2));  -- (stage ; bottleneck)
+
+export "rate_bp" = rate;

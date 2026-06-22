@@ -1,0 +1,12 @@
+-- PHYSICS: factory stage rates with no backpressure (prefix-min along the chain),
+-- published as the shared trace "rate" for analyzers to import.
+-- input 0: capacities (stage, capacity ;)   input 1: chain (pred, succ ;)
+
+let caps  = input 0 | key($0[0] ; $0[1]);     -- (stage ; capacity)
+let chain = input 1 | key($0[0] ; $0[1]);     -- (pred ; succ)
+
+prop: {
+    var rate = caps + ((chain | key($0 ; $1)) | join(rate, ($1 ; $2))) | min;
+}
+
+export "rate" = prop::rate;                   -- (stage ; achieved rate)

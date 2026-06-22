@@ -1,0 +1,41 @@
+# The buffer dial: one capacity trace, two physics readings of it.
+#   caps      publishes "cap" + "chain"
+#   rate_free imports them -> prefix-min  (no backpressure: change flows DOWNSTREAM only)
+#   rate_bp   imports "cap" -> global-min (backpressure: change re-derives EVERYONE)
+# Same poke, different blast radius -- that's the whole lesson, across three
+# separately-installed dataflows sharing traces by name. Run from interactive/:
+#   cargo run --release --example ddir_server -- examples/server/sessions/buffer_dial.txt
+install caps examples/server/programs/caps.ddp
+install free examples/server/programs/rate_free.ddp
+install bp   examples/server/programs/rate_bp.ddp
+list
+
+# A balanced line: every stage capacity 9.
+feed caps 0 0,9
+feed caps 0 1,9
+feed caps 0 2,9
+feed caps 0 3,9
+feed caps 0 4,9
+feed caps 0 5,9
+feed caps 0 6,9
+feed caps 0 7,9
+feed caps 1 0,1
+feed caps 1 1,2
+feed caps 1 2,3
+feed caps 1 3,4
+feed caps 1 4,5
+feed caps 1 5,6
+feed caps 1 6,7
+tick
+peek rate_free
+peek rate_bp
+
+# Poke ONE downstream stage (6 -> 2). Compare who moves in each reading:
+#   rate_free: only stages 6,7 fall to 2 (the downstream cone); upstream stays 9.
+#   rate_bp:   ALL stages fall to 2 (backpressure throttles the whole line).
+feed caps 0 6,9 diff=-1
+feed caps 0 6,2
+tick
+peek rate_free
+peek rate_bp
+exit
