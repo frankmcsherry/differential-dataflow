@@ -702,6 +702,40 @@ mod test {
         assert!(got.len() < total, "predicate should drop some updates");
     }
 
+    // Corgi-shaped: a tiny op-graph ADT (the precursor to a `Graph<NumOp>`)
+    // interpreted during the chunk's handle-based execute drives the filter
+    // identically to a direct closure — i.e. `Logic` can be an interpreted
+    // program, not only a Rust closure.
+    enum Pred { KeyEq(u64), ValEq(u64), Not(Box<Pred>), And(Box<Pred>, Box<Pred>) }
+    fn interp(p: &Pred, k: u64, v: u64) -> bool {
+        match p {
+            Pred::KeyEq(c) => k == *c,
+            Pred::ValEq(c) => v == *c,
+            Pred::Not(x) => !interp(x, k, v),
+            Pred::And(a, b) => interp(a, k, v) && interp(b, k, v),
+        }
+    }
+
+    #[test]
+    fn execute_filter_via_adt_program() {
+        let c = chunk(vec![(2, 0, 0, 1), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
+        // program: keep (key != 3) AND (val == 0)
+        let prog = Pred::And(Box::new(Pred::Not(Box::new(Pred::KeyEq(3)))), Box::new(Pred::ValEq(0)));
+
+        let mut via_adt = Vec::new();
+        let mut instr = Vec::new();
+        c.to_handles(&mut instr);
+        c.execute_filter(instr, &|k, v| interp(&prog, *k, *v), &mut via_adt);
+
+        let mut via_closure = Vec::new();
+        let mut instr2 = Vec::new();
+        c.to_handles(&mut instr2);
+        c.execute_filter(instr2, &|k, v| *k != 3 && *v == 0, &mut via_closure);
+
+        assert_eq!(via_adt, via_closure);
+        assert!(!via_adt.is_empty(), "key 2 / val 0 survives");
+    }
+
     // Property test: merging two multi-chunk chains (driven through `merge` by
     // `merge_chains`) reproduces the union of all updates, consolidated. Tiny
     // chunks force `(key, val)` groups to straddle chunk boundaries on both
