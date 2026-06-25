@@ -441,6 +441,25 @@ where U::Time: 'static {
             seal_chunk,
         );
     }
+
+    /// Drive the trie's columns directly — one pass over the resident view, no
+    /// cursor. (A paged chunk decodes once via `trie()`.)
+    fn for_each<'s>(&'s self, logic: &mut dyn FnMut(Self::Key<'s>, Self::Val<'s>, Self::Time, Self::Diff)) {
+        use crate::trace::implementations::LayoutExt;
+        let view = self.trie().view();
+        for k in 0..view.keys.values.len() {
+            let key = view.keys.values.get(k);
+            for v in child_range(view.vals.bounds, k) {
+                let val = view.vals.values.get(v);
+                for t in child_range(view.times.bounds, v) {
+                    let time = Self::owned_time(view.times.values.get(t));
+                    for d in child_range(view.diffs.bounds, t) {
+                        logic(key, val, time.clone(), Self::owned_diff(view.diffs.values.get(d)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The columnar spill point: when a spiller is installed and over the high-water
@@ -548,6 +567,32 @@ mod test {
     // Cut a consolidated set into a chain of small chunks, so groups straddle boundaries.
     fn chain(updates: &[Upd], sz: usize) -> Vec<ColChunk<Upd>> {
         updates.chunks(sz).map(|c| chunk(c.to_vec())).collect()
+    }
+
+    // The columnar `for_each` (trie-driven override) visits the same `(k,v,t,d)`
+    // stream as a cursor walk.
+    #[test]
+    fn for_each_matches_cursor() {
+        use crate::trace::cursor::Cursor;
+        let c = chunk(vec![(2, 0, 0, 1), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
+
+        let mut got = Vec::new();
+        c.for_each(&mut |k, v, t, r| got.push((*k, *v, t, r)));
+
+        let mut want = Vec::new();
+        let mut cur = c.cursor();
+        cur.rewind_keys(&c);
+        while cur.key_valid(&c) {
+            while cur.val_valid(&c) {
+                let (k, v) = (*cur.key(&c), *cur.val(&c));
+                cur.map_times(&c, |t, r| want.push((k, v, *t, *r)));
+                cur.step_val(&c);
+            }
+            cur.step_key(&c);
+        }
+
+        assert_eq!(got, want);
+        assert_eq!(got, vec![(2u64, 0u64, 0u64, 1i64), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
     }
 
     // Property test: merging two multi-chunk chains (driven through `merge` by
