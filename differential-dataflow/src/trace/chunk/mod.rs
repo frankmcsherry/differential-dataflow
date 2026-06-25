@@ -162,6 +162,29 @@ pub trait Chunk: Sized + Clone + LayoutExt {
     /// [`pack`] helper, supplying their layout's coalesce / split / commit closures.
     fn settle(input: &mut VecDeque<Self>, done: bool, out: &mut VecDeque<Self>);
 
+    /// Visit every `(key, val, time, diff)`, the chunk driving its own iteration.
+    ///
+    /// The logic is an interpreted `dyn` callback, so DD does not monomorphize
+    /// over it, and the chunk drives its native loop rather than being stepped
+    /// through a cursor. The default delegates to the cursor (the reference
+    /// behaviour); an implementor overrides to iterate its own representation.
+    /// Time/diff arrive owned, so only key/val carry a borrow (one lifetime).
+    ///
+    /// Scalar granularity for now; a run/batch-shaped variant (so the interpreted
+    /// dispatch amortizes) is the next step.
+    fn for_each<'s>(&'s self, logic: &mut dyn FnMut(Self::Key<'s>, Self::Val<'s>, Self::Time, Self::Diff)) {
+        let mut cur = self.cursor();
+        cur.rewind_keys(self);
+        while cur.key_valid(self) {
+            while cur.val_valid(self) {
+                let k = cur.key(self);
+                let v = cur.val(self);
+                cur.map_times(self, |t, d| logic(k, v, Self::owned_time(t), Self::owned_diff(d)));
+                cur.step_val(self);
+            }
+            cur.step_key(self);
+        }
+    }
 }
 
 /// Maximal-packing driver an implementor's [`Chunk::settle`] may delegate to.

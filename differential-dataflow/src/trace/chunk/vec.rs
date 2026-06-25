@@ -362,6 +362,14 @@ where K: Ord+Clone+'static, V: Ord+Clone+'static, T: Lattice+Timestamp, R: Ord+S
             |chunk| chunk,
         );
     }
+
+    /// Drive the flat backing `Vec` directly — one contiguous pass, no cursor.
+    fn for_each<'s>(&'s self, logic: &mut dyn FnMut(&'s K, &'s V, T, R)) {
+        use crate::trace::implementations::LayoutExt;
+        for ((k, v), t, r) in self.0.iter() {
+            logic(k, v, Self::owned_time(t), Self::owned_diff(r));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +381,32 @@ mod test {
 
     fn chunk(updates: Vec<((u64, u64), u64, i64)>) -> VecChunk<u64, u64, u64, i64> {
         VecChunk(Rc::new(updates))
+    }
+
+    // The chunk-driven `for_each` (override) visits the same `(k,v,t,d)` stream as
+    // a cursor walk — the IoC + interpreted-`dyn`-logic primitive, oracle-checked.
+    #[test]
+    fn for_each_matches_cursor() {
+        use crate::trace::cursor::Cursor;
+        let c = chunk(vec![((1, 0), 0, 1), ((2, 0), 0, 1), ((2, 1), 5, 1), ((2, 1), 7, -1), ((3, 0), 0, 1)]);
+
+        let mut got = Vec::new();
+        c.for_each(&mut |k, v, t, r| got.push((*k, *v, t, r)));
+
+        let mut want = Vec::new();
+        let mut cur = c.cursor();
+        cur.rewind_keys(&c);
+        while cur.key_valid(&c) {
+            while cur.val_valid(&c) {
+                let (k, v) = (*cur.key(&c), *cur.val(&c));
+                cur.map_times(&c, |t, r| want.push((k, v, *t, *r)));
+                cur.step_val(&c);
+            }
+            cur.step_key(&c);
+        }
+
+        assert_eq!(got, want);
+        assert_eq!(got, vec![(1u64, 0u64, 0u64, 1i64), (2, 0, 0, 1), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
     }
 
     // Flatten a chunk sequence back to its update stream.
