@@ -184,6 +184,25 @@ impl<U: ColumnarUpdate> ColChunk<U> {
             if keep(key, val) { out.push(((kh, vh), t, d)); }
         }
     }
+
+    /// Apply an interpreted map (the in-core `Logic`) to handle-instructions,
+    /// emitting transformed `((key', val'), time, diff)`. A *transforming* op
+    /// (vs filter's selection), so the boundary isn't filter-specific. NB: the
+    /// demo materializes owned output; a real map emits into an output chunk's
+    /// own arena (the output-arena design, deferred). `(time,diff)` ride through
+    /// untouched — DD's to keep.
+    pub fn execute_map<'s>(
+        &'s self,
+        instr: Vec<((u32, u32), U::Time, U::Diff)>,
+        map: &dyn Fn(columnar::Ref<'s, U::Key>, columnar::Ref<'s, U::Val>) -> (U::Key, U::Val),
+        out: &mut Vec<((U::Key, U::Val), U::Time, U::Diff)>,
+    ) {
+        let view = self.trie().view();
+        for ((kh, vh), t, d) in instr {
+            let (k2, v2) = map(view.keys.values.get(kh as usize), view.vals.values.get(vh as usize));
+            out.push(((k2, v2), t, d));
+        }
+    }
 }
 
 /// Take a chunk's trie by value, fetching it if paged (and notifying the spiller
@@ -734,6 +753,34 @@ mod test {
 
         assert_eq!(via_adt, via_closure);
         assert!(!via_adt.is_empty(), "key 2 / val 0 survives");
+    }
+
+    // Second op (transform): execute_map applies an interpreted map per handle and
+    // emits transformed updates, matching a cursor walk + the same map.
+    #[test]
+    fn execute_map_matches_cursor() {
+        use crate::trace::cursor::Cursor;
+        let c = chunk(vec![(2, 0, 0, 1), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
+
+        let mut instr = Vec::new();
+        c.to_handles(&mut instr);
+        let mut got = Vec::new();
+        c.execute_map(instr, &|k, v| (*k, *v + 100), &mut got);
+
+        let mut want = Vec::new();
+        let mut cur = c.cursor();
+        cur.rewind_keys(&c);
+        while cur.key_valid(&c) {
+            while cur.val_valid(&c) {
+                let (k, v) = (*cur.key(&c), *cur.val(&c));
+                cur.map_times(&c, |t, r| want.push(((k, v + 100), *t, *r)));
+                cur.step_val(&c);
+            }
+            cur.step_key(&c);
+        }
+
+        assert_eq!(got, want);
+        assert_eq!(got, vec![((2u64, 100u64), 0u64, 1i64), ((2, 101), 5, 1), ((2, 101), 7, -1), ((3, 100), 0, 1)]);
     }
 
     // Property test: merging two multi-chunk chains (driven through `merge` by
