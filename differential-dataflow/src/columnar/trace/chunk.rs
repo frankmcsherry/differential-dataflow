@@ -164,6 +164,26 @@ impl<U: ColumnarUpdate> ColChunk<U> {
             }
         }
     }
+
+    /// Apply an interpreted predicate to handle-instructions, emitting the
+    /// survivors in handle form. Spike for #2 (interpreted logic, chunk-side): the
+    /// chunk resolves each `(kh,vh)` to its `(key,val)` and runs `keep` — here a
+    /// boxed closure (the in-core `Logic`); a corgi-backed chunk would instead
+    /// `eval_graph` a `Graph<NumOp>` to a keep-mask. DD never sees the bytes — it
+    /// hands handle-tagged work and gets handle-tagged results.
+    pub fn execute_filter<'s>(
+        &'s self,
+        instr: Vec<((u32, u32), U::Time, U::Diff)>,
+        keep: &dyn Fn(columnar::Ref<'s, U::Key>, columnar::Ref<'s, U::Val>) -> bool,
+        out: &mut Vec<((u32, u32), U::Time, U::Diff)>,
+    ) {
+        let view = self.trie().view();
+        for ((kh, vh), t, d) in instr {
+            let key = view.keys.values.get(kh as usize);
+            let val = view.vals.values.get(vh as usize);
+            if keep(key, val) { out.push(((kh, vh), t, d)); }
+        }
+    }
 }
 
 /// Take a chunk's trie by value, fetching it if paged (and notifying the spiller
@@ -649,6 +669,37 @@ mod test {
         }
         // (2,1,5) and (2,1,7) share key 2 ⇒ same key-handle, same (kh,vh).
         assert_eq!(handles[1].0, handles[2].0);
+    }
+
+    // #2 proof: an interpreted predicate run chunk-side over handle-instructions
+    // keeps exactly the same `(time,diff)` a cursor walk + same predicate would.
+    #[test]
+    fn execute_filter_matches_cursor() {
+        use crate::trace::cursor::Cursor;
+        let c = chunk(vec![(2, 0, 0, 1), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
+
+        // DD hands the chunk its own handle-updates + a predicate "keep val == 0".
+        let mut instr = Vec::new();
+        c.to_handles(&mut instr);
+        let total = instr.len();
+        let mut got = Vec::new();
+        c.execute_filter(instr, &|_k, v| *v == 0, &mut got);
+        let got_td: Vec<(u64, i64)> = got.iter().map(|&(_, t, d)| (t, d)).collect();
+
+        // Reference: cursor walk, same predicate, collect survivors' (time,diff).
+        let mut want = Vec::new();
+        let mut cur = c.cursor();
+        cur.rewind_keys(&c);
+        while cur.key_valid(&c) {
+            while cur.val_valid(&c) {
+                if *cur.val(&c) == 0 { cur.map_times(&c, |t, r| want.push((*t, *r))); }
+                cur.step_val(&c);
+            }
+            cur.step_key(&c);
+        }
+
+        assert_eq!(got_td, want);
+        assert!(got.len() < total, "predicate should drop some updates");
     }
 
     // Property test: merging two multi-chunk chains (driven through `merge` by
