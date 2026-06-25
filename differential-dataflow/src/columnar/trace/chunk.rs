@@ -143,6 +143,27 @@ impl<U: ColumnarUpdate> ColChunk<U> {
             ColChunk::Paged(_) => unreachable!(),
         }
     }
+
+    /// Emit updates in *handle* form: `((key-handle, val-handle), time, diff)`,
+    /// where the handles are this trie's column indices (`keys.values` /
+    /// `vals.values`). Spike seed for the #3 "chunk-as-arena" model: DD can group
+    /// and order updates by handle (same key ⇒ same `kh`; same `(key,val)` ⇒ same
+    /// `(kh,vh)`) without ever touching the key/val bytes — only the chunk
+    /// resolves a handle (see [`ColChunk::trie`]'s `view`).
+    pub fn to_handles(&self, out: &mut Vec<((u32, u32), U::Time, U::Diff)>) {
+        use crate::trace::implementations::LayoutExt;
+        let view = self.trie().view();
+        for k in 0..view.keys.values.len() {
+            for v in child_range(view.vals.bounds, k) {
+                for t in child_range(view.times.bounds, v) {
+                    let time = Self::owned_time(view.times.values.get(t));
+                    for d in child_range(view.diffs.bounds, t) {
+                        out.push(((k as u32, v as u32), time.clone(), Self::owned_diff(view.diffs.values.get(d))));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Take a chunk's trie by value, fetching it if paged (and notifying the spiller
@@ -593,6 +614,41 @@ mod test {
 
         assert_eq!(got, want);
         assert_eq!(got, vec![(2u64, 0u64, 0u64, 1i64), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
+    }
+
+    // #3 seed: handle-form updates carry the same `(time,diff)` stream as a cursor
+    // walk, and each handle is a consistent function of `(key,val)` — i.e. DD can
+    // group/order by handle, never touching key/val bytes.
+    #[test]
+    fn to_handles_consistent_with_cursor() {
+        use crate::trace::cursor::Cursor;
+        use std::collections::HashMap;
+        let c = chunk(vec![(2, 0, 0, 1), (2, 1, 5, 1), (2, 1, 7, -1), (3, 0, 0, 1)]);
+
+        let mut handles = Vec::new();
+        c.to_handles(&mut handles);
+
+        let mut walk = Vec::new();
+        let mut cur = c.cursor();
+        cur.rewind_keys(&c);
+        while cur.key_valid(&c) {
+            while cur.val_valid(&c) {
+                let (k, v) = (*cur.key(&c), *cur.val(&c));
+                cur.map_times(&c, |t, r| walk.push((k, v, *t, *r)));
+                cur.step_val(&c);
+            }
+            cur.step_key(&c);
+        }
+
+        assert_eq!(handles.len(), walk.len());
+        let (mut kmap, mut vmap) = (HashMap::new(), HashMap::new());
+        for (&((kh, vh), ht, hd), &(k, v, wt, wd)) in handles.iter().zip(walk.iter()) {
+            assert_eq!((ht, hd), (wt, wd));                  // same (time,diff), in order
+            assert_eq!(*kmap.entry(kh).or_insert(k), k);     // kh ↦ key is a function
+            assert_eq!(*vmap.entry(vh).or_insert(v), v);     // vh ↦ val is a function
+        }
+        // (2,1,5) and (2,1,7) share key 2 ⇒ same key-handle, same (kh,vh).
+        assert_eq!(handles[1].0, handles[2].0);
     }
 
     // Property test: merging two multi-chunk chains (driven through `merge` by
