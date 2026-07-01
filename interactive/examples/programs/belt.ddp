@@ -1,0 +1,27 @@
+-- Belt cellular automaton (rule-184 / TASEP), one synchronous tick.
+--
+-- input 0: belt topology  (cell, next_cell ;)   -- the successor edge of each cell
+-- input 1: occupancy       (cell ;)             -- which cells currently hold an item
+--
+-- Output "result": the set of moves to apply this tick, each row keyed
+-- (source_cell, target_cell ;).  A cell's item moves iff its successor is
+-- empty; merges are arbitrated by `min` so at most one item enters a cell.
+--
+-- The point of the demo: in equilibrium (a jammed or empty belt) there are
+-- no interfaces between full and empty, so `result` is empty, the host pushes
+-- no updates, and a worker.step() does no work.  All work tracks the shock
+-- fronts (the boundaries where a jam meets a gap).
+
+let succ  = input 0 | key($0[0] ; $0[1]);   -- (cell ; next)
+let occ   = input 1 | key($0[0] ;);         -- (cell ; )
+
+let srcs  = succ | key($0 ;);               -- cells appearing as an edge source
+let dsts  = succ | key($1 ;);               -- cells appearing as an edge target (incl. drain)
+let cells = srcs + dsts | distinct;         -- every belt cell
+let empty = cells - occ | distinct;         -- belt cells not currently occupied
+
+let tgt   = occ | join(succ, ($2 ; $0));    -- (next ; cell) : where each item wants to go
+let raw   = tgt | join(empty, ($0 ; $1));   -- keep moves whose target is empty: (next ; cell)
+let moves = raw | min;                      -- arbitrate merges: one mover per target cell
+
+export "result" = moves | key($1, $0 ;) | arrange;

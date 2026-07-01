@@ -1,0 +1,12 @@
+-- Factory rates, WITH backpressure (finite buffers, steady state).
+-- Every stage runs at the GLOBAL bottleneck rate, so a capacity change at the
+-- binding constraint re-derives the rate EVERYWHERE (upstream and downstream);
+-- a change anywhere else does nothing.
+--
+-- input 0: capacities (stage, capacity ;)
+
+let caps   = input 0 | key($0[0] ; $0[1]);              -- (stage ; capacity)
+let allmin = caps | key(0 ; $1) | min;                  -- (0 ; min capacity over all stages)
+let rate   = (caps | key(0 ; $0)) | join(allmin, ($1 ; $2));  -- (stage ; global bottleneck)
+
+export "result" = rate | arrange;

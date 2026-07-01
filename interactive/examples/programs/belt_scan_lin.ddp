@@ -1,0 +1,24 @@
+-- Rigid (lockstep) belt, LINEAR-depth "can move" via one-hop label propagation.
+-- Same semantics and same export as belt_scan.ddp, but movability propagates
+-- one cell per round (semi-naive), so settling a run of length L takes ~L
+-- rounds instead of ~log L. Run both and compare the `steps` column.
+--
+-- input 0: topology (cell, next ;)   input 1: occupancy (cell ;)
+
+let succ = input 0 | key($0[0] ; $0[1]);
+let occ  = input 1 | key($0[0] ;);
+
+let srcs = succ | key($0 ;);
+let dsts = succ | key($1 ;);
+let cells = srcs + dsts | distinct;
+let empty = cells - occ | distinct;
+
+let oc   = occ | join(succ, ($2 ; $0)) | join(occ, ($1 ; $0));
+let base = occ | join(succ, ($2 ; $0)) | join(empty, ($1 ;));
+
+-- A cell is movable if it is a base cell, or its successor is movable.
+prop: {
+    var movable = base + ((oc | key($1 ; $0)) | join(movable, ($1 ;))) | distinct;
+}
+
+export "result" = prop::movable | join(succ, ($2 ; $0)) | key($1, $0 ;) | arrange;

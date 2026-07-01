@@ -1,0 +1,16 @@
+-- Factory rates, NO backpressure (infinite buffers).
+-- Stage i runs at min(capacity over stages 0..i): a forward prefix-min scan.
+-- A capacity change propagates only DOWNSTREAM (the cone), never upstream --
+-- upstream just lets its (infinite) buffer grow.
+--
+-- input 0: capacities (stage, capacity ;)     input 1: chain (pred, succ ;)
+
+let caps  = input 0 | key($0[0] ; $0[1]);     -- (stage ; capacity)
+let chain = input 1 | key($0[0] ; $0[1]);     -- (pred ; succ)
+
+-- rate[i] = min(capacity[i], rate[pred(i)]); sources (no pred) keep their cap.
+prop: {
+    var rate = caps + ((chain | key($0 ; $1)) | join(rate, ($1 ; $2))) | min;
+}
+
+export "result" = prop::rate | arrange;

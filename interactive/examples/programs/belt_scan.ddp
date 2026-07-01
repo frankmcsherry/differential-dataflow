@@ -1,0 +1,37 @@
+-- Rigid (lockstep) belt, LOG-depth "can move" via transitive-closure squaring.
+--
+-- A whole compressed run advances together when its lead has a gap ahead.
+-- can_move(c) = c is gap-adjacent, OR c reaches a gap-adjacent cell through a
+-- chain of occupied cells. We get that reachability in O(log run-length)
+-- rounds by squaring the occupied-chain edge relation (each round doubles the
+-- path length it can certify), instead of propagating one cell per round.
+--
+-- input 0: topology (cell, next ;)   input 1: occupancy (cell ;)
+
+let succ = input 0 | key($0[0] ; $0[1]);
+let occ  = input 1 | key($0[0] ;);
+
+let srcs = succ | key($0 ;);
+let dsts = succ | key($1 ;);
+let cells = srcs + dsts | distinct;
+let empty = cells - occ | distinct;
+
+-- occupied-chain edge: c -> succ(c), both ends occupied.
+let oc   = occ | join(succ, ($2 ; $0)) | join(occ, ($1 ; $0));
+-- base movers: occupied cells whose successor is empty (adjacent to a gap).
+let base = occ | join(succ, ($2 ; $0)) | join(empty, ($1 ;));
+
+-- Transitive closure of `oc` by repeated squaring: closure := oc U closure.closure.
+-- The edge (src,dst) is carried in the KEY so `distinct` dedups whole edges; we
+-- re-key to the shared middle only for the compositional self-join.
+sq: {
+    var closure = (oc | key($0, $1 ;))
+                + ((closure | key($0[1] ; $0[0])) | join((closure | key($0[0] ; $0[1])), ($1, $2 ;)))
+                | distinct;
+}
+
+-- movable = base cells, plus any cell that reaches a base cell via the closure.
+let via     = (sq::closure | key($0[1] ; $0[0])) | join(base, ($1 ;));
+let movable = base + via | distinct;
+
+export "result" = movable | join(succ, ($2 ; $0)) | key($1, $0 ;) | arrange;
