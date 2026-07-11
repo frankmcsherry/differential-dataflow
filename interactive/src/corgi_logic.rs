@@ -254,23 +254,60 @@ fn infer_term_shape(t: &Term, env_shapes: &[Shape]) -> Shape {
             if fs.is_empty() { Shape::Unit } else { Shape::Prod(fs) }
         }
         Term::If { then, .. } => infer_term_shape(then, env_shapes),
+        Term::List(fields) => {
+            let elem = fields.first().map(|f| infer_term_shape(f, env_shapes)).unwrap_or(Shape::Unit);
+            Shape::List(Box::new(elem))
+        }
         // Arithmetic, comparisons, and anything else scalar-ish reduce to a primitive column.
         _ => Shape::Prim(64),
+    }
+}
+
+/// Non-panicking shape inference, for gating (`compilable` and the backend's FlatMap fast path):
+/// `None` where `infer_term_shape` would panic or guess. Mirrors its arms.
+pub fn term_shape(t: &Term, env_shapes: &[Shape]) -> Option<Shape> {
+    match t {
+        Term::Var(i) => env_shapes.get(*i).cloned(),
+        Term::Int(_) | Term::Binary(..) => Some(Shape::Prim(64)),
+        Term::Proj(inner, i) => match term_shape(inner, env_shapes)? {
+            Shape::Prod(fs) => fs.get(*i).cloned(),
+            Shape::List(e) => Some(*e),
+            _ => None,
+        },
+        Term::If { then, .. } => term_shape(then, env_shapes),
+        Term::List(fields) => {
+            let elem = term_shape(fields.first()?, env_shapes)?;
+            Some(Shape::List(Box::new(elem)))
+        }
+        _ => None,
     }
 }
 
 /// Whether [`compile`] can lower this term to a corgi graph. Terms that use features the corgi
 /// compiler doesn't model yet — `List`, `Inject`/`Case` (sum types), `Unary`, `Hash` — return false,
 /// and the backend falls back to row-wise `ir::eval` (parity with `backend::vec`).
-pub fn compilable(t: &Term) -> bool {
+pub fn compilable(t: &Term, env_shapes: &[Shape]) -> bool {
     match t {
         Term::Var(_) | Term::Bound(_) | Term::Int(_) => true,
-        Term::Proj(inner, _) | Term::Spread(inner) => compilable(inner),
-        Term::Tuple(fs) => fs.iter().all(compilable),
-        Term::Binary(_, l, r) => compilable(l) && compilable(r),
-        Term::If { cond, then, els } => compilable(cond) && compilable(then) && compilable(els),
-        Term::Fold { list, init, step } => compilable(list) && compilable(init) && compilable(step),
-        _ => false, // List, Inject, Case, Unary, Hash — row-wise fallback.
+        Term::Proj(inner, _) | Term::Spread(inner) => compilable(inner, env_shapes),
+        Term::Tuple(fs) => fs.iter().all(|f| compilable(f, env_shapes)),
+        Term::Binary(_, l, r) => compilable(l, env_shapes) && compilable(r, env_shapes),
+        Term::If { cond, then, els } => {
+            compilable(cond, env_shapes) && compilable(then, env_shapes) && compilable(els, env_shapes)
+        }
+        Term::Fold { list, init, step } => {
+            compilable(list, env_shapes) && compilable(init, env_shapes) && compilable(step, env_shapes)
+        }
+        // Homogeneous list literals lower columnar (see `compile`); heterogeneous fall back.
+        Term::List(fields) => {
+            !fields.is_empty()
+                && fields.iter().all(|f| compilable(f, env_shapes))
+                && match term_shape(&fields[0], env_shapes) {
+                    Some(s0) => fields[1..].iter().all(|f| term_shape(f, env_shapes) == Some(s0.clone())),
+                    None => false,
+                }
+        }
+        _ => false, // Inject, Case, Unary, Hash — row-wise fallback.
     }
 }
 
@@ -360,8 +397,47 @@ pub fn compile(term: &Term, b: &mut Builder<NumOp>, env: &[usize], env_shapes: &
             let body = compile_fold_body(step);
             b.add(Op::Fold(Box::new(body)), vec![pair])
         }
+        // Homogeneous list literal: k element columns become a length-k list per row via the
+        // kernel matrix — Enlist each element (length-1 lanes), Iota a per-row [0..k) tag list,
+        // Weave interleaves the lanes (field order) into List<Sum{X x k}>, MapList(Unwrap) strips
+        // the homogeneous Sum. No per-row work; a fused list-intro kernel is corgi's call if this
+        // composition ever profiles hot.
+        Term::List(fields) => {
+            assert!(!fields.is_empty(), "compile: empty list literal");
+            let lanes: Vec<usize> = fields
+                .iter()
+                .map(|f| {
+                    let e = compile(f, b, env, env_shapes, anchor);
+                    b.add(Op::Enlist, vec![e])
+                })
+                .collect();
+            let count = b.add(Op::Lit(CValue::u64(vec![fields.len() as u64])), vec![anchor]);
+            let tags = b.add(Op::Iota, vec![count]);
+            let mut weave_in = vec![tags];
+            weave_in.extend(lanes);
+            let woven_in = b.tuple(weave_in);
+            let woven = b.add(Op::Weave, vec![woven_in]);
+            let unwrap_body = {
+                let mut bb = Builder::<NumOp>::default();
+                let i = bb.input();
+                let o = bb.add(Op::Unwrap, vec![i]);
+                bb.finish(o)
+            };
+            b.add(Op::MapList(Box::new(unwrap_body)), vec![woven])
+        }
         other => panic!("compile: unsupported Term in this rung: {other:?}"),
     }
+}
+
+/// Compile a FlatMap list term over `Var(0)=key` (shape `kshape`), `Var(1)=val` (`vshape`) → the
+/// list column itself (the backend explodes it).
+pub fn compile_flatmap(list: &Term, kshape: &Shape, vshape: &Shape) -> Graph<NumOp> {
+    let mut b = Builder::<NumOp>::default();
+    let input = b.input();
+    let var_k = b.add(Op::Field(0), vec![input]);
+    let var_v = b.add(Op::Field(1), vec![input]);
+    let out = compile(list, &mut b, &[var_k, var_v], &[kshape.clone(), vshape.clone()], input);
+    b.finish(out)
 }
 
 /// Compile a `Fold` step into a closed corgi sub-graph over `Prod([acc, elem])`.

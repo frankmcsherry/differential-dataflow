@@ -28,7 +28,7 @@ use crate::corgi_backend::CorgiContainer;
 use crate::corgi_join::CorgiJoinTactic;
 use crate::corgi_reduce_backend::CorgiReduceBackend;
 use differential_dataflow::operators::int_proxy::ProxyReduceTactic;
-use crate::corgi_logic::{compilable, compile_predicate, compile_projection};
+use crate::corgi_logic::{compilable, compile_flatmap, compile_predicate, compile_projection};
 use crate::ir::{Diff, LinearOp, Time, Value as DValue};
 use crate::parse::{Projection, Reducer};
 use crate::scope_ir as st;
@@ -45,7 +45,12 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
 
     for op in ops {
         c = match op {
-            LinearOp::Project(p) if compilable(&p.key) && compilable(&p.val) => {
+            LinearOp::Project(p)
+                if {
+                    let shapes = [corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals)];
+                    compilable(&p.key, &shapes) && compilable(&p.val, &shapes)
+                } =>
+            {
                 let (kshape, vshape) = (corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals));
                 let g = compile_projection(&p.key, &p.val, &kshape, &vshape);
                 let mut cols = corgi::eval_graph(&g, CValue::Prod(vec![c.keys, c.vals])).into_prod("linear project");
@@ -53,7 +58,12 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                 let keys = cols.pop().unwrap();
                 CorgiContainer { keys, vals, times: c.times, diffs: c.diffs }
             }
-            LinearOp::Filter(cond) if compilable(cond) => {
+            LinearOp::Filter(cond)
+                if {
+                    let shapes = [corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals)];
+                    compilable(cond, &shapes)
+                } =>
+            {
                 let (kshape, vshape) = (corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals));
                 let g = compile_predicate(cond, &kshape, &vshape);
                 let mask = corgi::eval_graph(&g, CValue::Prod(vec![c.keys.clone(), c.vals.clone()])).into_u64("filter mask");
@@ -117,6 +127,47 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                     out.push(((k, append_iter(v, iter)), t, d));
                 }
                 CorgiContainer::from_updates(out)
+            }
+            // Columnar FlatMap: evaluate the (compilable, homogeneous) list term as a corgi List
+            // column, then explode structurally — the flat element storage IS the new value column
+            // (paired with a per-group position), keys/times/diffs repeat by row via gather. No
+            // per-row eval, no transcode.
+            LinearOp::FlatMap(list_term)
+                if {
+                    let shapes = [corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals)];
+                    compilable(list_term, &shapes)
+                        && matches!(crate::corgi_logic::term_shape(list_term, &shapes), Some(corgi::Shape::List(_)))
+                } =>
+            {
+                let (kshape, vshape) = (corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals));
+                let g = compile_flatmap(list_term, &kshape, &vshape);
+                let list_col = corgi::eval_graph(&g, CValue::Prod(vec![c.keys.clone(), c.vals]));
+                let (bounds, elems) = list_col.into_list("flatmap list");
+                let total = match &bounds {
+                    corgi::Bounds::Offsets(v) => v.last().copied().unwrap_or(0),
+                    corgi::Bounds::Stride(k, rows) => k * rows,
+                };
+                let mut reps: Vec<usize> = Vec::with_capacity(total);
+                let mut pos: Vec<u64> = Vec::with_capacity(total);
+                {
+                    let mut start = 0usize;
+                    let ends: Vec<usize> = match &bounds {
+                        corgi::Bounds::Offsets(v) => v.clone(),
+                        corgi::Bounds::Stride(k, rows) => (1..=*rows).map(|i| i * k).collect(),
+                    };
+                    for (r, end) in ends.into_iter().enumerate() {
+                        for p in 0..(end - start) {
+                            reps.push(r);
+                            pos.push(p as u64);
+                        }
+                        start = end;
+                    }
+                }
+                let keys = gather(&c.keys, &reps);
+                let vals = CValue::Prod(vec![CValue::u64(pos), elems]);
+                let times = reps.iter().map(|&r| c.times[r].clone()).collect();
+                let diffs = reps.iter().map(|&r| c.diffs[r]).collect();
+                CorgiContainer { keys, vals, times, diffs }
             }
             LinearOp::FlatMap(list_term) => {
                 let mut out: Vec<Upd> = Vec::new();
