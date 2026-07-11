@@ -42,26 +42,32 @@
 //! Both are welcome to efficiently notice that there have been no collisions and optimize,
 //! or to ignore the risk entirely and live dangerously.
 
+//! # Columnar times
+//!
+//! The tactics require `T: Columnar` of their timestamps, and every seam type carries
+//! its time column in a columnar container (`ContainerOf<T>`) rather than a `Vec<T>`:
+//! for nested, allocating time types a vector of owned timestamps costs one allocation
+//! per record at every presentation and every replay — the measured dominant cost for
+//! columnar backends. The [`ProxyTime`] alias names the full bound; [`bridge`] holds the
+//! seam types ([`ProxyBridge`], [`SeedTimes`]) and `column` the tactics' internal
+//! working storage.
+
+mod bridge;
+mod column;
 mod history;
 
 pub mod join;
 pub mod reduce;
 
-/// Integer-only exchange medium: a consolidated collection of `[((hash, id), time, diff)]`.
-///
-/// The [`debug_assert_sorted_bridge`] method is (and can be) used to validate this property.
-pub type ProxyBridge<T, R> = Vec<((u64, u64), T, R)>;
-
-/// Debug check that a presented [`ProxyBridge`] is consolidated.
-///
-/// Operator harnesses use the test to flag backend implementations that do not uphold it.
-pub(crate) fn debug_assert_sorted_bridge<T: Ord, R>(bridge: &ProxyBridge<T, R>, who: &str) {
-    debug_assert!(
-        bridge.windows(2).all(|w| (w[0].0, &w[0].1) < (w[1].0, &w[1].1)),
-        "{}: a presented bridge must be sorted & consolidated by ((key_hash, value_id), time)",
-        who,
-    );
-}
-
+pub use bridge::{ProxyBridge, ProxyBridgeBuilder, SeedTimes};
+pub use column::{TimeRef, TimesView};
 pub use join::{JoinInstance, ProxyJoinBackend, ProxyJoinTactic};
 pub use reduce::{ProxyReduceBackend, ProxyReduceTactic, ReduceInstance, ReduceWindow};
+
+use crate::lattice::Lattice;
+use timely::progress::Timestamp;
+
+/// The time bound for the proxy tactics: a timestamp that is columnar-storable, with
+/// container references ordered consistently with the owned order.
+pub trait ProxyTime: Timestamp + Lattice + columnar::Columnar<Container: crate::columnar::layout::OrdContainer> {}
+impl<T: Timestamp + Lattice + columnar::Columnar<Container: crate::columnar::layout::OrdContainer>> ProxyTime for T {}

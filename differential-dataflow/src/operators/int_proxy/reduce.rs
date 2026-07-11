@@ -3,17 +3,19 @@
 //! A conventional differential reduce against `(u64, u64)`, where the backend supplies the
 //! implementation of the interpretation of the integers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use columnar::{Borrow, Clear, Columnar, ContainerOf, Index, Len, Push};
 
 use timely::PartialOrder;
 use timely::progress::{Antichain, Timestamp};
 use timely::progress::frontier::AntichainRef;
 
 use crate::difference::Semigroup;
-use crate::lattice::Lattice;
 use crate::trace::{BatchReader, Description};
-use super::ProxyBridge;
-use crate::operators::reduce::{ReduceTactic, sort_dedup};
+use super::ProxyTime;
+use super::bridge::{ProxyBridge, SeedTimes};
+use super::column::{suffix_meets_rev, TimesView, TimeVec, UpdateCol};
+
+use crate::operators::reduce::ReduceTactic;
 
 use super::history::{IdHistory, TimeHistory};
 
@@ -32,7 +34,7 @@ pub struct ReduceInstance<'a, B1: BatchReader, B2: BatchReader<Time = B1::Time>>
 /// One window of a retire's changed keys: a bounded, hash-contiguous snip the backend sizes.
 ///
 /// The window has the input (old and new) and output histories, restricted to the window's keys.
-pub struct ReduceWindow<T, RIn, ROut> {
+pub struct ReduceWindow<T: Columnar, RIn, ROut> {
     /// The window's key hashes: a contiguous, ascending slice of the retire's `changed` keys.
     pub keys: Vec<u64>,
     /// Input presentation for `keys`, sorted & consolidated by `((key_hash, value_id), time)`.
@@ -46,7 +48,7 @@ pub struct ReduceWindow<T, RIn, ROut> {
 /// The protocol is currently (temporarily) for each round of invocation:
 /// `seed_times begin [ next_window reduce_correction* emit ]* finish`
 /// This should be improved to put the `seed_times` in the per-window loop, or remove it entirely.
-pub trait ProxyReduceBackend<B1: BatchReader, B2: BatchReader<Time = B1::Time>> {
+pub trait ProxyReduceBackend<B1: BatchReader<Time: ProxyTime>, B2: BatchReader<Time = B1::Time>> {
     /// Diff type presented for the input.
     type RIn: Semigroup;
     /// Diff type of the output.
@@ -55,7 +57,7 @@ pub trait ProxyReduceBackend<B1: BatchReader, B2: BatchReader<Time = B1::Time>> 
     /// Hash keys and associated times in the instance's novel input batches.
     ///
     /// This is used (with held times) to seed the interesting times for each key.
-    fn seed_times(&self, instance: &ReduceInstance<'_, B1, B2>) -> Vec<(u64, B1::Time)>;
+    fn seed_times(&self, instance: &ReduceInstance<'_, B1, B2>) -> SeedTimes<B1::Time>;
 
     /// Initiate a session to create batches for these descriptions, which span `[lower, upper)`.
     ///
@@ -88,30 +90,69 @@ pub trait ProxyReduceBackend<B1: BatchReader, B2: BatchReader<Time = B1::Time>> 
     /// Commit to a collection of updates at a specific batch in progress.
     ///
     /// The `tile: usize` indexes the list of descriptions provided to `begin()`, and these updates
-    /// are aimed at that batch in progress.
-    fn emit(&mut self, tile: usize, records: &[((u64, u64), B1::Time, Self::ROut)]);
+    /// are aimed at that batch in progress. The columns are aligned, sorted, and consolidated by
+    /// `((key_hash, value_id), time)`.
+    fn emit(&mut self, tile: usize, ids: &[(u64, u64)], times: TimesView<'_, B1::Time>, diffs: &[Self::ROut]);
 
     /// Complete the session matching `begin`. The outputs correspond to the descriptions it was provided.
     fn finish(&mut self) -> Vec<B2>;
 }
 
-/// A proxy-space [`ReduceTactic`]: matches input and output records by `key_hash`.
-pub struct ProxyReduceTactic<T, Bk> {
-    backend: Bk,
-    /// Pending interesting times beyond the upper frontier, keyed by key hash.
-    pending: BTreeMap<u64, Vec<T>>,
+/// Outstanding interesting times at or beyond a retire's upper frontier, keyed by the
+/// stable key hash: ascending keys, each with a run of ascending times in a shared
+/// columnar container. Rebuilt each retire (keys are visited in ascending order, so runs
+/// append), read back by a cursor advancing in lockstep with the changed keys.
+struct PendingTimes<T: Columnar> {
+    keys: Vec<u64>,
+    ends: Vec<usize>,
+    times: ContainerOf<T>,
 }
 
-impl<T, Bk> ProxyReduceTactic<T, Bk> {
+impl<T: ProxyTime> PendingTimes<T> {
+    fn new() -> Self {
+        PendingTimes { keys: Vec::new(), ends: Vec::new(), times: Default::default() }
+    }
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.ends.clear();
+        self.times.clear();
+    }
+    fn keys(&self) -> &[u64] { &self.keys }
+    fn times(&self) -> TimesView<'_, T> { self.times.borrow() }
+    /// The time range of the `index`th key's run.
+    fn run(&self, index: usize) -> std::ops::Range<usize> {
+        let lower = if index == 0 { 0 } else { self.ends[index - 1] };
+        lower..self.ends[index]
+    }
+    /// Append `times` as the run of `key`; keys must arrive ascending.
+    fn push_run(&mut self, key: u64, times: &TimeVec<T>) {
+        debug_assert!(self.keys.iter().last().is_none_or(|k| *k < key));
+        let view = times.view();
+        for i in 0..view.len() {
+            self.times.push(view.get(i));
+        }
+        self.keys.push(key);
+        self.ends.push(self.times.len());
+    }
+}
+
+/// A proxy-space [`ReduceTactic`]: matches input and output records by `key_hash`.
+pub struct ProxyReduceTactic<T: Columnar, Bk> {
+    backend: Bk,
+    /// Pending interesting times beyond the upper frontier, keyed by key hash.
+    pending: PendingTimes<T>,
+}
+
+impl<T: ProxyTime, Bk> ProxyReduceTactic<T, Bk> {
     /// A tactic deferring all value semantics to `backend`.
     pub fn new(backend: Bk) -> Self {
-        ProxyReduceTactic { backend, pending: BTreeMap::new() }
+        ProxyReduceTactic { backend, pending: PendingTimes::new() }
     }
 }
 
 impl<B1, B2, Bk> ReduceTactic<B1, B2> for ProxyReduceTactic<B1::Time, Bk>
 where
-    B1: BatchReader,
+    B1: BatchReader<Time: ProxyTime>,
     B2: BatchReader<Time = B1::Time>,
     Bk: ProxyReduceBackend<B1, B2>,
 {
@@ -136,14 +177,29 @@ where
         };
 
         let seeds = self.backend.seed_times(&instance);
-        debug_assert!(seeds.windows(2).all(|w| w[0].0 <= w[1].0), "seed_times must be sorted by key_hash");
-        let mut changed: BTreeSet<u64> = seeds.iter().map(|(k, _)| *k).collect();
-        changed.extend(self.pending.keys().copied());
+        debug_assert!(seeds.keys().windows(2).all(|w| w[0] <= w[1]), "seed_times must be sorted by key_hash");
+        // The changed keys: those seeded by the novel input, merged with those carrying
+        // pending times (both sorted runs; a linear merge replaces the old `BTreeSet`).
+        let mut changed: Vec<u64> = Vec::new();
+        {
+            let (skeys, pkeys) = (seeds.keys(), self.pending.keys());
+            let (mut s, mut p) = (0, 0);
+            while s < skeys.len() || p < pkeys.len() {
+                let next = match (skeys.get(s), pkeys.get(p)) {
+                    (Some(&sk), Some(&pk)) => sk.min(pk),
+                    (Some(&sk), None) => sk,
+                    (None, Some(&pk)) => pk,
+                    (None, None) => unreachable!(),
+                };
+                while s < skeys.len() && skeys[s] == next { s += 1; }
+                while p < pkeys.len() && pkeys[p] == next { p += 1; }
+                changed.push(next);
+            }
+        }
         if changed.is_empty() {
             self.pending.clear();
             return (Vec::new(), Antichain::new());
         }
-        let changed: Vec<u64> = changed.into_iter().collect();
 
         // The output tiling (identical to the Abelian tactic): one tile per held time, keeping
         // non-degenerate intervals; `tile_of[i]` maps held time `i` to its tile.
@@ -168,7 +224,10 @@ where
         }
         self.backend.begin(&tile_descs);
 
-        let mut new_pending: BTreeMap<u64, Vec<B1::Time>> = BTreeMap::new();
+        let mut new_pending: PendingTimes<B1::Time> = PendingTimes::new();
+        // Cursor into the carried pending runs; `changed` contains every pending key, and
+        // both ascend, so a single pass serves all windows.
+        let mut pend_idx = 0usize;
 
         let mut cursor = 0usize;
         let mut ns = 0usize;
@@ -177,23 +236,30 @@ where
         // profiling note on `DiscoverScratch`: fresh per-key/per-round `Vec`s were the dominant cost.
         let mut discover_scratch: DiscoverScratch<B1::Time, Bk::RIn> = DiscoverScratch::new();
         let mut states: Vec<KeyState<B1::Time, Bk::RIn, Bk::ROut>> = Vec::new();
-        let mut tile_deltas: Vec<Vec<((u64, u64), B1::Time, Bk::ROut)>> = (0..held_elems.len()).map(|_| Vec::new()).collect();
+        let mut tile_deltas: Vec<UpdateCol<(u64, u64), B1::Time, Bk::ROut>> = (0..held_elems.len()).map(|_| UpdateCol::new()).collect();
         let mut batch_keys: Vec<u64> = Vec::new();
         let mut in_ends: Vec<usize> = Vec::new();
         let mut in_all: Vec<(u64, Bk::RIn)> = Vec::new();
         let mut out_ends: Vec<usize> = Vec::new();
         let mut out_all: Vec<(u64, Bk::ROut)> = Vec::new();
-        let mut active: Vec<(usize, B1::Time)> = Vec::new();
+        // A round's active moments, as (state index, moment index); the time itself is
+        // read back from the state's moment column, never cloned out.
+        let mut active: Vec<(usize, usize)> = Vec::new();
         let mut in_accum: Vec<(u64, Bk::RIn)> = Vec::new();
         let mut cur_out: Vec<(u64, Bk::ROut)> = Vec::new();
-        let mut moments_scratch: Vec<B1::Time> = Vec::new();
-        let mut pended_scratch: Vec<B1::Time> = Vec::new();
+        let mut moments_scratch: TimeVec<B1::Time> = TimeVec::new();
+        let mut pended_scratch: TimeVec<B1::Time> = TimeVec::new();
+        // Owned working times for lattice tests over container refs.
+        let mut t_cur: B1::Time = Timestamp::minimum();
+        let mut m_cur: B1::Time = Timestamp::minimum();
+        let mut s0: B1::Time = Timestamp::minimum();
+        let mut s1: B1::Time = Timestamp::minimum();
 
         while let Some(window) = self.backend.next_window(&instance, &changed, &mut cursor) {
             let p_in = &window.input;
             let p_out = &window.output;
-            super::debug_assert_sorted_bridge(p_in, "next_window.input");
-            super::debug_assert_sorted_bridge(p_out, "next_window.output");
+            p_in.debug_assert_sorted("next_window.input");
+            p_out.debug_assert_sorted("next_window.output");
 
             for deltas in tile_deltas.iter_mut() { deltas.clear(); }
 
@@ -201,46 +267,47 @@ where
             // (times only — no accumulation) and stand up its per-moment replays. Peak state is
             // O(window presentation), bounded by the window `next_window` already materialized.
             // `states` is a long-lived buffer reloaded slot-by-slot (not cleared/rebuilt): a slot's
-            // `Vec`s and replays are allocated once and reused, so keys cost no per-key alloc/free.
+            // columns and replays are allocated once and reused, so keys cost no per-key alloc/free.
             // `n_states` is the live prefix this window; higher slots persist (retaining capacity).
             let mut n_states = 0usize;
             let (mut is, mut os) = (0usize, 0usize);
             for &key in &window.keys {
-                while is < p_in.len() && p_in[is].0.0 < key { is += 1; }
+                while is < p_in.len() && p_in.ids()[is].0 < key { is += 1; }
                 let i0 = is;
-                while is < p_in.len() && p_in[is].0.0 == key { is += 1; }
+                while is < p_in.len() && p_in.ids()[is].0 == key { is += 1; }
                 let i1 = is;
-                while os < p_out.len() && p_out[os].0.0 < key { os += 1; }
+                while os < p_out.len() && p_out.ids()[os].0 < key { os += 1; }
                 let o0 = os;
-                while os < p_out.len() && p_out[os].0.0 == key { os += 1; }
+                while os < p_out.len() && p_out.ids()[os].0 == key { os += 1; }
                 let o1 = os;
-                while ns < seeds.len() && seeds[ns].0 < key { ns += 1; }
+                while ns < seeds.len() && seeds.keys()[ns] < key { ns += 1; }
                 let n0 = ns;
-                while ns < seeds.len() && seeds[ns].0 == key { ns += 1; }
+                while ns < seeds.len() && seeds.keys()[ns] == key { ns += 1; }
                 let n1 = ns;
+                while pend_idx < self.pending.keys().len() && self.pending.keys()[pend_idx] < key { pend_idx += 1; }
+                let pending_range = if pend_idx < self.pending.keys().len() && self.pending.keys()[pend_idx] == key {
+                    self.pending.run(pend_idx)
+                } else {
+                    0..0
+                };
 
                 moments_scratch.clear();
                 pended_scratch.clear();
-                {
-                    let pending = self.pending.get(&key).map(|p| &p[..]).unwrap_or(&[]);
-                    let seed_times = seeds[n0..n1].iter().map(|(_, t)| t.clone());
-                    let out_times = (o0..o1).map(|o| p_out[o].1.clone());
-                    discover_times(
-                        KeyView { p_in, i0, i1, pending },
-                        seed_times, out_times, upper,
-                        &mut discover_scratch,
-                        &mut moments_scratch, &mut pended_scratch,
-                    );
-                }
+                discover_times(
+                    KeyView { p_in, i0, i1, pending: self.pending.times(), pending_range },
+                    &seeds, n0..n1, p_out, o0..o1, upper,
+                    &mut discover_scratch,
+                    &mut moments_scratch, &mut pended_scratch,
+                );
                 if !pended_scratch.is_empty() {
-                    new_pending.insert(key, std::mem::take(&mut pended_scratch));
+                    new_pending.push_run(key, &pended_scratch);
                 }
                 if moments_scratch.is_empty() {
                     continue;
                 }
 
                 // Reload slot `n_states` in place (grow the buffer by one only when a window is wider
-                // than any before). `drain` moves the discovered moments in without copy or realloc.
+                // than any before): the moments copy into the slot's column, and the replays reload.
                 if n_states == states.len() {
                     states.push(KeyState::empty());
                 }
@@ -249,15 +316,22 @@ where
                 st.cursor = 0;
                 st.produced.clear();
                 st.moments.clear();
-                st.moments.extend(moments_scratch.drain(..));
-                st.meets.clear();
-                st.meets.extend(st.moments.iter().cloned());
-                for i in (1..st.meets.len()).rev() {
-                    let m = st.meets[i].clone();
-                    st.meets[i - 1].meet_assign(&m);
+                {
+                    let view = moments_scratch.view();
+                    for i in 0..view.len() {
+                        st.moments.push(view.get(i));
+                    }
                 }
-                st.in_replay.load_iter((i0..i1).map(|i| (p_in[i].0.1, p_in[i].1.clone(), p_in[i].2.clone())), st.meets.first());
-                st.out_replay.load_iter((o0..o1).map(|o| (p_out[o].0.1, p_out[o].1.clone(), p_out[o].2.clone())), st.meets.first());
+                suffix_meets_rev::<B1::Time>(st.moments.borrow(), 0..st.moments.len(), &mut st.meets_rev, &mut s0, &mut s1);
+                // The meet of all the key's moments, to load the replays compacted.
+                let first_meet = if st.moments.len() > 0 {
+                    s0.copy_from(st.meets_rev.borrow().get(st.moments.len() - 1));
+                    Some(&s0)
+                } else {
+                    None
+                };
+                st.in_replay.load(p_in, i0..i1, first_meet);
+                st.out_replay.load(p_out, o0..o1, first_meet);
                 n_states += 1;
             }
 
@@ -283,27 +357,40 @@ where
                     advanced = true;
                     let j = st.cursor;
                     st.cursor += 1;
-                    let t = st.moments[j].clone();
-                    st.in_replay.step_through(&t);
-                    st.out_replay.step_through(&t);
-                    st.in_replay.advance_buffer_by(&st.meets[j]);
-                    st.out_replay.advance_buffer_by(&st.meets[j]);
-                    for ((_, et), _) in st.produced.iter_mut() {
-                        *et = et.join(&st.meets[j]);
-                    }
-                    crate::consolidation::consolidate(&mut st.produced);
+                    t_cur.copy_from(st.moments.borrow().get(j));
+                    m_cur.copy_from(st.meets_rev.borrow().get(st.moments.len() - 1 - j));
+                    st.in_replay.step_through(&t_cur);
+                    st.out_replay.step_through(&t_cur);
+                    st.in_replay.advance_buffer_by(&m_cur);
+                    st.out_replay.advance_buffer_by(&m_cur);
+                    st.produced.advance_by(&m_cur, &mut s0);
+                    st.produced.consolidate();
 
                     in_accum.clear();
-                    for ((vid, et), d) in st.in_replay.buffer().iter() {
-                        if et.less_equal(&t) {
-                            in_accum.push((*vid, d.clone()));
+                    {
+                        let buffer = st.in_replay.buffer();
+                        for idx in 0..buffer.len() {
+                            s0.copy_from(buffer.time(idx));
+                            if s0.less_equal(&t_cur) {
+                                in_accum.push((buffer.ids()[idx], buffer.diffs()[idx].clone()));
+                            }
                         }
                     }
                     crate::consolidation::consolidate(&mut in_accum);
                     cur_out.clear();
-                    for ((vid, et), d) in st.out_replay.buffer().iter().chain(st.produced.iter()) {
-                        if et.less_equal(&t) {
-                            cur_out.push((*vid, d.clone()));
+                    {
+                        let buffer = st.out_replay.buffer();
+                        for idx in 0..buffer.len() {
+                            s0.copy_from(buffer.time(idx));
+                            if s0.less_equal(&t_cur) {
+                                cur_out.push((buffer.ids()[idx], buffer.diffs()[idx].clone()));
+                            }
+                        }
+                        for idx in 0..st.produced.len() {
+                            s0.copy_from(st.produced.time(idx));
+                            if s0.less_equal(&t_cur) {
+                                cur_out.push((st.produced.ids()[idx], st.produced.diffs()[idx].clone()));
+                            }
                         }
                     }
                     crate::consolidation::consolidate(&mut cur_out);
@@ -312,11 +399,11 @@ where
                         continue;
                     }
                     batch_keys.push(st.key);
-                    in_all.extend(in_accum.drain(..));
+                    Extend::extend(&mut in_all, in_accum.drain(..));
                     in_ends.push(in_all.len());
-                    out_all.extend(cur_out.drain(..));
+                    Extend::extend(&mut out_all, cur_out.drain(..));
                     out_ends.push(out_all.len());
-                    active.push((si, t));
+                    active.push((si, j));
                 }
                 // Terminate only when every key is EXHAUSTED — not merely when this round produced no
                 // crossing. A round can be empty because every key's current moment is empty-gated
@@ -330,13 +417,16 @@ where
 
                 let (corr, corr_ends) = self.backend.reduce_corrections(&batch_keys, &in_ends, &in_all, &out_ends, &out_all);
                 let mut cstart = 0usize;
-                for (bi, (si, t)) in active.iter().enumerate() {
+                for (bi, (si, j)) in active.iter().enumerate() {
                     let cend = corr_ends[bi];
                     if cstart != cend {
-                        let idx = held_elems.iter().rposition(|h| h.less_equal(t)).expect("no held capability <= active time");
+                        let KeyState { key, moments, produced, .. } = &mut states[*si];
+                        let t = moments.borrow().get(*j);
+                        s0.copy_from(t);
+                        let idx = held_elems.iter().rposition(|h| h.less_equal(&s0)).expect("no held capability <= active time");
                         for (vid, d) in &corr[cstart..cend] {
-                            states[*si].produced.push(((*vid, t.clone()), d.clone()));
-                            tile_deltas[idx].push(((states[*si].key, *vid), t.clone(), d.clone()));
+                            produced.push_ref(*vid, t, d.clone());
+                            tile_deltas[idx].push_ref((*key, *vid), t, d.clone());
                         }
                     }
                     cstart = cend;
@@ -348,8 +438,8 @@ where
                     continue;
                 }
                 if let Some(tile) = tile_of[held_index] {
-                    crate::consolidation::consolidate_updates(deltas);
-                    self.backend.emit(tile, &deltas[..]);
+                    deltas.consolidate();
+                    self.backend.emit(tile, deltas.ids(), deltas.times(), deltas.diffs());
                 }
             }
         }
@@ -357,9 +447,13 @@ where
         self.pending = new_pending;
         let produced: Vec<(B1::Time, B2)> = tile_held.into_iter().zip(self.backend.finish()).collect();
         let mut frontier = Antichain::new();
-        for times in self.pending.values() {
-            for t in times {
-                frontier.insert_ref(t);
+        {
+            let view = self.pending.times();
+            for i in 0..view.len() {
+                s0.copy_from(view.get(i));
+                if !frontier.less_equal(&s0) {
+                    frontier.insert(s0.clone());
+                }
             }
         }
         (produced, frontier)
@@ -367,76 +461,95 @@ where
 }
 
 /// Per-key application state for [`ProxyReduceTactic`]'s round-batched walk: the key's ordered
-/// interesting `moments` and their suffix `meets`, its input and output replays (meet-collapsed),
-/// the corrections `produced` this round so far, and a `cursor` into `moments`. Held for all of a
-/// window's keys at once so each round's crossing batches across keys — a key's own moments stay
-/// sequential (each sees its earlier corrections via `produced`), but distinct keys are independent.
-struct KeyState<T, RIn, ROut> {
+/// interesting `moments` and their (reversed) suffix meets, its input and output replays
+/// (meet-collapsed), the corrections `produced` this round so far, and a `cursor` into `moments`.
+/// Held for all of a window's keys at once so each round's crossing batches across keys — a key's
+/// own moments stay sequential (each sees its earlier corrections via `produced`), but distinct
+/// keys are independent.
+struct KeyState<T: Columnar, RIn, ROut> {
     key: u64,
-    moments: Vec<T>,
-    meets: Vec<T>,
+    moments: ContainerOf<T>,
+    /// Reversed suffix meets of `moments`: the meet of `moments[j..]` is
+    /// `meets_rev[len - 1 - j]`.
+    meets_rev: ContainerOf<T>,
     in_replay: IdHistory<T, RIn>,
     out_replay: IdHistory<T, ROut>,
-    produced: Vec<((u64, T), ROut)>,
+    produced: UpdateCol<u64, T, ROut>,
     cursor: usize,
 }
 
-impl<T: Timestamp + Lattice, RIn: Semigroup, ROut: Semigroup> KeyState<T, RIn, ROut> {
+impl<T: ProxyTime, RIn: Semigroup, ROut: Semigroup> KeyState<T, RIn, ROut> {
     /// An empty slot, to be filled by [`ProxyReduceTactic`]'s phase 1 (`reload`-style). The `states`
     /// vector holds these across windows and reloads them in place, so a key's buffers are allocated
     /// once (per slot) and reused — never dropped per key (which was ~18% of load in `free`).
     fn empty() -> Self {
-        KeyState { key: 0, moments: Vec::new(), meets: Vec::new(), in_replay: IdHistory::new(), out_replay: IdHistory::new(), produced: Vec::new(), cursor: 0 }
+        KeyState {
+            key: 0,
+            moments: Default::default(),
+            meets_rev: Default::default(),
+            in_replay: IdHistory::new(),
+            out_replay: IdHistory::new(),
+            produced: UpdateCol::new(),
+            cursor: 0,
+        }
     }
 }
 
 /// Reusable per-key scratch for [`discover_times`], held once per retire and threaded through every
-/// key so the replays and time buffers are cleared-and-refilled (`load`/`load_iter` reset while
-/// keeping capacity) rather than reallocated. Mirrors the reference `HistoryReplayer`'s field-held
-/// scratch; without it each of ~n keys paid ~7 fresh allocations per call — profiled at ~54% of the
-/// hash-reduce load in `malloc`, against the cursor reduce's ~10% (see DESIGN.md F7).
-struct DiscoverScratch<T, RIn> {
+/// key so the replays and time columns are cleared-and-refilled (retaining capacity) rather than
+/// reallocated. Mirrors the reference `HistoryReplayer`'s field-held scratch; without it each of ~n
+/// keys paid ~7 fresh allocations per call — profiled at ~54% of the hash-reduce load in `malloc`,
+/// against the cursor reduce's ~10%.
+struct DiscoverScratch<T: Columnar, RIn> {
     batch_replay: TimeHistory<T>,
     input_replay: IdHistory<T, RIn>,
     output_replay: TimeHistory<T>,
-    synth: Vec<T>,
-    times_current: Vec<T>,
-    temporary: Vec<T>,
-    meets: Vec<T>,
+    /// Synthesized interesting times, ascending, consumed from `synth_cursor`.
+    synth: TimeVec<T>,
+    synth_cursor: usize,
+    times_current: TimeVec<T>,
+    temporary: TimeVec<T>,
+    /// Reversed suffix meets of the key's pending run.
+    pending_meets_rev: ContainerOf<T>,
+    // Owned working times.
+    next_time: T,
+    /// The running meet of every remaining source of times; `meet_valid` is its presence
+    /// (an inline `Option<T>` that keeps the time's allocations across iterations).
+    meet: T,
+    meet_valid: bool,
+    s0: T,
+    s1: T,
 }
 
-impl<T: Timestamp + Lattice, RIn: Semigroup + Clone> DiscoverScratch<T, RIn> {
+impl<T: ProxyTime, RIn: Semigroup + Clone> DiscoverScratch<T, RIn> {
     fn new() -> Self {
         DiscoverScratch {
             batch_replay: TimeHistory::new(),
             input_replay: IdHistory::new(),
             output_replay: TimeHistory::new(),
-            synth: Vec::new(),
-            times_current: Vec::new(),
-            temporary: Vec::new(),
-            meets: Vec::new(),
+            synth: TimeVec::new(),
+            synth_cursor: 0,
+            times_current: TimeVec::new(),
+            temporary: TimeVec::new(),
+            pending_meets_rev: Default::default(),
+            next_time: Timestamp::minimum(),
+            meet: Timestamp::minimum(),
+            meet_valid: false,
+            s0: Timestamp::minimum(),
+            s1: Timestamp::minimum(),
         }
     }
 }
 
 /// A one-key view into the input presentation: the read-only arguments [`discover_times`] needs
 /// about a single key — its slice `[i0, i1)` of the merged input run `p_in` and the carried
-/// `pending` times.
-struct KeyView<'a, T, RIn> {
+/// `pending` times (a view of the shared pending column, with the key's run range).
+struct KeyView<'a, T: Columnar, RIn> {
     p_in: &'a ProxyBridge<T, RIn>,
     i0: usize,
     i1: usize,
-    pending: &'a [T],
-}
-
-/// Updates an optional meet by an optional time.
-fn update_meet<T: Lattice + Clone>(meet: &mut Option<T>, other: Option<&T>) {
-    if let Some(time) = other {
-        match meet.as_mut() {
-            Some(m) => m.meet_assign(time),
-            None => *meet = Some(time.clone()),
-        }
-    }
+    pending: TimesView<'a, T>,
+    pending_range: std::ops::Range<usize>,
 }
 
 /// Phase A: discover a key's interesting times in `[lower, upper)` (pending those at/after `upper`)
@@ -446,134 +559,194 @@ fn update_meet<T: Lattice + Clone>(meet: &mut Option<T>, other: Option<&T>) {
 /// joins thereof — joins against the input/output histories and the reached times. Nothing
 /// materializes an input collection, so peak memory is O(times), never O(times × values); the
 /// application walk re-assembles each moment's accumulation on the fly, one moment deep — the whole
-/// point of the tactic (see DESIGN.md F8). Buffers are advanced by the meet of the times still to
-/// come and consolidated, keeping a key with many distinct times linear rather than quadratic.
+/// point of the tactic. Buffers are advanced by the meet of the times still to come and
+/// consolidated, keeping a key with many distinct times linear rather than quadratic.
+///
+/// All time sets live in columnar containers; the loop's owned working times (`next_time`, the
+/// running `meet`, and the `s0`/`s1` scratches) are the only owned timestamps, reused across every
+/// iteration and every key.
 #[allow(clippy::too_many_arguments)]
 fn discover_times<T, RIn>(
     key: KeyView<'_, T, RIn>,
-    seed_times: impl Iterator<Item = T>,
-    out_times: impl Iterator<Item = T>,
+    seeds: &SeedTimes<T>,
+    seed_range: std::ops::Range<usize>,
+    p_out: &ProxyBridge<T, impl Semigroup>,
+    out_range: std::ops::Range<usize>,
     upper: &Antichain<T>,
     scratch: &mut DiscoverScratch<T, RIn>,
-    moments: &mut Vec<T>,
-    pended: &mut Vec<T>,
+    moments: &mut TimeVec<T>,
+    pended: &mut TimeVec<T>,
 ) where
-    T: Timestamp + Lattice,
+    T: ProxyTime,
     RIn: Semigroup + Clone,
 {
-    // Reuse the retire's scratch: `load`/`load_iter` reset the replays (keeping capacity); the plain
-    // buffers are cleared here. `meets_slice` reborrows `meets` immutably; the rest stay disjoint.
-    let DiscoverScratch { batch_replay, input_replay, output_replay, synth, times_current, temporary, meets } = scratch;
+    // Reuse the retire's scratch: loads reset the replays (keeping capacity); the plain
+    // columns are cleared here.
+    let DiscoverScratch {
+        batch_replay, input_replay, output_replay,
+        synth, synth_cursor, times_current, temporary, pending_meets_rev,
+        next_time, meet, meet_valid, s0, s1,
+    } = scratch;
     synth.clear();
+    *synth_cursor = 0;
     times_current.clear();
     temporary.clear();
 
-    batch_replay.load(seed_times, None);
+    let seeds_view = seeds.times();
+    batch_replay.load(seed_range.map(|i| seeds_view.get(i)), None);
 
-    meets.clear();
-    meets.extend(key.pending.iter().cloned());
-    for i in (1..meets.len()).rev() {
-        let m = meets[i].clone();
-        meets[i - 1].meet_assign(&m);
+    // Suffix meets of the carried pending times (reversed, as everywhere).
+    suffix_meets_rev::<T>(key.pending, key.pending_range.clone(), pending_meets_rev, s0, s1);
+    let pending_len = key.pending_range.len();
+    // Cursor into the key's pending run: `pending_range.start + pcur` is the next time.
+    let mut pcur = 0usize;
+
+    *meet_valid = false;
+    if pending_len > 0 {
+        meet.copy_from(pending_meets_rev.borrow().get(pending_len - 1));
+        *meet_valid = true;
     }
-
-    let mut meet: Option<T> = None;
-    update_meet(&mut meet, meets.first());
-    update_meet(&mut meet, batch_replay.meet());
+    if let Some(m) = batch_replay.meet() {
+        s0.copy_from(m);
+        if *meet_valid { meet.meet_assign(&*s0); } else { meet.clone_from(&*s0); *meet_valid = true; }
+    }
 
     // The merged (history ⊎ novel) run — replayed for its TIMES only (join base), never
     // accumulated. Output times likewise: base joins, never seeds.
-    input_replay.load_iter(
-        (key.i0..key.i1).map(|i| (key.p_in[i].0.1, key.p_in[i].1.clone(), key.p_in[i].2.clone())),
-        meet.as_ref(),
-    );
-    output_replay.load(out_times, meet.as_ref());
+    let advance_by = if *meet_valid { Some(&*meet) } else { None };
+    input_replay.load(key.p_in, key.i0..key.i1, advance_by);
+    let out_view = p_out.times();
+    output_replay.load(out_range.map(|o| out_view.get(o)), advance_by);
 
-    let mut times_slice = key.pending;
-    let mut meets_slice = &meets[..];
-
-    while let Some(next_time) = [batch_replay.time(), times_slice.first(), input_replay.time(), output_replay.time(), synth.last()]
-        .into_iter()
-        .flatten()
-        .min()
-        .cloned()
-    {
-        input_replay.step_while_time_is(&next_time);
-        output_replay.step_while_time_is(&next_time);
-        let mut interesting = batch_replay.step_while_time_is(&next_time);
-        if interesting {
-            if let Some(m) = meet.as_ref() {
-                batch_replay.advance_buffer_by(m);
+    loop {
+        // The next time: the least of every source's next. All candidates are container
+        // refs; reborrow to a common lifetime, take the min, and copy it out before any
+        // source is stepped.
+        let has_next = {
+            let candidates = [
+                batch_replay.time().map(T::reborrow),
+                (pcur < pending_len).then(|| T::reborrow(key.pending.get(key.pending_range.start + pcur))),
+                input_replay.time().map(T::reborrow),
+                output_replay.time().map(T::reborrow),
+                (*synth_cursor < synth.len()).then(|| T::reborrow(synth.get(*synth_cursor))),
+            ];
+            if let Some(min) = candidates.into_iter().flatten().min() {
+                next_time.copy_from(min);
+                true
+            } else {
+                false
             }
+        };
+        if !has_next {
+            break;
         }
-        while synth.last() == Some(&next_time) {
-            times_current.push(synth.pop().expect("nonempty"));
-            interesting = true;
-        }
-        while times_slice.first() == Some(&next_time) {
-            times_current.push(times_slice[0].clone());
-            times_slice = &times_slice[1..];
-            meets_slice = &meets_slice[1..];
-            interesting = true;
-        }
-        interesting = interesting || batch_replay.buffer().iter().any(|t| t.less_equal(&next_time));
-        interesting = interesting || times_current.iter().any(|t| t.less_equal(&next_time));
 
-        if !upper.less_equal(&next_time) {
+        input_replay.step_while_time_is(next_time);
+        output_replay.step_while_time_is(next_time);
+        let mut interesting = batch_replay.step_while_time_is(next_time);
+        if interesting && *meet_valid {
+            batch_replay.advance_buffer_by(meet);
+        }
+        while *synth_cursor < synth.len() && {
+            s0.copy_from(synth.get(*synth_cursor));
+            *s0 == *next_time
+        } {
+            times_current.push_ref(synth.get(*synth_cursor));
+            *synth_cursor += 1;
+            interesting = true;
+        }
+        while pcur < pending_len && {
+            s0.copy_from(key.pending.get(key.pending_range.start + pcur));
+            *s0 == *next_time
+        } {
+            times_current.push_ref(key.pending.get(key.pending_range.start + pcur));
+            pcur += 1;
+            interesting = true;
+        }
+        interesting = interesting || any_le(batch_replay.buffer().view(), next_time, s0);
+        interesting = interesting || any_le(times_current.view(), next_time, s0);
+
+        if !upper.less_equal(next_time) {
             if interesting {
                 // Synthesize joins against the input/output histories (times only — no
                 // accumulation), then record `next_time` as an interesting moment.
-                if let Some(m) = meet.as_ref() {
-                    input_replay.advance_buffer_by(m);
+                if *meet_valid {
+                    input_replay.advance_buffer_by(meet);
                 }
-                for ((_, t), _) in input_replay.buffer().iter() {
-                    if !t.less_equal(&next_time) {
-                        temporary.push(next_time.join(t));
+                join_beyond_into(input_replay.buffer().times(), next_time, temporary, s0);
+                if *meet_valid {
+                    output_replay.advance_buffer_by(meet);
+                }
+                join_beyond_into(output_replay.buffer().view(), next_time, temporary, s0);
+                moments.push_own(next_time);
+            }
+            join_beyond_into(batch_replay.buffer().view(), next_time, temporary, s0);
+            join_beyond_into(times_current.view(), next_time, temporary, s0);
+            temporary.sort_dedup();
+            let mut synthesized = false;
+            {
+                let view = temporary.view();
+                for i in 0..view.len() {
+                    s0.copy_from(view.get(i));
+                    if upper.less_equal(&*s0) {
+                        pended.push_own(s0);
+                    } else {
+                        synth.push_own(s0);
+                        synthesized = true;
                     }
                 }
-                if let Some(m) = meet.as_ref() {
-                    output_replay.advance_buffer_by(m);
-                }
-                for t in output_replay.buffer().iter() {
-                    if !t.less_equal(&next_time) {
-                        temporary.push(next_time.join(t));
-                    }
-                }
-                moments.push(next_time.clone());
             }
-            temporary.extend(batch_replay.buffer().iter().filter(|t| !t.less_equal(&next_time)).map(|t| t.join(&next_time)));
-            temporary.extend(times_current.iter().filter(|t| !t.less_equal(&next_time)).map(|t| t.join(&next_time)));
-            sort_dedup(temporary);
-            let synth_len = synth.len();
-            for time in temporary.drain(..) {
-                if upper.less_equal(&time) {
-                    pended.push(time);
-                } else {
-                    synth.push(time);
-                }
-            }
-            if synth.len() > synth_len {
-                synth.sort_by(|x, y| y.cmp(x));
-                synth.dedup();
+            temporary.clear();
+            if synthesized {
+                synth.sort_dedup_from(synth_cursor);
             }
         } else if interesting {
-            pended.push(next_time.clone());
+            pended.push_own(next_time);
         }
 
-        meet = None;
-        update_meet(&mut meet, batch_replay.meet());
-        update_meet(&mut meet, input_replay.meet());
-        update_meet(&mut meet, output_replay.meet());
-        for t in synth.iter() {
-            update_meet(&mut meet, Some(t));
-        }
-        update_meet(&mut meet, meets_slice.first());
-        if let Some(m) = meet.as_ref() {
-            for t in times_current.iter_mut() {
-                *t = t.join(m);
+        // Track the meet of every remaining source of times, and keep `times_current`
+        // advanced by it (the same collapse as the buffers).
+        *meet_valid = false;
+        for candidate in [batch_replay.meet(), input_replay.meet(), output_replay.meet()] {
+            if let Some(m) = candidate {
+                s0.copy_from(m);
+                if *meet_valid { meet.meet_assign(&*s0); } else { meet.clone_from(&*s0); *meet_valid = true; }
             }
         }
-        sort_dedup(times_current);
+        for i in *synth_cursor..synth.len() {
+            s0.copy_from(synth.get(i));
+            if *meet_valid { meet.meet_assign(&*s0); } else { meet.clone_from(&*s0); *meet_valid = true; }
+        }
+        if pcur < pending_len {
+            s0.copy_from(pending_meets_rev.borrow().get(pending_len - 1 - pcur));
+            if *meet_valid { meet.meet_assign(&*s0); } else { meet.clone_from(&*s0); *meet_valid = true; }
+        }
+        if *meet_valid {
+            times_current.advance_by(meet, s0);
+        } else {
+            times_current.sort_dedup();
+        }
     }
-    sort_dedup(pended);
+    pended.sort_dedup();
+}
+
+/// True iff any time in `times` is `less_equal` the probe (copying each into `scratch`
+/// for the partially-ordered test).
+fn any_le<T: ProxyTime>(times: TimesView<'_, T>, probe: &T, scratch: &mut T) -> bool {
+    (0..times.len()).any(|i| {
+        scratch.copy_from(times.get(i));
+        scratch.less_equal(probe)
+    })
+}
+
+/// For every time in `times` NOT `less_equal` the probe, push its join with the probe
+/// into `out` — the synthetic-join step against a replayed history.
+fn join_beyond_into<T: ProxyTime>(times: TimesView<'_, T>, probe: &T, out: &mut TimeVec<T>, scratch: &mut T) {
+    for i in 0..times.len() {
+        scratch.copy_from(times.get(i));
+        if !scratch.less_equal(probe) {
+            scratch.join_assign(probe);
+            out.push_own(scratch);
+        }
+    }
 }

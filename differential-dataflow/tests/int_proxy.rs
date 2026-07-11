@@ -358,7 +358,7 @@ fn proxy_reduce_synthesizes_and_pends_product_times() {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use differential_dataflow::operators::int_proxy::{JoinInstance, ProxyBridge, ProxyJoinBackend, ProxyReduceBackend, ReduceInstance, ReduceWindow};
+use differential_dataflow::operators::int_proxy::{JoinInstance, ProxyBridge, ProxyJoinBackend, ProxyReduceBackend, ProxyTime, ReduceInstance, ReduceWindow, SeedTimes, TimesView};
 use differential_dataflow::trace::BatchReader;
 
 /// A reduce backend wrapper counting records presented by the inner backend.
@@ -369,14 +369,14 @@ struct CountingReduce<B> {
 
 impl<B1, B2, B> ProxyReduceBackend<B1, B2> for CountingReduce<B>
 where
-    B1: BatchReader,
+    B1: BatchReader<Time: ProxyTime>,
     B2: BatchReader<Time = B1::Time>,
     B: ProxyReduceBackend<B1, B2>,
 {
     type RIn = B::RIn;
     type ROut = B::ROut;
 
-    fn seed_times(&self, instance: &ReduceInstance<'_, B1, B2>) -> Vec<(u64, B1::Time)> {
+    fn seed_times(&self, instance: &ReduceInstance<'_, B1, B2>) -> SeedTimes<B1::Time> {
         let seeds = self.inner.seed_times(instance);
         self.presented.fetch_add(seeds.len(), AtomicOrdering::SeqCst);
         seeds
@@ -401,8 +401,8 @@ where
     ) -> (Vec<(u64, B::ROut)>, Vec<usize>) {
         self.inner.reduce_corrections(keys, in_ends, input, out_ends, output)
     }
-    fn emit(&mut self, tile: usize, records: &[((u64, u64), B1::Time, B::ROut)]) {
-        self.inner.emit(tile, records)
+    fn emit(&mut self, tile: usize, ids: &[(u64, u64)], times: TimesView<'_, B1::Time>, diffs: &[B::ROut]) {
+        self.inner.emit(tile, ids, times, diffs)
     }
     fn finish(&mut self) -> Vec<B2> {
         self.inner.finish()
@@ -417,7 +417,7 @@ struct CountingJoin<B> {
 
 impl<B0, B1, B> ProxyJoinBackend<B0, B1> for CountingJoin<B>
 where
-    B0: BatchReader,
+    B0: BatchReader<Time: ProxyTime>,
     B1: BatchReader<Time = B0::Time>,
     B: ProxyJoinBackend<B0, B1>,
 {
@@ -436,7 +436,7 @@ where
         self.presented.fetch_add(chunk.len(), AtomicOrdering::SeqCst);
         chunk
     }
-    fn cross(&mut self, instance: &JoinInstance<'_, B0, B1>, left: &[(u64, u64)], right: &[(u64, u64)], times: Vec<B0::Time>, diffs: Vec<B::ROut>) -> B::Output {
+    fn cross(&mut self, instance: &JoinInstance<'_, B0, B1>, left: &[(u64, u64)], right: &[(u64, u64)], times: columnar::ContainerOf<B0::Time>, diffs: Vec<B::ROut>) -> B::Output {
         self.inner.cross(instance, left, right, times, diffs)
     }
 }
@@ -578,11 +578,10 @@ fn proxy_join_work_is_delta_proportional() {
 
 mod identity {
     use std::rc::Rc;
-    use differential_dataflow::operators::int_proxy::{ProxyBridge, ProxyReduceBackend, ReduceInstance, ReduceWindow};
+    use differential_dataflow::operators::int_proxy::{ProxyBridge, ProxyBridgeBuilder, ProxyReduceBackend, ReduceInstance, ReduceWindow, SeedTimes, TimesView};
+    use differential_dataflow::operators::int_proxy::ProxyTime;
     use differential_dataflow::trace::Description;
     use differential_dataflow::trace::chunk::ChunkBatch;
-    use differential_dataflow::lattice::Lattice;
-    use timely::progress::Timestamp;
     use crate::support::identity_chunk::IdentityChunk;
 
     pub type Batch<T> = Rc<ChunkBatch<IdentityChunk<T, isize>>>;
@@ -596,48 +595,51 @@ mod identity {
         _t: std::marker::PhantomData<T>,
     }
 
-    impl<T: Timestamp + Lattice, L> IdentityReduce<T, L> {
+    impl<T: ProxyTime, L> IdentityReduce<T, L> {
         pub fn new(logic: L) -> Self {
             IdentityReduce { logic, tiles: Vec::new(), _t: std::marker::PhantomData }
         }
     }
 
-    fn records<T: Timestamp + Lattice>(batches: &[Batch<T>], keys: Option<&[u64]>) -> ProxyBridge<T, isize> {
-        let mut rows = Vec::new();
+    fn records<T: ProxyTime>(builder: &mut ProxyBridgeBuilder<T, isize>, batches: &[Batch<T>], keys: Option<&[u64]>) {
         for batch in batches {
             for chunk in &batch.chunks {
                 for i in 0..chunk.len() {
                     let k = chunk.key_hashes()[i];
                     if keys.is_none_or(|f| f.binary_search(&k).is_ok()) {
-                        rows.push(((k, chunk.value_ids()[i]), chunk.times()[i].clone(), chunk.diffs()[i]));
+                        builder.push((k, chunk.value_ids()[i]), &chunk.times()[i], chunk.diffs()[i]);
                     }
                 }
             }
         }
-        differential_dataflow::consolidation::consolidate_updates(&mut rows);
-        rows
+    }
+
+    fn present<T: ProxyTime>(batches: &[Batch<T>], keys: Option<&[u64]>) -> ProxyBridge<T, isize> {
+        let mut builder = ProxyBridgeBuilder::default();
+        records(&mut builder, batches, keys);
+        builder.build().0
     }
 
     impl<T, L> ProxyReduceBackend<Batch<T>, Batch<T>> for IdentityReduce<T, L>
     where
-        T: Timestamp + Lattice,
+        T: ProxyTime,
         L: FnMut(&[(u64, isize)]) -> Vec<(u64, isize)>,
     {
         type RIn = isize;
         type ROut = isize;
 
-        fn seed_times(&self, instance: &ReduceInstance<'_, Batch<T>, Batch<T>>) -> Vec<(u64, T)> {
+        fn seed_times(&self, instance: &ReduceInstance<'_, Batch<T>, Batch<T>>) -> SeedTimes<T> {
             // Raw (key_hash, time) support, sorted by key_hash — no value work, and never
             // merged with stored history, so no compacted record can cancel a seed.
-            let mut out = Vec::new();
+            let mut out = SeedTimes::default();
             for batch in instance.input_batches {
                 for chunk in &batch.chunks {
                     for i in 0..chunk.len() {
-                        out.push((chunk.key_hashes()[i], chunk.times()[i].clone()));
+                        out.push(chunk.key_hashes()[i], &chunk.times()[i]);
                     }
                 }
             }
-            out.sort_by_key(|(k, _)| *k);
+            out.sort_by_key();
             out
         }
 
@@ -653,10 +655,11 @@ mod identity {
             let end = (*cursor + 2).min(changed.len());
             let keys: Vec<u64> = changed[*cursor..end].to_vec();
             *cursor = end;
-            let mut input = records(instance.source_batches, Some(&keys));
-            input.extend(records(instance.input_batches, Some(&keys)));
-            differential_dataflow::consolidation::consolidate_updates(&mut input);
-            let output = records(instance.output_batches, Some(&keys));
+            let mut builder = ProxyBridgeBuilder::default();
+            records(&mut builder, instance.source_batches, Some(&keys));
+            records(&mut builder, instance.input_batches, Some(&keys));
+            let input = builder.build().0;
+            let output = present(instance.output_batches, Some(&keys));
             Some(ReduceWindow { keys, input, output })
         }
 
@@ -693,8 +696,12 @@ mod identity {
             (corr, corr_ends)
         }
 
-        fn emit(&mut self, tile: usize, records: &[((u64, u64), T, isize)]) {
-            self.tiles[tile].1.extend_from_slice(records);
+        fn emit(&mut self, tile: usize, ids: &[(u64, u64)], times: TimesView<'_, T>, diffs: &[isize]) {
+            use columnar::Index;
+            let rows = &mut self.tiles[tile].1;
+            for (i, id) in ids.iter().enumerate() {
+                rows.push((*id, T::into_owned(times.get(i)), diffs[i]));
+            }
         }
 
         fn finish(&mut self) -> Vec<Batch<T>> {

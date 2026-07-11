@@ -167,25 +167,6 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: crate::difference::Semigroup> V
         HistoryReplay { replay: self }
     }
 
-    /// Loads `edits` from a plain iterator (grouped by consecutive value — the presentation
-    /// order), advancing each time by `advance_by` if supplied, then organizes. This is the
-    /// cursor-free ingestion path: the `int_proxy` tactics present `(value_id, time, diff)`
-    /// runs directly rather than through a `Cursor`, and share this machinery instead of
-    /// re-implementing it. Ungrouped input is still correct, only less compact.
-    fn load_iter(&mut self, edits: impl Iterator<Item = (V, T, D)>, advance_by: Option<&T>) {
-        self.edits.clear();
-        let mut cur: Option<V> = None;
-        for (v, mut time, diff) in edits {
-            if cur != Some(v) {
-                if let Some(pv) = cur { self.edits.seal(pv); }
-                cur = Some(v);
-            }
-            if let Some(m) = advance_by { time.join_assign(m); }
-            self.edits.push(time, diff);
-        }
-        if let Some(pv) = cur { self.edits.seal(pv); }
-        self.build();
-    }
 }
 
 impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::difference::Semigroup> ValueHistory<V, T, D> {
@@ -210,11 +191,6 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::difference::Semi
         while self.time() == Some(time) { found = true; self.step(); }
         found
     }
-    /// Step edits while the next time is `<= time` in the TOTAL order (a superset of the
-    /// partially-ordered downset; readers filter the buffer by `less_equal` themselves).
-    fn step_through(&mut self, time: &T) {
-        while self.time().is_some_and(|t| t <= time) { self.step(); }
-    }
     /// Advance buffered times by `meet` and consolidate — the collapse that keeps replay linear.
     fn advance_buffer_by(&mut self, meet: &T) {
         for element in self.buffer.iter_mut() { (element.0).1.join_assign(meet); }
@@ -228,8 +204,9 @@ struct HistoryReplay<'history, V, T, D> {
 }
 
 // A `HistoryReplay` is a thin cursor-facing handle over a `ValueHistory`; the replay
-// machinery lives on `ValueHistory` itself (shared with the `int_proxy` tactics), and
-// these forward to it.
+// machinery lives on `ValueHistory` itself, and these forward to it. (The `int_proxy`
+// tactics carry a columnar-storage re-expression of the same replay discipline; see
+// `int_proxy/history.rs` for why the storage forks.)
 impl<'history, V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::difference::Semigroup> HistoryReplay<'history, V, T, D> {
     fn time(&self) -> Option<&T> { self.replay.time() }
     fn meet(&self) -> Option<&T> { self.replay.meet() }

@@ -31,7 +31,7 @@ use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::{Builder, Description, Navigable};
 use differential_dataflow::trace::cursor::Cursor;
 use differential_dataflow::trace::chunk::{ChunkBatch, ChunkBuilder};
-use differential_dataflow::operators::int_proxy::ProxyBridge;
+use differential_dataflow::operators::int_proxy::{ProxyBridge, ProxyBridgeBuilder, SeedTimes, TimesView};
 use differential_dataflow::trace::chunk::vec::VecChunk;
 
 use differential_dataflow::operators::int_proxy::{JoinInstance, ProxyJoinBackend};
@@ -47,14 +47,14 @@ pub fn stable_hash<D: Hash>(data: &D) -> u64 {
 pub type RefBatch<K, V, T, R> = Rc<ChunkBatch<VecChunk<K, V, T, R>>>;
 
 /// Proxy rows under construction, with the real record retained per `(key_hash, value_id)`.
-struct Rows<K, V, T, R> {
-    rows: Vec<((u64, u64), T, R)>,
+struct Rows<K, V, T: columnar::Columnar, R> {
+    rows: ProxyBridgeBuilder<T, R>,
     reals: HashMap<(u64, u64), (K, V)>,
 }
 
-impl<K, V, T, R> Rows<K, V, T, R> {
+impl<K, V, T: columnar::Columnar, R> Rows<K, V, T, R> {
     fn new() -> Self {
-        Rows { rows: Vec::new(), reals: HashMap::new() }
+        Rows { rows: ProxyBridgeBuilder::default(), reals: HashMap::new() }
     }
 }
 
@@ -62,7 +62,7 @@ impl<K, V, T, R> Rows<K, V, T, R>
 where
     K: Ord + Clone + Hash + 'static,
     V: Ord + Clone + Hash + 'static,
-    T: Lattice + Timestamp,
+    T: Lattice + Timestamp + columnar::Columnar<Container: differential_dataflow::columnar::layout::OrdContainer>,
     R: Ord + Semigroup + 'static,
 {
     /// Append one key's `(val, time, diff)` records read at the cursor's current key,
@@ -81,7 +81,7 @@ where
             cursor.map_times(batch, |t, d| {
                 let mut t = t.clone();
                 t.advance_by(lower);
-                self.rows.push(((kh, vh), t, d.clone()));
+                self.rows.push((kh, vh), &t, d.clone());
             });
             cursor.step_val(batch);
         }
@@ -117,9 +117,8 @@ where
 
     /// Sort and consolidate into a presentation run, plus the real-record alignment.
     fn present(self) -> (ProxyBridge<T, R>, HashMap<(u64, u64), (K, V)>) {
-        let mut rows = self.rows;
-        differential_dataflow::consolidation::consolidate_updates(&mut rows);
-        (rows, self.reals)
+        let (bridge, _reps) = self.rows.build();
+        (bridge, self.reals)
     }
 }
 
@@ -163,7 +162,7 @@ where
     K: Ord + Clone + Hash + 'static,
     V0: Ord + Clone + Hash + 'static,
     V1: Ord + Clone + Hash + 'static,
-    T: Lattice + Timestamp,
+    T: Lattice + Timestamp + columnar::Columnar<Container: differential_dataflow::columnar::layout::OrdContainer>,
     R0: Ord + Semigroup + Multiply<R1, Output = RO> + 'static,
     R1: Ord + Semigroup + 'static,
     RO: Semigroup + 'static,
@@ -202,14 +201,16 @@ where
         _instance: &JoinInstance<'_, RefBatch<K, V0, T, R0>, RefBatch<K, V1, T, R1>>,
         left: &[(u64, u64)],
         right: &[(u64, u64)],
-        times: Vec<T>,
+        times: columnar::ContainerOf<T>,
         diffs: Vec<RO>,
     ) -> Vec<(D, T, RO)> {
+        use columnar::{Borrow, Index};
+        let view = times.borrow();
         let mut out = Vec::with_capacity(left.len());
-        for (((l, r), t), d) in left.iter().zip(right).zip(times).zip(diffs) {
+        for (((l, r), i), d) in left.iter().zip(right).zip(0..).zip(diffs) {
             let (k, v0) = self.left.get(l).expect("left id presented this unit");
             let (_, v1) = self.right.get(r).expect("right id presented this unit");
-            out.push(((self.logic)(k, v0, v1), t, d));
+            out.push(((self.logic)(k, v0, v1), T::into_owned(view.get(i)), d));
         }
         out
     }
@@ -260,7 +261,7 @@ where
     K: Ord + Clone + Hash + 'static,
     V: Ord + Clone + Hash + 'static,
     V2: Ord + Clone + Hash + 'static,
-    T: Lattice + Timestamp,
+    T: Lattice + Timestamp + columnar::Columnar<Container: differential_dataflow::columnar::layout::OrdContainer>,
     RIn: Ord + Semigroup + 'static,
     ROut: Ord + Abelian + 'static,
     L: FnMut(&K, &[(&V, RIn)], &mut Vec<(V2, ROut)>),
@@ -268,23 +269,23 @@ where
     type RIn = RIn;
     type ROut = ROut;
 
-    fn seed_times(&self, instance: &ReduceInstance<'_, RefBatch<K, V, T, RIn>, RefBatch<K, V2, T, ROut>>) -> Vec<(u64, T)> {
+    fn seed_times(&self, instance: &ReduceInstance<'_, RefBatch<K, V, T, RIn>, RefBatch<K, V2, T, ROut>>) -> SeedTimes<T> {
         // The batch's raw (key_hash, time) support: hash keys only (no value work), one
         // entry per record, sorted by key_hash. Never merged with stored history, so no
         // compacted record can cancel a seed.
-        let mut out = Vec::new();
+        let mut out = SeedTimes::default();
         for batch in instance.input_batches {
             let mut cursor = batch.cursor();
             while let Some(k) = cursor.get_key(batch) {
                 let kh = stable_hash(k);
                 while cursor.get_val(batch).is_some() {
-                    cursor.map_times(batch, |t, _| out.push((kh, t.clone())));
+                    cursor.map_times(batch, |t, _| out.push(kh, t));
                     cursor.step_val(batch);
                 }
                 cursor.step_key(batch);
             }
         }
-        out.sort_by_key(|(k, _)| *k);
+        out.sort_by_key();
         out
     }
 
@@ -397,13 +398,14 @@ where
         (corr, corr_ends)
     }
 
-    fn emit(&mut self, tile: usize, records: &[((u64, u64), T, ROut)]) {
+    fn emit(&mut self, tile: usize, ids: &[(u64, u64)], times: TimesView<'_, T>, diffs: &[ROut]) {
+        use columnar::Index;
         // Resolve ids to real data now, while the retire's maps are live.
         let rows = &mut self.tiles[tile].1;
-        for ((kh, vh), t, d) in records {
+        for (i, (kh, vh)) in ids.iter().enumerate() {
             let k = self.keys.get(kh).expect("key presented this retire").clone();
             let v = self.out_vals.get(vh).expect("value presented or minted this retire").clone();
-            rows.push(((k, v), t.clone(), d.clone()));
+            rows.push(((k, v), T::into_owned(times.get(i)), diffs[i].clone()));
         }
     }
 
