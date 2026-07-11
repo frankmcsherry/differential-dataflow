@@ -1266,3 +1266,4 @@ fn bench_pointstamp_retires() {
         timer.elapsed()
     );
 }
+

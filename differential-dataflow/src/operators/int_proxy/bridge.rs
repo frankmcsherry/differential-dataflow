@@ -77,8 +77,13 @@ where
         if clean {
             return (ProxyBridge { ids, times, diffs }, (0..n).collect());
         }
+        // Sort `(id, time ref, index)` tuples directly — container refs are `Copy + Ord`,
+        // so this sorts small flat tuples with sequential access rather than a
+        // permutation of indices chasing the columns per comparison.
         let view = times.borrow();
-        let perm = sort_perm::<T>(&ids, view);
+        let mut pairs: Vec<((u64, u64), super::column::TimeRef<'_, T>, u32)> =
+            (0..n).map(|i| (ids[i], view.get(i), i as u32)).collect();
+        pairs.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 
         let mut out_ids = Vec::new();
         let mut out_times: ContainerOf<T> = Default::default();
@@ -86,21 +91,18 @@ where
         let mut reps = Vec::new();
         let mut i = 0;
         while i < n {
-            let r = perm[i];
-            let mut d = diffs[r].clone();
+            let (id, time, r) = pairs[i];
+            let mut d = diffs[r as usize].clone();
             let mut j = i + 1;
-            while j < n && {
-                let s = perm[j];
-                ids[s] == ids[r] && view.get(s) == view.get(r)
-            } {
-                d.plus_equals(&diffs[perm[j]]);
+            while j < n && pairs[j].0 == id && pairs[j].1 == time {
+                d.plus_equals(&diffs[pairs[j].2 as usize]);
                 j += 1;
             }
             if !d.is_zero() {
-                out_ids.push(ids[r]);
-                out_times.push(view.get(r));
+                out_ids.push(id);
+                out_times.push(time);
                 out_diffs.push(d);
-                reps.push(r);
+                reps.push(r as usize);
             }
             i = j;
         }
@@ -122,42 +124,6 @@ where
             who,
         );
     }
-}
-
-/// A sorting permutation for `((key_hash, value_id), time)`. For small runs a plain
-/// unstable sort; for large ones an MSD counting sort on the top byte of `key_hash` (a
-/// content hash, so uniformly distributed) into 256 ascending buckets, each finished by
-/// the full comparison. The order is identical to a full sort; `unstable` is fine
-/// because `from_unsorted` only needs *a* representative per consolidated group, not a
-/// particular one. Degenerate `key_hash` (all one top byte) falls back to a single
-/// bucket — the small-`n` path plus `O(n)`, never worse.
-fn sort_perm<T>(ids: &[(u64, u64)], times: TimesView<'_, T>) -> Vec<usize>
-where
-    T: Columnar<Container: for<'a> Container<Ref<'a>: Ord>>,
-{
-    let n = ids.len();
-    let cmp = |&a: &usize, &b: &usize| ids[a].cmp(&ids[b]).then_with(|| times.get(a).cmp(&times.get(b)));
-    if n < 512 {
-        let mut perm: Vec<usize> = (0..n).collect();
-        perm.sort_unstable_by(cmp);
-        return perm;
-    }
-    let bucket = |i: usize| (ids[i].0 >> 56) as usize;
-    let mut counts = [0usize; 256];
-    for i in 0..n { counts[bucket(i)] += 1; }
-    let mut starts = [0usize; 257];
-    for b in 0..256 { starts[b + 1] = starts[b] + counts[b]; }
-    let mut perm = vec![0usize; n];
-    let mut cursor = starts;
-    for i in 0..n {
-        let b = bucket(i);
-        perm[cursor[b]] = i;
-        cursor[b] += 1;
-    }
-    for b in 0..256 {
-        perm[starts[b]..starts[b + 1]].sort_unstable_by(cmp);
-    }
-    perm
 }
 
 /// The novel batches' raw `(key_hash, time)` support, sorted by `key_hash` — the seed

@@ -54,7 +54,6 @@ pub(crate) struct IdHistory<T: Columnar, R> {
     stage_vids: Vec<u64>,
     stage_times: ContainerOf<T>,
     stage_diffs: Vec<R>,
-    perm: Vec<usize>,
     scratch: T,
     scratch2: T,
 }
@@ -75,7 +74,6 @@ where
             stage_vids: Vec::new(),
             stage_times: Default::default(),
             stage_diffs: Vec::new(),
-            perm: Vec::new(),
             scratch: T::minimum(),
             scratch2: T::minimum(),
         }
@@ -83,59 +81,42 @@ where
 
     /// Load the records `bridge[range]`, advancing each time by `advance_by` if
     /// supplied, and organize the replay (consolidate + sort + suffix meets). Clears any
-    /// prior state; capacity is retained.
+    /// prior state; capacity is retained. Without advancement the bridge columns feed
+    /// the organization directly; with it the advanced times stage through a scratch
+    /// column first.
     pub fn load(&mut self, bridge: &ProxyBridge<T, R>, range: std::ops::Range<usize>, advance_by: Option<&T>) {
-        self.stage_vids.clear();
-        self.stage_times.clear();
-        self.stage_diffs.clear();
-        let view = bridge.times();
-        for i in range {
-            self.stage_vids.push(bridge.ids()[i].1);
-            self.stage_diffs.push(bridge.diffs()[i].clone());
-            if let Some(m) = advance_by {
+        if let Some(m) = advance_by {
+            self.stage_vids.clear();
+            self.stage_times.clear();
+            self.stage_diffs.clear();
+            let view = bridge.times();
+            for i in range {
+                self.stage_vids.push(bridge.ids()[i].1);
+                self.stage_diffs.push(bridge.diffs()[i].clone());
                 self.scratch.copy_from(view.get(i));
                 self.scratch.join_assign(m);
                 push_owned::<T>(&mut self.stage_times, &self.scratch);
-            } else {
-                self.stage_times.push(view.get(i));
             }
+            let Self { vids, times, diffs, meets_rev, cursor, buffer, stage_vids, stage_times, stage_diffs, scratch, scratch2, .. } = self;
+            organize::<T, R>(
+                stage_times.borrow(), 0..stage_vids.len(),
+                |i| stage_vids[i], |i| &stage_diffs[i],
+                vids, times, diffs,
+            );
+            *cursor = 0;
+            buffer.clear();
+            suffix_meets_rev::<T>(times.borrow(), 0..vids.len(), meets_rev, scratch, scratch2);
+        } else {
+            let Self { vids, times, diffs, meets_rev, cursor, buffer, scratch, scratch2, .. } = self;
+            organize::<T, R>(
+                bridge.times(), range,
+                |i| bridge.ids()[i].1, |i| &bridge.diffs()[i],
+                vids, times, diffs,
+            );
+            *cursor = 0;
+            buffer.clear();
+            suffix_meets_rev::<T>(times.borrow(), 0..vids.len(), meets_rev, scratch, scratch2);
         }
-        self.organize();
-    }
-
-    /// Consolidate the staged edits and organize the replay.
-    fn organize(&mut self) {
-        let Self { vids, times, diffs, meets_rev, cursor, buffer, stage_vids, stage_times, stage_diffs, perm, scratch, scratch2 } = self;
-        *cursor = 0;
-        buffer.clear();
-        vids.clear();
-        times.clear();
-        diffs.clear();
-
-        let stage = stage_times.borrow();
-        perm.clear();
-        Extend::extend(perm, 0..stage_vids.len());
-        perm.sort_unstable_by(|&a, &b| stage.get(a).cmp(&stage.get(b)).then_with(|| stage_vids[a].cmp(&stage_vids[b])));
-
-        // Merge equal (value_id, time) pairs — adjacent in (time, value_id) order too —
-        // summing diffs and dropping zeros; the survivors are already in replay order.
-        let mut index = 0;
-        while index < perm.len() {
-            let this = perm[index];
-            let mut diff = stage_diffs[this].clone();
-            index += 1;
-            while index < perm.len() && stage_vids[perm[index]] == stage_vids[this] && stage.get(perm[index]) == stage.get(this) {
-                diff.plus_equals(&stage_diffs[perm[index]]);
-                index += 1;
-            }
-            if !diff.is_zero() {
-                vids.push(stage_vids[this]);
-                times.push(stage.get(this));
-                diffs.push(diff);
-            }
-        }
-
-        suffix_meets_rev::<T>(times.borrow(), 0..vids.len(), meets_rev, scratch, scratch2);
     }
 
     /// The next (least) un-replayed time.
@@ -194,6 +175,46 @@ where
     /// The buffered (stepped-in, advanced, consolidated) edits.
     pub fn buffer(&self) -> &UpdateCol<u64, T, R> {
         &self.buffer
+    }
+}
+
+/// Consolidate `(value_id, time, diff)` edits into replay order: sort `(time ref,
+/// value_id, index)` tuples DIRECTLY — container refs are `Copy + Ord`, so this sorts
+/// small flat tuples with sequential access rather than a permutation of indices chasing
+/// the column per comparison — then merge equal `(value_id, time)` pairs (adjacent in
+/// either order), summing diffs and dropping zeros. The survivors land in `vids` /
+/// `times` / `diffs` in ascending `(time, value_id)` order.
+fn organize<'a, T, R>(
+    view: super::column::TimesView<'a, T>,
+    range: std::ops::Range<usize>,
+    vid_at: impl Fn(usize) -> u64,
+    diff_at: impl Fn(usize) -> &'a R,
+    vids: &mut Vec<u64>,
+    times: &mut ContainerOf<T>,
+    diffs: &mut Vec<R>,
+) where
+    T: super::ProxyTime,
+    R: Semigroup + Clone + 'a,
+{
+    vids.clear();
+    times.clear();
+    diffs.clear();
+    let mut pairs: Vec<(TimeRef<'a, T>, u64, u32)> = range.map(|i| (view.get(i), vid_at(i), i as u32)).collect();
+    pairs.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut index = 0;
+    while index < pairs.len() {
+        let (time, vid, this) = pairs[index];
+        let mut diff = diff_at(this as usize).clone();
+        index += 1;
+        while index < pairs.len() && pairs[index].1 == vid && pairs[index].0 == time {
+            diff.plus_equals(diff_at(pairs[index].2 as usize));
+            index += 1;
+        }
+        if !diff.is_zero() {
+            vids.push(vid);
+            times.push(time);
+            diffs.push(diff);
+        }
     }
 }
 
