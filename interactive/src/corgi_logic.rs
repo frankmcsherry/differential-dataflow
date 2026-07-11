@@ -275,9 +275,74 @@ pub fn term_shape(t: &Term, env_shapes: &[Shape]) -> Option<Shape> {
             _ => None,
         },
         Term::If { then, .. } => term_shape(then, env_shapes),
+        Term::Tuple(fields) => {
+            let mut fs = Vec::new();
+            for f in fields {
+                match f {
+                    Term::Spread(inner) => match term_shape(inner, env_shapes)? {
+                        Shape::Prod(inner_fs) => fs.extend(inner_fs),
+                        Shape::Unit => {}
+                        other => fs.push(other),
+                    },
+                    _ => fs.push(term_shape(f, env_shapes)?),
+                }
+            }
+            Some(if fs.is_empty() { Shape::Unit } else { Shape::Prod(fs) })
+        }
+        // A fold produces its accumulator's shape.
+        Term::Fold { init, .. } => term_shape(init, env_shapes),
         Term::List(fields) => {
             let elem = term_shape(fields.first()?, env_shapes)?;
             Some(Shape::List(Box::new(elem)))
+        }
+        Term::Case { scrutinee, arms, default: None } if !arms.is_empty() => {
+            let field = case_untag_field(arms)?;
+            let payload = case_payload_shape(scrutinee, arms.len(), env_shapes)?;
+            match field {
+                None => Some(payload),
+                Some(i) => match payload {
+                    Shape::Prod(fs) => fs.get(i).cloned(),
+                    _ => None,
+                },
+            }
+        }
+        _ => None,
+    }
+}
+
+
+/// The shared "untag" arm form of a columnar-compilable `Case`: every arm is `Bound(0)` (the
+/// payload itself; `Some(None)`) or `Proj(Bound(0), i)` with one `i` across arms (`Some(Some(i))`).
+fn case_untag_field(arms: &[Term]) -> Option<Option<usize>> {
+    let field_of = |a: &Term| -> Option<Option<usize>> {
+        match a {
+            Term::Bound(0) => Some(None),
+            Term::Proj(inner, i) if matches!(inner.as_ref(), Term::Bound(0)) => Some(Some(*i)),
+            _ => None,
+        }
+    };
+    let first = field_of(arms.first()?)?;
+    for a in &arms[1..] {
+        if field_of(a)? != first {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// The (single, statically-known) payload shape of a columnar-compilable `Case` scrutinee: an
+/// `If`/`Inject` tree whose tags are constant `Int`s below `arity` and whose payloads all share
+/// one shape. `None` marks the tree non-compilable (row-wise fallback).
+fn case_payload_shape(t: &Term, arity: usize, env_shapes: &[Shape]) -> Option<Shape> {
+    match t {
+        Term::Inject(tag, payload) => match tag.as_ref() {
+            Term::Int(k) if (*k as usize) < arity && *k >= 0 => term_shape(payload, env_shapes),
+            _ => None,
+        },
+        Term::If { cond: _, then, els } => {
+            let a = case_payload_shape(then, arity, env_shapes)?;
+            let b = case_payload_shape(els, arity, env_shapes)?;
+            if a == b { Some(a) } else { None }
         }
         _ => None,
     }
@@ -307,7 +372,32 @@ pub fn compilable(t: &Term, env_shapes: &[Shape]) -> bool {
                     None => false,
                 }
         }
-        _ => false, // Inject, Case, Unary, Hash — row-wise fallback.
+        // Case-as-untag (every arm is the payload passthrough `Bound(0)`) over an If/Inject
+        // scrutinee tree with constant tags and one shared payload shape compiles columnar
+        // (Inject/Select/Unwrap); everything else (outer-var arms, data-driven tags,
+        // heterogeneous payloads, defaults) falls back row-wise.
+        Term::Case { scrutinee, arms, default: None } if !arms.is_empty() => {
+            case_untag_field(arms).is_some()
+                && case_scrutinee_compilable(scrutinee, arms.len(), env_shapes)
+                && term_shape(t, env_shapes).is_some()
+        }
+        _ => false, // Inject, general Case, Unary, Hash — row-wise fallback.
+    }
+}
+
+/// Whether a `Case` scrutinee's If/Inject tree has compilable conds/payloads throughout.
+fn case_scrutinee_compilable(t: &Term, arity: usize, env_shapes: &[Shape]) -> bool {
+    match t {
+        Term::Inject(tag, payload) => {
+            matches!(tag.as_ref(), Term::Int(k) if (*k as usize) < arity && *k >= 0)
+                && compilable(payload, env_shapes)
+        }
+        Term::If { cond, then, els } => {
+            compilable(cond, env_shapes)
+                && case_scrutinee_compilable(then, arity, env_shapes)
+                && case_scrutinee_compilable(els, arity, env_shapes)
+        }
+        _ => false,
     }
 }
 
@@ -425,7 +515,40 @@ pub fn compile(term: &Term, b: &mut Builder<NumOp>, env: &[usize], env_shapes: &
             };
             b.add(Op::MapList(Box::new(unwrap_body)), vec![woven])
         }
+        // Case-as-untag: build the scrutinee's Sum column (constant-tag Inject lanes, Select at
+        // If merges — Select's shape rule JOINS the two Sums, so each side's uncommitted lanes
+        // adopt the other's), then Unwrap the homogeneous result. The `Bound(0)` arms are the
+        // identity, so no MapSum is needed.
+        Term::Case { scrutinee, arms, default: None }
+            if !arms.is_empty() && case_untag_field(arms).is_some() =>
+        {
+            let sum = compile_sum(scrutinee, arms.len(), b, env, env_shapes, anchor);
+            let payload = b.add(Op::Unwrap, vec![sum]);
+            match case_untag_field(arms).unwrap() {
+                None => payload,
+                Some(i) => b.add(Op::Field(i), vec![payload]),
+            }
+        }
         other => panic!("compile: unsupported Term in this rung: {other:?}"),
+    }
+}
+
+/// Compile a `Case` scrutinee's If/Inject tree to a Sum column of the given arity.
+fn compile_sum(t: &Term, arity: usize, b: &mut Builder<NumOp>, env: &[usize], env_shapes: &[Shape], anchor: usize) -> usize {
+    match t {
+        Term::Inject(tag, payload) => {
+            let Term::Int(k) = tag.as_ref() else { panic!("compile_sum: non-constant tag") };
+            let p = compile(payload, b, env, env_shapes, anchor);
+            b.add(Op::Inject(*k as usize, arity), vec![p])
+        }
+        Term::If { cond, then, els } => {
+            let c = compile(cond, b, env, env_shapes, anchor);
+            let t_id = compile_sum(then, arity, b, env, env_shapes, anchor);
+            let e_id = compile_sum(els, arity, b, env, env_shapes, anchor);
+            let sel = b.tuple(vec![c, t_id, e_id]);
+            b.add(Op::Select, vec![sel])
+        }
+        other => panic!("compile_sum: unsupported scrutinee {other:?}"),
     }
 }
 
