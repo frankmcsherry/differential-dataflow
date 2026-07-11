@@ -15,7 +15,7 @@ workspace = true
 columnar = { workspace = true }
 # Pinned to a git rev so the branch builds standalone (frankmcsherry/wip @ fable/work,
 # base dd-arrange-api f556868 + survey_groups). Local dev: `path = "../../wip/corgi"`.
-corgi = { git = "https://github.com/frankmcsherry/wip", rev = "1ece187b2649ab107fa3560e7379086313cee81a" }
+corgi = { git = "https://github.com/frankmcsherry/wip", rev = "e0ac7368087ef3f731a0f0a3c4f807719496f645" }
 differential-dataflow = { workspace = true }
 mimalloc = "0.1.48"
 serde = { version = "1.0", features = ["derive"] }
