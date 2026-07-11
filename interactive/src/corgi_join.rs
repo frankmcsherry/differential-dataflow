@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 
 use differential_dataflow::operators::join::{Fresh, JoinTactic};
+use differential_dataflow::operators::recipes::{bilinear_wave, ValueHistory};
 
 use corgi::arrange::{find_ranges, gather};
 use corgi::Value as CValue;
@@ -88,18 +89,50 @@ where
     let nl = left.times.len();
 
     // Multi-record merge-join: one batched `find` gives, per left row, the equal-range of its key in
-    // the sorted right keys. Cross-product each left row with its matched right rows (lattice
-    // time-join + diff-multiply). Replaces the per-pair `compare_at` scan.
+    // the sorted right keys. Small matches cross-product directly (lattice time-join +
+    // diff-multiply); a BIG x BIG key takes the time-forward `bilinear_wave` instead — meet-advanced
+    // buffers net flip-flopping histories, so work tracks accumulation size, not history length
+    // (the robustification the raw cross product lacks; row indices serve as the wave's ids).
+    const WAVE: usize = 16;
     let (lo, hi) = find_ranges(&left.keys, &right.keys);
     let (mut li, mut ri): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
     let (mut ot, mut od): (Vec<T>, Vec<Diff>) = (Vec::new(), Vec::new());
-    for a in 0..nl {
-        for b in lo[a]..hi[a] {
-            li.push(a);
-            ri.push(b);
-            ot.push(left.times[a].join(&right.times[b]));
-            od.push(left.diffs[a] * right.diffs[b]);
+    let (mut h0, mut h1): (ValueHistory<u64, T, Diff>, ValueHistory<u64, T, Diff>) = (ValueHistory::new(), ValueHistory::new());
+    let mut a = 0usize;
+    while a < nl {
+        // The left rows sharing this (matched) key are exactly those sharing the (lo, hi) range;
+        // unmatched rows (empty range) advance one at a time.
+        if lo[a] >= hi[a] {
+            a += 1;
+            continue;
         }
+        let a_end = {
+            let mut e = a + 1;
+            while e < nl && lo[e] == lo[a] && hi[e] == hi[a] {
+                e += 1;
+            }
+            e
+        };
+        if a_end - a >= WAVE && hi[a] - lo[a] >= WAVE {
+            h0.load_iter((a..a_end).map(|x| (x as u64, left.times[x].clone(), left.diffs[x])), None);
+            h1.load_iter((lo[a]..hi[a]).map(|x| (x as u64, right.times[x].clone(), right.diffs[x])), None);
+            bilinear_wave(&mut h0, &mut h1, |x, y, t, d: Diff| {
+                li.push(x as usize);
+                ri.push(y as usize);
+                ot.push(t);
+                od.push(d);
+            });
+        } else {
+            for x in a..a_end {
+                for b in lo[a]..hi[a] {
+                    li.push(x);
+                    ri.push(b);
+                    ot.push(left.times[x].join(&right.times[b]));
+                    od.push(left.diffs[x] * right.diffs[b]);
+                }
+            }
+        }
+        a = a_end;
     }
     if li.is_empty() {
         return None;
