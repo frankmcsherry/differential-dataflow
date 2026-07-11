@@ -57,6 +57,26 @@ struct Inner<T: Columnar, R> {
     times: ColTimes<T>,
     /// Per-update diffs.
     diffs: Vec<R>,
+    /// Lazily-memoized hash-order presentation (see [`Presentation`]): the reduce backend pays
+    /// the per-row hash + hash-order sort once per (immutable) chunk, not once per retire.
+    presentation: std::cell::OnceCell<Presentation<T>>,
+}
+
+/// A chunk's rows re-indexed for proxy-space presentation: ascending `(key_hash, value_id,
+/// time)` order, with times deduplicated into a sorted table. Computed once per chunk (chunks
+/// are immutable) and reused by every retire that presents the chunk; a retire then merges
+/// chunks' sorted runs instead of re-hashing and re-sorting the full history each time.
+pub struct Presentation<T> {
+    /// Original row index per sorted position.
+    pub perm: Vec<u32>,
+    /// Key hash per sorted position (ascending runs).
+    pub khs: Vec<u64>,
+    /// Value id (content hash) per sorted position.
+    pub vids: Vec<u64>,
+    /// Rank into `times` per sorted position (rank order == time order).
+    pub tranks: Vec<u32>,
+    /// The chunk's distinct times, ascending.
+    pub times: Vec<T>,
 }
 
 /// A sorted, consolidated run of `((key, val), time, diff)` with corgi-columnar key/val, shared via `Rc`.
@@ -68,7 +88,7 @@ impl<T: Columnar, R> Clone for CorgiChunk<T, R> {
 
 impl<T: Columnar, R> Default for CorgiChunk<T, R> {
     fn default() -> Self {
-        CorgiChunk(Rc::new(Inner { keys: CValue::Unit(0), vals: CValue::Unit(0), times: ColTimes::new(), diffs: Vec::new() }))
+        CorgiChunk(Rc::new(Inner { keys: CValue::Unit(0), vals: CValue::Unit(0), times: ColTimes::new(), diffs: Vec::new(), presentation: std::cell::OnceCell::new() }))
     }
 }
 
@@ -82,7 +102,7 @@ fn split_kv(kv: CValue) -> (CValue, CValue) {
 
 impl<T: Columnar + Clone, R: Clone> CorgiChunk<T, R> {
     fn from_parts(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> Self {
-        CorgiChunk(Rc::new(Inner { keys, vals, times, diffs }))
+        CorgiChunk(Rc::new(Inner { keys, vals, times, diffs, presentation: std::cell::OnceCell::new() }))
     }
     /// The `(key, val)` sort payload as one corgi `Prod` column (cheap `Arc` bumps).
     fn kv(&self) -> CValue { CValue::Prod(vec![self.0.keys.clone(), self.0.vals.clone()]) }
@@ -94,6 +114,11 @@ impl<T: Columnar + Clone, R: Clone> CorgiChunk<T, R> {
     pub fn vals(&self) -> &CValue { &self.0.vals }
     pub fn times(&self) -> &ColTimes<T> { &self.0.times }
     pub fn diffs(&self) -> &[R] { &self.0.diffs }
+    /// The memoized hash-order presentation, built by `build` on first access. All `Rc` clones
+    /// of the chunk share the one cache; it drops with the chunk.
+    pub fn presentation_or_init(&self, build: impl FnOnce() -> Presentation<T>) -> &Presentation<T> {
+        self.0.presentation.get_or_init(build)
+    }
 }
 
 impl<T, R> CorgiChunk<T, R>

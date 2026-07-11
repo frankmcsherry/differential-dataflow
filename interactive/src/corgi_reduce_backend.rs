@@ -31,7 +31,6 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 
-use differential_dataflow::consolidation::consolidate_updates;
 use differential_dataflow::trace::Description;
 use differential_dataflow::trace::chunk::ChunkBatch;
 use differential_dataflow::operators::int_proxy::ProxyBridge;
@@ -41,7 +40,7 @@ use corgi::arrange::{gather, gather_lanes, sort_blocks};
 use corgi::{Bounds, Shape, Value as CValue};
 
 use crate::col_times::ColTime;
-use crate::corgi_chunk::{columns_to_batch, CorgiChunk};
+use crate::corgi_chunk::{columns_to_batch, CorgiChunk, Presentation};
 use crate::ir::Diff;
 use crate::parse::Reducer;
 
@@ -179,41 +178,126 @@ fn ids(col: &CValue) -> Vec<u64> {
     }
 }
 
-/// Concatenate the records of the `changed` keys across a run of chunks into parallel
-/// `(keys_col, vals_col)` corgi columns plus per-record `(key_hash, time, diff)`. `changed` is the
-/// ASCENDING set of changed key hashes; a row is kept iff its key hash is in it.
-///
-/// NB this is a full scan of the presented chunks (incl. `source_batches`, the accumulated trace).
-/// A `find_ranges` seek of the changed keys was tried (delta-proportional in principle) but REGRESSED
-/// SCC (1.62x→2.16x): SCC's changed set is broad (label propagation touches most keys each retire), so
-/// the scan already touches ~every row while the per-chunk gallop only adds overhead. The O(history)
-/// re-presentation is inherent to SCC here, not a seekable-few-keys case.
-fn collect_present<T>(chunks: &[&CorgiChunk<T, Diff>], changed: &[u64]) -> (CValue, CValue, Vec<u64>, Vec<T>, Vec<Diff>)
+/// Build a chunk's memoized hash-order [`Presentation`]: per-row key hashes and value ids, times
+/// interned into a sorted distinct table, and a permutation ascending by `(key_hash, value_id,
+/// time)`. Paid once per (immutable) chunk; every retire that presents the chunk reuses it.
+fn build_presentation<T>(ch: &CorgiChunk<T, Diff>) -> Presentation<T>
 where
-    T: ColTime,
+    T: ColTime + Ord,
 {
-    let key_srcs: Vec<Option<&CValue>> = chunks.iter().map(|c| Some(c.keys())).collect();
-    let val_srcs: Vec<Option<&CValue>> = chunks.iter().map(|c| Some(c.vals())).collect();
-    let (mut tags, mut offs) = (Vec::new(), Vec::new());
-    let (mut khs, mut times, mut diffs) = (Vec::new(), Vec::new(), Vec::new());
-    for (ci, ch) in chunks.iter().enumerate() {
-        let kh = ids(ch.keys());
-        for i in 0..kh.len() {
-            if changed.binary_search(&kh[i]).is_ok() {
-                tags.push(ci);
-                offs.push(i);
-                khs.push(kh[i]);
-                times.push(ch.times().get(i));
-                diffs.push(ch.diffs()[i]);
+    let n = ch.diffs().len();
+    let kh = ids(ch.keys());
+    let vid = ids(ch.vals());
+    let ct = ch.times();
+    let mut index: BTreeMap<T, u32> = BTreeMap::new();
+    let mut tfirst: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let next = index.len() as u32;
+        tfirst.push(*index.entry(ct.get(i)).or_insert(next));
+    }
+    let mut rank = vec![0u32; index.len()];
+    let mut times: Vec<T> = Vec::with_capacity(index.len());
+    for (pos, (t, first)) in index.into_iter().enumerate() {
+        rank[first as usize] = pos as u32;
+        times.push(t);
+    }
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    perm.sort_unstable_by_key(|&i| (kh[i as usize], vid[i as usize], rank[tfirst[i as usize] as usize]));
+    let khs: Vec<u64> = perm.iter().map(|&i| kh[i as usize]).collect();
+    let vids: Vec<u64> = perm.iter().map(|&i| vid[i as usize]).collect();
+    let tranks: Vec<u32> = perm.iter().map(|&i| rank[tfirst[i as usize] as usize]).collect();
+    Presentation { perm, khs, vids, tranks, times }
+}
+
+/// One side's merged presentation: gather coordinates + per-record ids (aligned, pre-netting,
+/// mirroring the previous per-record gather semantics) and the netted integer bridge records
+/// (`time` as a rank into the window's global sorted-time table).
+struct MergedSide {
+    tags: Vec<usize>,
+    offs: Vec<usize>,
+    khs: Vec<u64>,
+    vids: Vec<u64>,
+    records: Vec<((u64, u64), u32, Diff)>,
+}
+
+/// Merge chunks' cached hash-order runs, restricted to the ascending `changed` hashes, netting
+/// equal `(key_hash, value_id, time)` on the fly. `maps[c]` maps chunk `c`'s local time ranks to
+/// the window's global ranks. Replaces the previous per-retire full scan + hash + comparison sort
+/// (each was O(history) per retire; the scan variant with `find_ranges` seek had REGRESSED SCC —
+/// broad changed sets — but merging pre-sorted cached runs is cheaper than either).
+fn merge_presentations<T>(pres: &[&Presentation<T>], maps: &[Vec<u32>], diffs: &[&[Diff]], changed: &[u64]) -> MergedSide {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    // Restrict each chunk's run to the changed hashes: ascending position ranges.
+    let mut cursors: Vec<(Vec<(u32, u32)>, usize, u32)> = Vec::with_capacity(pres.len());
+    for p in pres {
+        let khs = &p.khs;
+        let mut ranges = Vec::new();
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < khs.len() && j < changed.len() {
+            if khs[i] < changed[j] {
+                i += 1;
+            } else if khs[i] > changed[j] {
+                j += 1;
+            } else {
+                let s = i;
+                while i < khs.len() && khs[i] == changed[j] {
+                    i += 1;
+                }
+                ranges.push((s as u32, i as u32));
+                j += 1;
             }
         }
+        let start = ranges.first().map(|r| r.0).unwrap_or(0);
+        cursors.push((ranges, 0, start));
     }
-    if tags.is_empty() {
-        return (CValue::Unit(0), CValue::Unit(0), khs, times, diffs);
+
+    let mut out = MergedSide { tags: Vec::new(), offs: Vec::new(), khs: Vec::new(), vids: Vec::new(), records: Vec::new() };
+    let mut heap: BinaryHeap<Reverse<(u64, u64, u32, usize)>> = BinaryHeap::new();
+    let key_at = |c: usize, pos: u32| {
+        let p = pres[c];
+        let i = pos as usize;
+        (p.khs[i], p.vids[i], maps[c][p.tranks[i] as usize], c)
+    };
+    for c in 0..pres.len() {
+        if !cursors[c].0.is_empty() {
+            heap.push(Reverse(key_at(c, cursors[c].2)));
+        }
     }
-    let keys_col = gather_lanes(&key_srcs, &tags, &offs);
-    let vals_col = gather_lanes(&val_srcs, &tags, &offs);
-    (keys_col, vals_col, khs, times, diffs)
+    while let Some(Reverse((kh, vid, grank, c))) = heap.pop() {
+        let pos = cursors[c].2;
+        let row = pres[c].perm[pos as usize] as usize;
+        let d = diffs[c][row];
+
+        out.tags.push(c);
+        out.offs.push(row);
+        out.khs.push(kh);
+        out.vids.push(vid);
+        match out.records.last_mut() {
+            Some(((lk, lv), lr, ld)) if *lk == kh && *lv == vid && *lr == grank => {
+                *ld += d;
+                if *ld == 0 {
+                    out.records.pop();
+                }
+            }
+            _ => out.records.push(((kh, vid), grank, d)),
+        }
+
+        // Advance chunk c's cursor to its next restricted position.
+        let (ranges, ri, p) = &mut cursors[c];
+        let mut next = *p + 1;
+        if next >= ranges[*ri].1 {
+            *ri += 1;
+            if *ri >= ranges.len() {
+                continue;
+            }
+            next = ranges[*ri].0;
+        }
+        *p = next;
+        heap.push(Reverse(key_at(c, next)));
+    }
+    out
 }
 
 /// All chunks of a batch list, flattened (empty chunks included — `hash_rows` yields nothing for them).
@@ -371,15 +455,15 @@ where
     type ROut = Diff;
 
     fn seed_times(&self, instance: &ReduceInstance<'_, CBatch<T>, CBatch<T>>) -> Vec<(u64, T)> {
-        // The batch's raw (key_hash, time) support — hash the novel KEY columns only, one entry per
-        // record, sorted by key_hash. Seeds may over-derive (a non-changing seed yields a zero delta),
-        // so this superset of b.support suffices; `instance.lower` is not applied (see ReduceInstance).
+        // The batch's raw (key_hash, time) support — one entry per novel record, sorted by key_hash.
+        // Seeds may over-derive (a non-changing seed yields a zero delta), so this superset of
+        // b.support suffices; `instance.lower` is not applied (see ReduceInstance). Reads (and warms)
+        // the chunks' memoized presentations: khs are cached and already hash-sorted per chunk.
         let mut out: Vec<(u64, T)> = Vec::new();
         for ch in chunks_of(instance.input_batches) {
-            let kh = ids(ch.keys());
-            let times = ch.times();
-            for (i, h) in kh.into_iter().enumerate() {
-                out.push((h, times.get(i)));
+            let p = ch.presentation_or_init(|| build_presentation(ch));
+            for i in 0..p.khs.len() {
+                out.push((p.khs[i], p.times[p.tranks[i] as usize].clone()));
             }
         }
         out.sort_by_key(|(k, _)| *k);
@@ -401,67 +485,62 @@ where
         }
         let keys: Vec<u64> = changed[*cursor..].to_vec();
         *cursor = changed.len();
-        let present = |chunks: &[&CorgiChunk<T, Diff>]| collect_present(chunks, &keys);
 
-        // Window-wide time interning: distinct presented times are few (shared band/moment
-        // times) while rows are many, with the same (key,val) recurring at many times — so the
-        // owned-time AoS comparison consolidation profiled at ~16% of SCC-compound. Intern each
-        // owned time once (the BTreeMap's keys double as the sorted distinct-time table),
-        // consolidate all-integer Copy records, and materialize owned times only after netting.
-        let mut time_index: BTreeMap<T, u32> = BTreeMap::new();
-
-        // Input presentation: accumulated history ∪ novel delta, restricted to the window's keys.
-        // value_id = content hash of the value (equal values share an id → the tactic nets them);
-        // `in_index` resolves an id back to a representative in_vals row for `reduce_corrections`.
+        // Presentations are memoized per (immutable) chunk: hash + hash-order sort paid once per
+        // chunk, so a retire is a MERGE of cached sorted runs restricted to the changed keys —
+        // replacing the previous per-retire full scan + re-hash + owned-time comparison sort.
         let mut in_chunks = chunks_of(instance.input_batches);
         in_chunks.extend(chunks_of(instance.source_batches));
-        let (in_keys, in_vals, in_khs, in_times, in_diffs) = present(&in_chunks);
+        let out_chunks = chunks_of(instance.output_batches);
+        let in_pres: Vec<&Presentation<T>> = in_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+        let out_pres: Vec<&Presentation<T>> = out_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+
+        // The window's global time table: union of the chunks' (small, sorted, distinct) tables;
+        // `maps` carries each chunk's local rank into the global rank space.
+        let mut global: std::collections::BTreeSet<&T> = Default::default();
+        for p in in_pres.iter().chain(out_pres.iter()) {
+            global.extend(p.times.iter());
+        }
+        let sorted_times: Vec<T> = global.iter().map(|t| (*t).clone()).collect();
+        let map_of = |p: &Presentation<T>| -> Vec<u32> {
+            p.times.iter().map(|t| sorted_times.binary_search(t).expect("global table contains every chunk time") as u32).collect()
+        };
+        let in_maps: Vec<Vec<u32>> = in_pres.iter().map(|p| map_of(p)).collect();
+        let out_maps: Vec<Vec<u32>> = out_pres.iter().map(|p| map_of(p)).collect();
+
+        // Input side: merge, then gather the presented rows (pre-netting, mirroring the previous
+        // per-record gather) for the id → representative-row pools.
+        let in_diffs: Vec<&[Diff]> = in_chunks.iter().map(|c| c.diffs()).collect();
+        let m_in = merge_presentations(&in_pres, &in_maps, &in_diffs, &keys);
         self.in_index = IdMap::default();
-        let raw_input: Vec<((u64, u64), u32, Diff)> = if in_khs.is_empty() {
+        let input: ProxyBridge<T, Diff> = if m_in.khs.is_empty() {
             self.in_vals = CValue::Unit(0);
             Vec::new()
         } else {
-            let vids = ids(&in_vals);
-            for (r, &vid) in vids.iter().enumerate() { self.in_index.entry(vid).or_insert(r); }
+            let key_srcs: Vec<Option<&CValue>> = in_chunks.iter().map(|c| Some(c.keys())).collect();
+            let val_srcs: Vec<Option<&CValue>> = in_chunks.iter().map(|c| Some(c.vals())).collect();
+            let in_keys = gather_lanes(&key_srcs, &m_in.tags, &m_in.offs);
+            let in_vals = gather_lanes(&val_srcs, &m_in.tags, &m_in.offs);
+            for (r, &vid) in m_in.vids.iter().enumerate() { self.in_index.entry(vid).or_insert(r); }
             self.in_vals = in_vals;
-            self.register_keys(in_keys, &in_khs);
-            in_times.into_iter().enumerate().map(|(i, t)| {
-                let next = time_index.len() as u32;
-                let ti = *time_index.entry(t).or_insert(next);
-                ((in_khs[i], vids[i]), ti, in_diffs[i])
-            }).collect()
+            self.register_keys(in_keys, &m_in.khs);
+            m_in.records.into_iter().map(|((k, v), r, d)| ((k, v), sorted_times[r as usize].clone(), d)).collect()
         };
 
-        // Output-history presentation, same keys (register keys + values for correction resolution).
-        let (o_keys, o_vals, o_khs, o_times, o_diffs) = present(&chunks_of(instance.output_batches));
-        let raw_output: Vec<((u64, u64), u32, Diff)> = if o_khs.is_empty() {
+        // Output side, same shape (also registers values for correction resolution).
+        let o_diffs: Vec<&[Diff]> = out_chunks.iter().map(|c| c.diffs()).collect();
+        let m_out = merge_presentations(&out_pres, &out_maps, &o_diffs, &keys);
+        let output: ProxyBridge<T, Diff> = if m_out.khs.is_empty() {
             Vec::new()
         } else {
-            let vids = ids(&o_vals);
-            self.register_keys(o_keys, &o_khs);
-            self.register_vals(o_vals, &vids);
-            o_times.into_iter().enumerate().map(|(i, t)| {
-                let next = time_index.len() as u32;
-                let ti = *time_index.entry(t).or_insert(next);
-                ((o_khs[i], vids[i]), ti, o_diffs[i])
-            }).collect()
+            let key_srcs: Vec<Option<&CValue>> = out_chunks.iter().map(|c| Some(c.keys())).collect();
+            let val_srcs: Vec<Option<&CValue>> = out_chunks.iter().map(|c| Some(c.vals())).collect();
+            let o_keys = gather_lanes(&key_srcs, &m_out.tags, &m_out.offs);
+            let o_vals = gather_lanes(&val_srcs, &m_out.tags, &m_out.offs);
+            self.register_keys(o_keys, &m_out.khs);
+            self.register_vals(o_vals, &m_out.vids);
+            m_out.records.into_iter().map(|((k, v), r, d)| ((k, v), sorted_times[r as usize].clone(), d)).collect()
         };
-
-        // Rank indices by time order (BTreeMap iterates sorted), so integer consolidation
-        // yields exactly the ((key_hash, value_id), time) order the bridge contract requires.
-        let mut rank = vec![0u32; time_index.len()];
-        let mut sorted_times: Vec<T> = Vec::with_capacity(time_index.len());
-        for (pos, (t, first)) in time_index.into_iter().enumerate() {
-            rank[first as usize] = pos as u32;
-            sorted_times.push(t);
-        }
-        let finish = |mut b: Vec<((u64, u64), u32, Diff)>| -> ProxyBridge<T, Diff> {
-            for r in b.iter_mut() { r.1 = rank[r.1 as usize]; }
-            consolidate_updates(&mut b);
-            b.into_iter().map(|((k, v), r, d)| ((k, v), sorted_times[r as usize].clone(), d)).collect()
-        };
-        let input = finish(raw_input);
-        let output = finish(raw_output);
 
         Some(ReduceWindow { keys, input, output })
     }
