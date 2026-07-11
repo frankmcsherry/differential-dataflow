@@ -26,7 +26,7 @@
 //! read whole (delta-sized), the accumulated history is scanned and filtered to the changed hashes
 //! (a columnar semijoin — matching the row-wise tactic's read).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
@@ -403,6 +403,13 @@ where
         *cursor = changed.len();
         let present = |chunks: &[&CorgiChunk<T, Diff>]| collect_present(chunks, &keys);
 
+        // Window-wide time interning: distinct presented times are few (shared band/moment
+        // times) while rows are many, with the same (key,val) recurring at many times — so the
+        // owned-time AoS comparison consolidation profiled at ~16% of SCC-compound. Intern each
+        // owned time once (the BTreeMap's keys double as the sorted distinct-time table),
+        // consolidate all-integer Copy records, and materialize owned times only after netting.
+        let mut time_index: BTreeMap<T, u32> = BTreeMap::new();
+
         // Input presentation: accumulated history ∪ novel delta, restricted to the window's keys.
         // value_id = content hash of the value (equal values share an id → the tactic nets them);
         // `in_index` resolves an id back to a representative in_vals row for `reduce_corrections`.
@@ -410,7 +417,7 @@ where
         in_chunks.extend(chunks_of(instance.source_batches));
         let (in_keys, in_vals, in_khs, in_times, in_diffs) = present(&in_chunks);
         self.in_index = IdMap::default();
-        let input: ProxyBridge<T, Diff> = if in_khs.is_empty() {
+        let raw_input: Vec<((u64, u64), u32, Diff)> = if in_khs.is_empty() {
             self.in_vals = CValue::Unit(0);
             Vec::new()
         } else {
@@ -418,25 +425,43 @@ where
             for (r, &vid) in vids.iter().enumerate() { self.in_index.entry(vid).or_insert(r); }
             self.in_vals = in_vals;
             self.register_keys(in_keys, &in_khs);
-            let mut b: ProxyBridge<T, Diff> =
-                (0..in_khs.len()).map(|i| ((in_khs[i], vids[i]), in_times[i].clone(), in_diffs[i])).collect();
-            consolidate_updates(&mut b);
-            b
+            in_times.into_iter().enumerate().map(|(i, t)| {
+                let next = time_index.len() as u32;
+                let ti = *time_index.entry(t).or_insert(next);
+                ((in_khs[i], vids[i]), ti, in_diffs[i])
+            }).collect()
         };
 
         // Output-history presentation, same keys (register keys + values for correction resolution).
         let (o_keys, o_vals, o_khs, o_times, o_diffs) = present(&chunks_of(instance.output_batches));
-        let output: ProxyBridge<T, Diff> = if o_khs.is_empty() {
+        let raw_output: Vec<((u64, u64), u32, Diff)> = if o_khs.is_empty() {
             Vec::new()
         } else {
             let vids = ids(&o_vals);
             self.register_keys(o_keys, &o_khs);
             self.register_vals(o_vals, &vids);
-            let mut b: ProxyBridge<T, Diff> =
-                (0..o_khs.len()).map(|i| ((o_khs[i], vids[i]), o_times[i].clone(), o_diffs[i])).collect();
-            consolidate_updates(&mut b);
-            b
+            o_times.into_iter().enumerate().map(|(i, t)| {
+                let next = time_index.len() as u32;
+                let ti = *time_index.entry(t).or_insert(next);
+                ((o_khs[i], vids[i]), ti, o_diffs[i])
+            }).collect()
         };
+
+        // Rank indices by time order (BTreeMap iterates sorted), so integer consolidation
+        // yields exactly the ((key_hash, value_id), time) order the bridge contract requires.
+        let mut rank = vec![0u32; time_index.len()];
+        let mut sorted_times: Vec<T> = Vec::with_capacity(time_index.len());
+        for (pos, (t, first)) in time_index.into_iter().enumerate() {
+            rank[first as usize] = pos as u32;
+            sorted_times.push(t);
+        }
+        let finish = |mut b: Vec<((u64, u64), u32, Diff)>| -> ProxyBridge<T, Diff> {
+            for r in b.iter_mut() { r.1 = rank[r.1 as usize]; }
+            consolidate_updates(&mut b);
+            b.into_iter().map(|((k, v), r, d)| ((k, v), sorted_times[r as usize].clone(), d)).collect()
+        };
+        let input = finish(raw_input);
+        let output = finish(raw_output);
 
         Some(ReduceWindow { keys, input, output })
     }
