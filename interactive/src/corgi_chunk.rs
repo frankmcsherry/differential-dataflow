@@ -92,6 +92,28 @@ impl<T: Columnar, R> Default for CorgiChunk<T, R> {
     }
 }
 
+/// Advance `idx` past every row of `xs` whose `(key,val)` is STRICTLY LESS than `piv[pj]`'s
+/// (doubling then binary refine — O(log gap) `compare_at`s). Equal rows stop the gallop: their
+/// time interleaving is the row-level loop's business.
+fn gallop_kv_lt(xs: &CValue, idx: &mut usize, hi: usize, piv: &CValue, pj: usize) {
+    let lt = |k: usize| compare_at(xs, k, piv, pj) == Ordering::Less;
+    if *idx < hi && lt(*idx) {
+        let mut step = 1;
+        while *idx + step < hi && lt(*idx + step) {
+            *idx += step;
+            step <<= 1;
+        }
+        step >>= 1;
+        while step > 0 {
+            if *idx + step < hi && lt(*idx + step) {
+                *idx += step;
+            }
+            step >>= 1;
+        }
+        *idx += 1;
+    }
+}
+
 /// Split a `Prod([keys, vals])` corgi value into its two columns.
 fn split_kv(kv: CValue) -> (CValue, CValue) {
     let mut cols = kv.into_prod("corgi chunk kv");
@@ -188,25 +210,59 @@ where
     fn merge(in1: &mut VecDeque<Self>, in2: &mut VecDeque<Self>, out: &mut VecDeque<Self>) {
         let c1 = in1.pop_front().unwrap();
         let c2 = in2.pop_front().unwrap();
+        // Row-level merge with WARMUP GALLOPING: identical semantics to the plain two-pointer
+        // ((key,val) structurally then time; equal (k,v,t) nets; suffix push-back at exhaustion),
+        // but after STREAK consecutive same-side wins at the (key,val) level, gallop to the other
+        // side's current row and bulk-copy the strictly-smaller range. Alternating interleavings
+        // pay nothing (the streak never fires); run-heavy merges (e.g. SCC's label bands) skip
+        // whole ranges in O(log gap) compares. (A group-range survey merge — corgi's
+        // survey_groups — won on run-heavy but cost two extra structural probes per singleton
+        // match, regressing unique-key workloads ~15-30%; warmup keeps both fast.)
         let (kv1, kv2) = (c1.kv(), c2.kv());
         let (n1, n2) = (c1.len_(), c2.len_());
         let (t1, d1) = (c1.times(), c1.diffs());
         let (t2, d2) = (c2.times(), c2.diffs());
 
+        const STREAK: u32 = 8;
         let (mut tags, mut offs) = (Vec::new(), Vec::new());
         let (mut times, mut diffs) = (ColTimes::new(), Vec::new());
         let (mut p1, mut p2) = (0usize, 0usize);
+        let (mut run1, mut run2) = (0u32, 0u32);
         while p1 < n1 && p2 < n2 {
             // `(key, val)` structurally, then `time` in place via the columnar `Ref: Ord`.
-            let ord = compare_at(&kv1, p1, &kv2, p2).then_with(|| t1.cmp_cross(p1, t2, p2));
+            let kv_ord = compare_at(&kv1, p1, &kv2, p2);
+            let ord = kv_ord.then_with(|| t1.cmp_cross(p1, t2, p2));
             match ord {
-                Ordering::Less => { tags.push(0); offs.push(p1); times.push_ref(t1, p1); diffs.push(d1[p1].clone()); p1 += 1; }
-                Ordering::Greater => { tags.push(1); offs.push(p2); times.push_ref(t2, p2); diffs.push(d2[p2].clone()); p2 += 1; }
+                Ordering::Less => {
+                    tags.push(0); offs.push(p1); times.push_ref(t1, p1); diffs.push(d1[p1].clone()); p1 += 1;
+                    if kv_ord == Ordering::Less {
+                        run1 += 1; run2 = 0;
+                        if run1 >= STREAK {
+                            let start = p1;
+                            gallop_kv_lt(&kv1, &mut p1, n1, &kv2, p2);
+                            for p in start..p1 { tags.push(0); offs.push(p); times.push_ref(t1, p); diffs.push(d1[p].clone()); }
+                            run1 = 0;
+                        }
+                    } else { run1 = 0; run2 = 0; }
+                }
+                Ordering::Greater => {
+                    tags.push(1); offs.push(p2); times.push_ref(t2, p2); diffs.push(d2[p2].clone()); p2 += 1;
+                    if kv_ord == Ordering::Greater {
+                        run2 += 1; run1 = 0;
+                        if run2 >= STREAK {
+                            let start = p2;
+                            gallop_kv_lt(&kv2, &mut p2, n2, &kv1, p1);
+                            for p in start..p2 { tags.push(1); offs.push(p); times.push_ref(t2, p); diffs.push(d2[p].clone()); }
+                            run2 = 0;
+                        }
+                    } else { run1 = 0; run2 = 0; }
+                }
                 Ordering::Equal => {
                     let mut d = d1[p1].clone();
                     d.plus_equals(&d2[p2]);
                     if !d.is_zero() { tags.push(0); offs.push(p1); times.push_ref(t1, p1); diffs.push(d); }
                     p1 += 1; p2 += 1;
+                    run1 = 0; run2 = 0;
                 }
             }
         }
