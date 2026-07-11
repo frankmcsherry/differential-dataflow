@@ -367,32 +367,11 @@ where
                     st.produced.consolidate();
 
                     in_accum.clear();
-                    {
-                        let buffer = st.in_replay.buffer();
-                        for idx in 0..buffer.len() {
-                            s0.copy_from(buffer.time(idx));
-                            if s0.less_equal(&t_cur) {
-                                in_accum.push((buffer.ids()[idx], buffer.diffs()[idx].clone()));
-                            }
-                        }
-                    }
+                    accumulate_le(st.in_replay.buffer(), &t_cur, &mut in_accum, &mut s0);
                     crate::consolidation::consolidate(&mut in_accum);
                     cur_out.clear();
-                    {
-                        let buffer = st.out_replay.buffer();
-                        for idx in 0..buffer.len() {
-                            s0.copy_from(buffer.time(idx));
-                            if s0.less_equal(&t_cur) {
-                                cur_out.push((buffer.ids()[idx], buffer.diffs()[idx].clone()));
-                            }
-                        }
-                        for idx in 0..st.produced.len() {
-                            s0.copy_from(st.produced.time(idx));
-                            if s0.less_equal(&t_cur) {
-                                cur_out.push((st.produced.ids()[idx], st.produced.diffs()[idx].clone()));
-                            }
-                        }
-                    }
+                    accumulate_le(st.out_replay.buffer(), &t_cur, &mut cur_out, &mut s0);
+                    accumulate_le(&st.produced, &t_cur, &mut cur_out, &mut s0);
                     crate::consolidation::consolidate(&mut cur_out);
 
                     if in_accum.is_empty() && cur_out.is_empty() {
@@ -728,6 +707,23 @@ fn discover_times<T, RIn>(
         }
     }
     pended.sort_dedup();
+}
+
+/// Append `(id, diff)` for every update in `updates` whose time is `less_equal` the
+/// probe — the one-moment-deep accumulation read off a replay buffer.
+fn accumulate_le<T: ProxyTime, R: Semigroup + Clone>(
+    updates: &UpdateCol<u64, T, R>,
+    probe: &T,
+    out: &mut Vec<(u64, R)>,
+    scratch: &mut T,
+) {
+    let (ids, times, diffs) = (updates.ids(), updates.times(), updates.diffs());
+    for idx in 0..ids.len() {
+        scratch.copy_from(times.get(idx));
+        if scratch.less_equal(probe) {
+            out.push((ids[idx], diffs[idx].clone()));
+        }
+    }
 }
 
 /// True iff any time in `times` is `less_equal` the probe (copying each into `scratch`

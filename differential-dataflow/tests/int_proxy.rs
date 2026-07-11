@@ -1192,3 +1192,77 @@ fn proxy_reduce_seeds_survive_compaction_cancellation() {
     );
     assert!(frontier2.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Wall clock, nested times: the allocation shape the columnar time column targets.
+// ---------------------------------------------------------------------------
+//
+// `PointStamp<u64>` is an allocating timestamp (two coordinates spill its inline
+// buffer to the heap): with owned time storage every presented record and every
+// replayed edit materializes one allocation, while columnar storage lays the
+// times down contiguously. Scripted retires of the reduce tactic over the
+// identity backend — counting per key over many keys × distinct nested times per
+// round, with cross-round joins synthesizing more — report the total retire time.
+
+#[test]
+#[ignore = "wall-clock benchmark; run --release with --ignored --nocapture"]
+fn bench_pointstamp_retires() {
+    use differential_dataflow::dynamic::pointstamp::PointStamp;
+    use differential_dataflow::trace::chunk::ChunkBatch;
+    use crate::support::identity_chunk::IdentityChunk;
+    use timely::progress::Timestamp;
+    type NT = PointStamp<u64>;
+
+    const ROUNDS: u64 = 100;
+    const KEYS: u64 = 32;
+    const TIMES: u64 = 8;
+
+    let count = |acc: &[(u64, isize)]| {
+        let s: isize = acc.iter().map(|(_, d)| *d).sum();
+        if s > 0 { vec![(s as u64, 1)] } else { Vec::new() }
+    };
+
+    let mut tactic = ProxyReduceTactic::new(identity::IdentityReduce::new(count));
+    let mut source: Vec<identity::Batch<NT>> = Vec::new();
+    let mut outputs: Vec<identity::Batch<NT>> = Vec::new();
+    let mut lower = Antichain::from_elem(NT::minimum());
+    let mut produced_count = 0usize;
+
+    let timer = std::time::Instant::now();
+    for r in 0..ROUNDS {
+        // KEYS keys, each updated at TIMES distinct nested times [r, j]; joins against
+        // earlier rounds' incomparable coordinates synthesize additional moments.
+        let (mut ks, mut vs) = (Vec::new(), Vec::new());
+        let (mut ts, mut ds) = (Vec::new(), Vec::new());
+        for k in 0..KEYS {
+            for j in 0..TIMES {
+                ks.push(k);
+                vs.push(k * TIMES + j);
+                ts.push(PointStamp::new(vec![r, j].into()));
+                ds.push(1isize);
+            }
+        }
+        let upper = if r + 1 == ROUNDS {
+            Antichain::new()
+        } else {
+            Antichain::from_elem(PointStamp::new(vec![r + 1].into()))
+        };
+        let held = Antichain::from_elem(PointStamp::new(vec![r].into()));
+        let (chunk, _) = IdentityChunk::from_unsorted(ks, vs, ts, ds);
+        let desc = Description::new(lower.clone(), upper.clone(), Antichain::from_elem(NT::minimum()));
+        let input = vec![std::rc::Rc::new(ChunkBatch::new(vec![chunk], desc))];
+
+        let (produced, frontier) = tactic.retire(source.clone(), outputs.clone(), input.clone(), &lower, &upper, &held);
+        assert!(frontier.is_empty(), "chain-within-round times should never pend");
+        for (_, batch) in produced {
+            produced_count += 1;
+            outputs.push(batch);
+        }
+        source.extend(input);
+        lower = upper;
+    }
+    eprintln!(
+        "pointstamp reduce: {ROUNDS} rounds x {KEYS} keys x {TIMES} times: {:?} ({produced_count} output batches)",
+        timer.elapsed()
+    );
+}

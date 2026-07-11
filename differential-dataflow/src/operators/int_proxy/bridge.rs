@@ -68,6 +68,15 @@ where
     pub fn from_unsorted(ids: Vec<(u64, u64)>, times: ContainerOf<T>, diffs: Vec<R>) -> (Self, Vec<usize>) {
         let n = ids.len();
         debug_assert!(times.len() == n && diffs.len() == n);
+        // Fast path: already sorted, distinct, and zero-free — the columns pass through
+        // unchanged, and every record represents itself.
+        let clean = {
+            let view = times.borrow();
+            (1..n).all(|i| (ids[i - 1], view.get(i - 1)) < (ids[i], view.get(i)))
+        } && diffs.iter().all(|d| !d.is_zero());
+        if clean {
+            return (ProxyBridge { ids, times, diffs }, (0..n).collect());
+        }
         let view = times.borrow();
         let perm = sort_perm::<T>(&ids, view);
 

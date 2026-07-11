@@ -235,13 +235,14 @@ fn join_key<T, R0, R1, RO, F>(
             let (v0, t0, d0) = h0.edit().unwrap();
             s0.copy_from(t0);
             let buffer = h1.buffer();
-            for idx in 0..buffer.len() {
+            let (ids, times, diffs) = (buffer.ids(), buffer.times(), buffer.diffs());
+            for idx in 0..ids.len() {
                 li.push((kh, v0));
-                ri.push((kh, buffer.ids()[idx]));
-                s1.copy_from(buffer.time(idx));
+                ri.push((kh, ids[idx]));
+                s1.copy_from(times.get(idx));
                 s1.join_assign(&*s0);
                 push_owned::<T>(ot, s1);
-                od.push(d0.clone().multiply(&buffer.diffs()[idx]));
+                od.push(d0.clone().multiply(&diffs[idx]));
                 if li.len() >= JOIN_CHUNK { flush(li, ri, ot, od); }
             }
             h0.step();
@@ -251,13 +252,14 @@ fn join_key<T, R0, R1, RO, F>(
             let (v1, t1, d1) = h1.edit().unwrap();
             s0.copy_from(t1);
             let buffer = h0.buffer();
-            for idx in 0..buffer.len() {
-                li.push((kh, buffer.ids()[idx]));
+            let (ids, times, diffs) = (buffer.ids(), buffer.times(), buffer.diffs());
+            for idx in 0..ids.len() {
+                li.push((kh, ids[idx]));
                 ri.push((kh, v1));
-                s1.copy_from(buffer.time(idx));
+                s1.copy_from(times.get(idx));
                 s1.join_assign(&*s0);
                 push_owned::<T>(ot, s1);
-                od.push(buffer.diffs()[idx].clone().multiply(d1));
+                od.push(diffs[idx].clone().multiply(d1));
                 if li.len() >= JOIN_CHUNK { flush(li, ri, ot, od); }
             }
             h1.step();
@@ -269,13 +271,14 @@ fn join_key<T, R0, R1, RO, F>(
         let (v0, t0, d0) = h0.edit().unwrap();
         s0.copy_from(t0);
         let buffer = h1.buffer();
-        for idx in 0..buffer.len() {
+        let (ids, times, diffs) = (buffer.ids(), buffer.times(), buffer.diffs());
+        for idx in 0..ids.len() {
             li.push((kh, v0));
-            ri.push((kh, buffer.ids()[idx]));
-            s1.copy_from(buffer.time(idx));
+            ri.push((kh, ids[idx]));
+            s1.copy_from(times.get(idx));
             s1.join_assign(&*s0);
             push_owned::<T>(ot, s1);
-            od.push(d0.clone().multiply(&buffer.diffs()[idx]));
+            od.push(d0.clone().multiply(&diffs[idx]));
             if li.len() >= JOIN_CHUNK { flush(li, ri, ot, od); }
         }
         h0.step();
@@ -286,13 +289,14 @@ fn join_key<T, R0, R1, RO, F>(
         let (v1, t1, d1) = h1.edit().unwrap();
         s0.copy_from(t1);
         let buffer = h0.buffer();
-        for idx in 0..buffer.len() {
-            li.push((kh, buffer.ids()[idx]));
+        let (ids, times, diffs) = (buffer.ids(), buffer.times(), buffer.diffs());
+        for idx in 0..ids.len() {
+            li.push((kh, ids[idx]));
             ri.push((kh, v1));
-            s1.copy_from(buffer.time(idx));
+            s1.copy_from(times.get(idx));
             s1.join_assign(&*s0);
             push_owned::<T>(ot, s1);
-            od.push(buffer.diffs()[idx].clone().multiply(d1));
+            od.push(diffs[idx].clone().multiply(d1));
             if li.len() >= JOIN_CHUNK { flush(li, ri, ot, od); }
         }
         h1.step();

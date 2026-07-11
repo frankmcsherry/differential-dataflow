@@ -64,6 +64,11 @@ impl<T: super::ProxyTime> TimeVec<T> {
     pub fn sort_dedup_from(&mut self, cursor: &mut usize) {
         let Self { data, spare, perm } = self;
         let view = data.borrow();
+        // Fast path: the live suffix is already sorted and distinct; leave it in place
+        // (a consumed prefix, if any, is dropped at the next real rebuild).
+        if (*cursor + 1..view.len()).all(|i| view.get(i - 1) < view.get(i)) {
+            return;
+        }
         perm.clear();
         Extend::extend(perm, *cursor..view.len());
         perm.sort_unstable_by(|&a, &b| view.get(a).cmp(&view.get(b)));
@@ -164,6 +169,12 @@ where
     pub fn consolidate(&mut self) {
         let Self { ids, times, diffs, spare_ids, spare_times, spare_diffs, perm } = self;
         let view = times.borrow();
+        // Fast path: already sorted, distinct, and zero-free — nothing to merge or drop.
+        if (1..ids.len()).all(|i| (ids[i - 1], view.get(i - 1)) < (ids[i], view.get(i)))
+            && diffs.iter().all(|d| !d.is_zero())
+        {
+            return;
+        }
         perm.clear();
         Extend::extend(perm, 0..ids.len());
         perm.sort_unstable_by(|&a, &b| ids[a].cmp(&ids[b]).then_with(|| view.get(a).cmp(&view.get(b))));
