@@ -6,7 +6,6 @@
 //! This iteration: the `Backend` impl SHAPE compiles (arrange + leave_dynamic real; linear/join/
 //! as_collection/reduce/inspect = `todo!()`), validating the trait wiring + `render_tree::<CorgiBackend>`.
 
-use timely::container::CapacityContainerBuilder;
 use timely::dataflow::Scope;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::Operator;
@@ -38,7 +37,7 @@ use crate::scope_ir as st;
 /// The time/list-shaping ops (EnterAt/LiftIter/FlatMap) take a correctness-first row-wise path
 /// (untranscode → vec-style transform → `from_updates`), matching `backend::vec` exactly; a columnar
 /// fast-path is future work. `level` is the scope depth (locates the iteration coordinate).
-fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
+pub(crate) fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
     use timely::order::Product;
     use differential_dataflow::lattice::Lattice;
     use differential_dataflow::dynamic::pointstamp::PointStamp;
@@ -308,11 +307,18 @@ impl Backend for CorgiBackend {
             .as_collection()
     }
 
-    fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection) -> Collection<'s, Time, CC> {
+    fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection, post: &[LinearOp], level: usize) -> Collection<'s, Time, CC> {
         // The tactic compiles the projection per work-unit (shape-directed, for `Spread`) and emits
         // corgi columns directly into a `CorgiContainer` (via `give_container`) — the output stream is
-        // column-native, so there is no row round-trip / no `JoinToCorgi` unary.
-        let tactic = CorgiJoinTactic::new(projection.key.clone(), projection.val.clone());
+        // column-native, so there is no row round-trip / no `JoinToCorgi` unary. Fused `post` ops run
+        // inside the tactic on each output container (columnar via `apply_ops`), not as an operator.
+        let post_fn: Option<Box<dyn FnMut(CC) -> CC>> = if post.is_empty() {
+            None
+        } else {
+            let post = post.to_vec();
+            Some(Box::new(move |c: CC| apply_ops(c, &post, level)))
+        };
+        let tactic = CorgiJoinTactic::new(projection.key.clone(), projection.val.clone(), post_fn);
         join_with_tactic::<_, _, _, CC>(l, r, tactic).as_collection()
     }
 

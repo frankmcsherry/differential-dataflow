@@ -18,7 +18,12 @@ fn main() {
     } else {
         parse::applicative::parse(&source)
     };
-    let original = lower::lower_tree(stmts);
+    let mut original = lower::lower_tree(stmts);
+    // OPTIMIZE=1: dump the optimized (operator-fused) plan instead — fused joins
+    // render as `join(a, b) | fused: ...`, the absorbed ops visible in place.
+    if std::env::var("OPTIMIZE").is_ok() {
+        original.optimize();
+    }
 
     println!("-- ====================================================");
     println!("-- ORIGINAL ({} ops)", original.op_count());

@@ -120,13 +120,33 @@ impl Backend for VecBackend {
     fn as_collection<'s>(a: Self::Arr<'s>) -> Collection<'s, Time, Self::Container> {
         a.as_collection(|k, v| (k.clone(), v.clone()))
     }
-    fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection) -> Collection<'s, Time, Self::Container> {
+    fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection, post: &[LinearOp], _level: usize) -> Collection<'s, Time, Self::Container> {
         let proj = projection.clone();
+        let post = post.to_vec();
         let f: Arc<dyn Fn(&Row, &Row, &Row) -> SmallVec<[(Row, Row); 2]> + Send + Sync> =
             Arc::new(move |key, left, right| {
                 let mut env = vec![key.clone(), left.clone(), right.clone()];
-                let k = eval(&proj.key, &mut env);
-                let v = eval(&proj.val, &mut env);
+                let mut k = eval(&proj.key, &mut env);
+                let mut v = eval(&proj.val, &mut env);
+                // Fused post ops, applied inside the join's emission (row-wise).
+                for op in &post {
+                    match op {
+                        LinearOp::Project(p) => {
+                            let mut env = vec![k, v];
+                            let nk = eval(&p.key, &mut env);
+                            let nv = eval(&p.val, &mut env);
+                            k = nk;
+                            v = nv;
+                        }
+                        LinearOp::Filter(c) => {
+                            let mut env = vec![k.clone(), v.clone()];
+                            if !eval(c, &mut env).truthy() {
+                                return svec![];
+                            }
+                        }
+                        other => unreachable!("non-fusable op in Join::post: {other:?}"),
+                    }
+                }
                 svec![(k, v)]
             });
         l.join_core(r, move |k, v1, v2| f(k, v1, v2))

@@ -78,7 +78,7 @@ fn clone_node(node: &Node, m: impl Fn(&Ref) -> Ref) -> Node {
         Node::Linear { input, ops } => Node::Linear { input: m(input), ops: ops.clone() },
         Node::Concat(refs) => Node::Concat(refs.iter().map(&m).collect()),
         Node::Arrange(r) => Node::Arrange(m(r)),
-        Node::Join { left, right, projection } => Node::Join { left: m(left), right: m(right), projection: projection.clone() },
+        Node::Join { left, right, projection, post } => Node::Join { left: m(left), right: m(right), projection: projection.clone(), post: post.clone() },
         Node::Reduce { input, reducer } => Node::Reduce { input: m(input), reducer: reducer.clone() },
         Node::Inspect { input, label } => Node::Inspect { input: m(input), label: label.clone() },
     }
@@ -326,10 +326,11 @@ fn walk_shapes(
                     Node::Linear { input, ops } => of(input).map(|s| apply_ops_arity(s, ops)),
                     Node::Concat(refs) => refs.iter().find_map(|r| of(r)),
                     Node::Arrange(r) | Node::Inspect { input: r, .. } => of(r),
-                    Node::Join { left, right, projection } => match (of(left), of(right)) {
+                    Node::Join { left, right, projection, post } => match (of(left), of(right)) {
                         (Some((kl, vl)), Some((_, vr))) => {
                             let rows = [kl, vl, vr];
-                            Some((proj_arity(&projection.key, &rows), proj_arity(&projection.val, &rows)))
+                            let joined = (proj_arity(&projection.key, &rows), proj_arity(&projection.val, &rows));
+                            Some(apply_ops_arity(joined, post))
                         }
                         _ => None,
                     },
@@ -382,7 +383,7 @@ impl Sb {
     fn join(&mut self, l: Ref, r: Ref, projection: Projection) -> Ref {
         let la = self.op(Node::Arrange(l));
         let ra = self.op(Node::Arrange(r));
-        self.op(Node::Join { left: la, right: ra, projection })
+        self.op(Node::Join { left: la, right: ra, projection, post: vec![] })
     }
     fn reduce(&mut self, input: Ref, reducer: Reducer) -> Ref {
         let a = self.op(Node::Arrange(input));
@@ -1029,7 +1030,8 @@ impl<'a> Reverse<'a> {
                 let contrib = ex.emit_lookup_keyed(dep_this, &side, out_shape, out_user_len, reducer);
                 self.contribs.entry(target).or_default().push(contrib);
             }
-            Node::Join { left, right, projection } => {
+            Node::Join { left, right, projection, post } => {
+                assert!(post.is_empty(), "explain: fused Join (run before optimize)");
                 let lt = resolve(self.orig, path, left);
                 let rt = resolve(self.orig, path, right);
                 let ls = self.side(&lt);

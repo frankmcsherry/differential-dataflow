@@ -108,7 +108,11 @@ pub enum Node {
     Linear { input: Ref, ops: Vec<LinearOp> },
     Concat(Vec<Ref>),
     Arrange(Ref),
-    Join { left: Ref, right: Ref, projection: Projection },
+    /// `post` holds linear ops FUSED into the join's emission by `fuse_post_join`
+    /// (Project/Filter only). The absorbed ops are carried verbatim — they ARE the
+    /// provenance — and render inside the join operator, not as their own operator.
+    /// Always empty before `optimize` (the explain rewrite requires it so).
+    Join { left: Ref, right: Ref, projection: Projection, post: Vec<LinearOp> },
     Reduce { input: Ref, reducer: Reducer },
     Inspect { input: Ref, label: String },
 }
@@ -173,6 +177,8 @@ impl Scope {
     ///   (an `Arrange` or a `Reduce`);
     /// - fuse a `Linear` into its `Linear` input when it is that input's only
     ///   consumer;
+    /// - fuse a Project/Filter-only `Linear` into the `Join` it is the only
+    ///   consumer of (the ops move into `Join::post` — no separate operator);
     /// - deduplicate structurally identical operators.
     ///
     /// All three are *within-scope*: a scope boundary is a semantic barrier,
@@ -188,6 +194,7 @@ impl Scope {
         loop {
             let changed = self.collapse_arranges(&mut dead)
                 | self.fuse_linear(&mut dead)
+                | (!std::env::var("NO_FUSE_POST_JOIN").is_ok() && self.fuse_post_join(&mut dead))
                 | self.dedup(&mut dead);
             if !changed { break; }
         }
@@ -214,13 +221,33 @@ impl Scope {
         for e in self.exports.iter_mut() { f(&mut e.value); }
     }
 
-    /// Count, for each item, the references to it (`Local` or `ChildExport`).
-    fn use_counts(&mut self) -> Vec<usize> {
+    /// Count, for each item, the references to it (`Local` or `ChildExport`)
+    /// from LIVE holders only. Dead items keep their (stale, already-redirected-
+    /// around) input refs until `compact`, and counting those would make a
+    /// single-consumer item look shared — blocking fusion after its consumer
+    /// chain has partially fused.
+    fn use_counts(&self, dead: &[bool]) -> Vec<usize> {
         let mut counts = vec![0usize; self.items.len()];
-        self.for_each_ref(|r| match r {
+        let mut tally = |r: &Ref| match r {
             Ref::Local(i) | Ref::ChildExport(i, _) => counts[*i] += 1,
             Ref::Import(_) | Ref::Var(_) => {},
-        });
+        };
+        for (i, item) in self.items.iter().enumerate() {
+            if dead[i] { continue; }
+            match item {
+                Item::Op(node) => match node {
+                    Node::Linear { input, .. } | Node::Arrange(input)
+                    | Node::Reduce { input, .. } | Node::Inspect { input, .. } => tally(input),
+                    Node::Join { left, right, .. } => { tally(left); tally(right); },
+                    Node::Concat(refs) => for r in refs { tally(r); },
+                },
+                Item::Sub(child) => for imp in &child.imports {
+                    if let Source::Parent(r) = &imp.from { tally(r); }
+                },
+            }
+        }
+        for b in &self.binds { tally(&b.value); }
+        for e in &self.exports { tally(&e.value); }
         counts
     }
 
@@ -247,7 +274,7 @@ impl Scope {
 
     /// Fuse a `Linear` into its `Linear` input when it is the only consumer.
     fn fuse_linear(&mut self, dead: &mut [bool]) -> bool {
-        let counts = self.use_counts();
+        let counts = self.use_counts(dead);
         let mut changed = false;
         for i in 0..self.items.len() {
             if dead[i] { continue; }
@@ -260,6 +287,36 @@ impl Scope {
             fused.append(ops);
             self.items[i] = Item::Op(Node::Linear { input: inner_input, ops: fused });
             dead[j] = true;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Fuse a Project/Filter-only `Linear` into the `Join` it is the sole
+    /// consumer of: the ops append to `Join::post` and the join's emission
+    /// applies them in place of the removed operator. Other `LinearOp`s stay
+    /// unfused (Negate needs the diff; EnterAt/LiftIter/FlatMap need time/list
+    /// machinery the join emission doesn't own).
+    fn fuse_post_join(&mut self, dead: &mut [bool]) -> bool {
+        let mut counts = self.use_counts(dead);
+        let mut changed = false;
+        for i in 0..self.items.len() {
+            if dead[i] { continue; }
+            let Item::Op(Node::Linear { input: Ref::Local(j), ops }) = &self.items[i] else { continue };
+            let j = *j;
+            if dead[j] || counts[j] != 1 { continue; }
+            if !matches!(&self.items[j], Item::Op(Node::Join { .. })) { continue; }
+            if !ops.iter().all(|op| matches!(op, LinearOp::Project(_) | LinearOp::Filter(_))) { continue; }
+            let ops = ops.clone();
+            let Item::Op(Node::Join { post, .. }) = &mut self.items[j] else { unreachable!() };
+            post.extend(ops);
+            self.redirect(i, Ref::Local(j), dead);
+            // The join inherits the absorbed Linear's consumers: keep `counts`
+            // current within this sweep, or a SECOND (parallel) consumer of the
+            // dead Linear would still see the stale single-consumer count and
+            // serialize into `post` ops that were never sequential.
+            counts[j] = counts[i];
+            counts[i] = 0;
             changed = true;
         }
         changed
@@ -308,6 +365,14 @@ impl Scope {
     }
 }
 
+fn op_name(op: &LinearOp) -> &'static str {
+    match op {
+        LinearOp::Project(_) => "project", LinearOp::Filter(_) => "filter",
+        LinearOp::Negate => "negate", LinearOp::EnterAt(_) => "enter_at",
+        LinearOp::LiftIter => "lift_iter", LinearOp::FlatMap(_) => "flatmap",
+    }
+}
+
 fn fmt_ref(r: &Ref) -> String {
     match r {
         Ref::Local(i) => format!("n{}", i),
@@ -349,16 +414,19 @@ fn dump_scope_body(s: &Scope, indent: usize) {
             Item::Op(node) => {
                 let desc = match node {
                     Node::Linear { input, ops } => {
-                        let ops: Vec<&str> = ops.iter().map(|op| match op {
-                            LinearOp::Project(_) => "project", LinearOp::Filter(_) => "filter",
-                            LinearOp::Negate => "negate", LinearOp::EnterAt(_) => "enter_at",
-                            LinearOp::LiftIter => "lift_iter", LinearOp::FlatMap(_) => "flatmap",
-                        }).collect();
+                        let ops: Vec<&str> = ops.iter().map(op_name).collect();
                         format!("{} | {}", fmt_ref(input), ops.join(" | "))
                     }
                     Node::Concat(refs) => refs.iter().map(fmt_ref).collect::<Vec<_>>().join(" + "),
                     Node::Arrange(r) => format!("{} | arrange", fmt_ref(r)),
-                    Node::Join { left, right, .. } => format!("join({}, {})", fmt_ref(left), fmt_ref(right)),
+                    Node::Join { left, right, post, .. } => {
+                        let mut s = format!("join({}, {})", fmt_ref(left), fmt_ref(right));
+                        if !post.is_empty() {
+                            let ops: Vec<&str> = post.iter().map(op_name).collect();
+                            s = format!("{} | fused: {}", s, ops.join(" | "));
+                        }
+                        s
+                    }
                     Node::Reduce { input, reducer } => format!("{} | {:?}", fmt_ref(input), reducer),
                     Node::Inspect { input, label } => format!("{} | inspect({})", fmt_ref(input), label),
                 };
@@ -398,7 +466,7 @@ mod tests {
             vars: vec![Var { name: "reach".into() }],
             items: vec![
                 // proposals = reach JOIN edges  — references Var + Import
-                Item::Op(Node::Join { left: Ref::Var(0), right: Ref::Import(0), projection: noproj.clone() }),
+                Item::Op(Node::Join { left: Ref::Var(0), right: Ref::Import(0), projection: noproj.clone(), post: vec![] }),
                 // body = roots + proposals       — references Import + Local
                 Item::Op(Node::Concat(vec![Ref::Import(1), Ref::Local(0)])),
             ],
@@ -424,5 +492,38 @@ mod tests {
         assert!(matches!(prog.root.exports[0].value, Ref::ChildExport(0, 0)));
         assert!(matches!(prog.root.imports[0].from, Source::Input(0)));
         assert!(matches!(reach.binds[0].value, Ref::Local(1)));
+    }
+
+    // The SCC program's `join | join | filter | key` trim chains must fuse their
+    // trailing Filter+Project into the second join's `post` (and the fused ops
+    // must be exactly what the removed Linear carried).
+    #[test]
+    fn fuses_post_join_linear() {
+        let src = r#"
+            let edges = input 0 | key($0[0] ; $0[1]);
+            let out = edges | join(edges, ($1 ; $0, $2)) | filter($1[1] == $1[0]) | key($0 ; $1[0]);
+            export "result" = out | arrange;
+        "#;
+        let mut p = crate::lower::lower_tree(crate::parse::pipe::parse(src));
+        let before = p.op_count();
+        p.optimize();
+        fn fused_joins(s: &Scope) -> usize {
+            s.items.iter().map(|i| match i {
+                Item::Op(Node::Join { post, .. }) if !post.is_empty() => 1,
+                Item::Sub(c) => fused_joins(c),
+                _ => 0,
+            }).sum()
+        }
+        assert!(p.op_count() < before, "fusion must drop the operator count");
+        assert_eq!(fused_joins(&p.root), 1, "the filter|key chain must fuse into the join");
+        // No Linear may remain consuming the fused join.
+        for item in &p.root.items {
+            if let Item::Op(Node::Join { post, .. }) = item {
+                if !post.is_empty() {
+                    assert!(post.iter().any(|o| matches!(o, LinearOp::Filter(_))));
+                    assert!(post.iter().any(|o| matches!(o, LinearOp::Project(_))));
+                }
+            }
+        }
     }
 }

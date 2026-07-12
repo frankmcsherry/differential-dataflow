@@ -36,10 +36,22 @@ fn run_one(prog: &str) -> bool {
     let src = interactive::load_program(&path);
     let stmts = parse::pipe::parse(&src);
     let mut tree = lower::lower_tree(stmts);
+    let unopt = tree.clone();
     tree.optimize();
     let inputs = inputs_for(prog);
 
     let want = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vec::evaluate(&tree, &inputs)));
+    // Fusion oracle: the optimized tree (operator fusion included) must compute
+    // exactly what the un-optimized tree computes, on the reference backend.
+    if let Ok(w) = &want {
+        let base = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vec::evaluate(&unopt, &inputs)));
+        if let Ok(b) = base {
+            if &b != w {
+                println!("[FAIL] {prog} (optimize changed vec semantics)");
+                return false;
+            }
+        }
+    }
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| corgi::evaluate(&tree, &inputs)));
     match (want, got) {
         (Ok(w), Ok(g)) => {

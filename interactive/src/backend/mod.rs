@@ -47,7 +47,10 @@ pub trait Backend {
     fn linear<'s>(c: Collection<'s, Time, Self::Container>, ops: Vec<LinearOp>, level: usize) -> Collection<'s, Time, Self::Container>;
     fn arrange<'s>(c: Collection<'s, Time, Self::Container>) -> Self::Arr<'s>;
     fn as_collection<'s>(a: Self::Arr<'s>) -> Collection<'s, Time, Self::Container>;
-    fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection) -> Collection<'s, Time, Self::Container>;
+    /// `post` are the linear ops fused into this join by `fuse_post_join`
+    /// (Project/Filter only) — apply them inside the join's own emission, never
+    /// as a separate operator. `level` is the scope depth (as for `linear`).
+    fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection, post: &[LinearOp], level: usize) -> Collection<'s, Time, Self::Container>;
     fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer) -> Self::Arr<'s>;
     fn inspect<'s>(c: Collection<'s, Time, Self::Container>, label: String) -> Collection<'s, Time, Self::Container>;
     fn leave_dynamic<'s>(c: Collection<'s, Time, Self::Container>, depth: usize) -> Collection<'s, Time, Self::Container>;
@@ -136,10 +139,10 @@ pub fn render_tree<'s, B: Backend>(
                         Rendered::Collection(c)
                     },
                     st::Node::Arrange(r) => Rendered::Arrangement(resolve(&items, &imports, &var_cols, r).arrange()),
-                    st::Node::Join { left, right, projection } => {
+                    st::Node::Join { left, right, projection, post } => {
                         let l = resolve(&items, &imports, &var_cols, left).arrange();
                         let r = resolve(&items, &imports, &var_cols, right).arrange();
-                        Rendered::Collection(B::join(l, r, projection))
+                        Rendered::Collection(B::join(l, r, projection, post, depth))
                     },
                     st::Node::Reduce { input, reducer } => {
                         let a = resolve(&items, &imports, &var_cols, input).arrange();

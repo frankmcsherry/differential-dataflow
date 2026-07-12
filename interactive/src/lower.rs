@@ -153,7 +153,7 @@ impl ScopeLower {
             Expr::Join(l, r, p) => {
                 let lr = self.lower_expr(l); let la = self.push(st::Node::Arrange(lr));
                 let rr = self.lower_expr(r); let ra = self.push(st::Node::Arrange(rr));
-                self.push(st::Node::Join { left: la, right: ra, projection: p.clone() })
+                self.push(st::Node::Join { left: la, right: ra, projection: p.clone(), post: vec![] })
             },
             Expr::Reduce(e, red)=> {
                 let r = self.lower_expr(e); let a = self.push(st::Node::Arrange(r));

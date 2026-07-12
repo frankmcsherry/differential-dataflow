@@ -35,12 +35,16 @@ type CBatch<T> = Rc<ChunkBatch<CorgiChunk<T, Diff>>>;
 pub struct CorgiJoinTactic<T: ColTime> {
     key: Term,
     val: Term,
-    _t: std::marker::PhantomData<T>,
+    /// The fused `Join::post` ops as a container transform — applied to each output
+    /// container before it leaves the tactic (no separate operator). Built at the
+    /// concrete call site (`Backend::join`) from `apply_ops`, since the ops
+    /// machinery is concrete over `Time` while the tactic is generic.
+    post: Option<Box<dyn FnMut(CorgiContainer<T, Diff>) -> CorgiContainer<T, Diff>>>,
 }
 
 impl<T: ColTime> CorgiJoinTactic<T> {
-    pub fn new(key: Term, val: Term) -> Self {
-        CorgiJoinTactic { key, val, _t: std::marker::PhantomData }
+    pub fn new(key: Term, val: Term, post: Option<Box<dyn FnMut(CorgiContainer<T, Diff>) -> CorgiContainer<T, Diff>>>) -> Self {
+        CorgiJoinTactic { key, val, post }
     }
 }
 
@@ -52,7 +56,16 @@ where
     /// and fuel by draining the returned iterator; `meet` (compaction) is ignored (correctness-first,
     /// like the reference identity backend — output times are just less compact, never wrong).
     fn prep(&mut self, input0: Vec<CBatch<T>>, input1: Vec<CBatch<T>>, fresh: Fresh, _meet: T) -> Box<dyn Iterator<Item = CorgiContainer<T, Diff>>> {
-        Box::new(run_unit(input0, input1, fresh, &self.key, &self.val).into_iter())
+        let out = run_unit(input0, input1, fresh, &self.key, &self.val);
+        let out = match (&mut self.post, out) {
+            (Some(post), Some(c)) => {
+                let c = post(c);
+                // Fused Filters can empty a unit's output; emit nothing then.
+                if c.diffs.is_empty() { None } else { Some(c) }
+            }
+            (_, out) => out,
+        };
+        Box::new(out.into_iter())
     }
 }
 
