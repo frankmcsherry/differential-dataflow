@@ -6,6 +6,7 @@ pub mod corgi_backend;
 pub mod corgi_chunk;
 pub mod corgi_join;
 pub mod corgi_reduce_backend;
+pub mod lane_store;
 pub mod lower;
 pub mod scope_ir;
 pub mod backend;
