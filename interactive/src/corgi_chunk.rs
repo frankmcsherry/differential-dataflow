@@ -302,10 +302,11 @@ where
         // IN REF SPACE (flat lane compares, no owned `PointStamp` per row). Owned
         // materialization + antichain ops run once per distinct time only.
         let mut memo: Vec<(usize, bool)> = Vec::new();
+        let tc = times.comparer();
         for i in 0..chunk.len_() {
-            let keep_i = if i > 0 && times.cmp(i - 1, i) == std::cmp::Ordering::Equal {
+            let keep_i = if i > 0 && tc.cmp(i - 1, i) == std::cmp::Ordering::Equal {
                 !si.last().is_some_and(|&s| s == i - 1)
-            } else if let Some(&(_, k)) = memo.iter().find(|(r, _)| times.cmp(*r, i) == std::cmp::Ordering::Equal) {
+            } else if let Some(&(_, k)) = memo.iter().find(|(r, _)| tc.cmp(*r, i) == std::cmp::Ordering::Equal) {
                 k
             } else {
                 let ti = times.get(i);

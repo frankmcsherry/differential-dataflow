@@ -162,6 +162,27 @@ impl<T: Columnar> ColTimes<T> {
     }
 }
 
+/// A borrowed comparer over a [`ColTimes`]: holds the SoA view once so hot loops don't
+/// reconstruct the nested slice view (`store.borrow()`) on every compare.
+pub struct ColTimesCmp<'a, T: Columnar> {
+    b: <<T as Columnar>::Container as Borrow>::Borrowed<'a>,
+}
+
+impl<T: Columnar> ColTimes<T> {
+    /// A compare handle amortizing the borrow across many [`ColTimesCmp::cmp`] calls.
+    pub fn comparer(&self) -> ColTimesCmp<'_, T> {
+        ColTimesCmp { b: self.store.borrow() }
+    }
+}
+
+impl<'a, T: ColTime> ColTimesCmp<'a, T> {
+    /// Order rows `i` and `j` in ref space (no owned `T`, no per-call borrow).
+    #[inline]
+    pub fn cmp(&self, i: usize, j: usize) -> Ordering {
+        T::cmp_refs(self.b.get(i), self.b.get(j))
+    }
+}
+
 /// Build a column from an iterator of owned times (the `FromIterator` path used at construction).
 impl<T: Columnar> FromIterator<T> for ColTimes<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
