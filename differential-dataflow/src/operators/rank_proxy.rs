@@ -8,7 +8,6 @@
 //! descriptions, cross-retire pending) and inside the store. Diffs are concrete `i64` in this
 //! v1 (per the seam review); genericity can follow once parity is proven.
 
-use std::collections::BTreeMap;
 
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
@@ -72,14 +71,16 @@ pub struct RankReduceTactic<T, Bk, S> {
     backend: Bk,
     store: S,
     /// Pending interesting times beyond the upper frontier — OWNED (they cross retires; the
-    /// store is per-retire). Interned on entry each retire, materialized on exit.
-    pending: BTreeMap<u64, Vec<T>>,
+    /// store is per-retire). Interned on entry each retire, materialized on exit. Sorted by
+    /// key hash, keys unique — every producer and consumer walks keys in ascending order, so
+    /// a sorted vec replaces the former BTreeMap (whose inserts were ~4% of SCC profiles).
+    pending: Vec<(u64, Vec<T>)>,
 }
 
 impl<T, Bk, S: Default> RankReduceTactic<T, Bk, S> {
     /// A tactic deferring value semantics to `backend`, times to a fresh store.
     pub fn new(backend: Bk) -> Self {
-        RankReduceTactic { backend, store: S::default(), pending: BTreeMap::new() }
+        RankReduceTactic { backend, store: S::default(), pending: Vec::new() }
     }
 }
 
@@ -140,16 +141,34 @@ where
 
         let seeds = self.backend.seed_times(&instance, store);
         debug_assert!(seeds.windows(2).all(|w| w[0].0 <= w[1].0), "seed_times must be sorted by key_hash");
-        let mut changed: std::collections::BTreeSet<u64> = seeds.iter().map(|(k, _)| *k).collect();
-        changed.extend(self.pending.keys().copied());
+        // `changed` = union of seed keys and pending keys — both sorted, so a plain merge.
+        let mut changed: Vec<u64> = Vec::with_capacity(seeds.len().min(64) + self.pending.len());
+        {
+            let (mut a, mut b) = (0usize, 0usize);
+            while a < seeds.len() || b < self.pending.len() {
+                let k = match (seeds.get(a), self.pending.get(b)) {
+                    (Some(x), Some(y)) => x.0.min(y.0),
+                    (Some(x), None) => x.0,
+                    (None, Some(y)) => y.0,
+                    (None, None) => unreachable!(),
+                };
+                while a < seeds.len() && seeds[a].0 == k {
+                    a += 1;
+                }
+                if b < self.pending.len() && self.pending[b].0 == k {
+                    b += 1;
+                }
+                changed.push(k);
+            }
+        }
         if changed.is_empty() {
             self.pending.clear();
             return (Vec::new(), Antichain::new());
         }
-        let changed: Vec<u64> = changed.into_iter().collect();
 
         // Cross-retire pending: intern this retire's copy (store-sorted per key on exit).
-        let pending_ranks: BTreeMap<u64, Vec<Rank>> = self
+        // Sorted by key (inherits `pending`'s order); read by the monotone `ps` cursor below.
+        let pending_ranks: Vec<(u64, Vec<Rank>)> = self
             .pending
             .iter()
             .map(|(k, ts)| (*k, ts.iter().map(|t| store.intern(t.clone())).collect()))
@@ -161,10 +180,12 @@ where
         let held_ranks: Vec<Rank> = held_elems.iter().map(|t| store.intern(t.clone())).collect();
         self.backend.begin(&tile_descs);
 
-        let mut new_pending: BTreeMap<u64, Vec<Rank>> = BTreeMap::new();
+        // Keys are visited in ascending order across all windows, so pushes stay sorted.
+        let mut new_pending: Vec<(u64, Vec<Rank>)> = Vec::new();
 
         let mut cursor = 0usize;
         let mut ns = 0usize;
+        let mut ps = 0usize;
 
         let mut discover_scratch: RankDiscoverScratch<i64> = RankDiscoverScratch::new();
         let mut states: Vec<RankKeyState> = Vec::new();
@@ -219,7 +240,13 @@ where
                 moments_scratch.clear();
                 pended_scratch.clear();
                 {
-                    let pending = pending_ranks.get(&key).map(|p| &p[..]).unwrap_or(&[]);
+                    while ps < pending_ranks.len() && pending_ranks[ps].0 < key {
+                        ps += 1;
+                    }
+                    let pending: &[Rank] = match pending_ranks.get(ps) {
+                        Some((k, rs)) if *k == key => &rs[..],
+                        _ => &[],
+                    };
                     let seed_times = seeds[n0..n1].iter().map(|(_, t)| *t);
                     let out_times = (o0..o1).map(|o| p_out[o].1);
                     rank_discover_times(
@@ -234,7 +261,8 @@ where
                     );
                 }
                 if !pended_scratch.is_empty() {
-                    new_pending.insert(key, std::mem::take(&mut pended_scratch));
+                    debug_assert!(new_pending.last().is_none_or(|(k, _)| *k < key));
+                    new_pending.push((key, std::mem::take(&mut pended_scratch)));
                 }
                 if moments_scratch.is_empty() {
                     continue;
@@ -365,14 +393,14 @@ where
             }
         }
 
-        // Materialize cross-retire pending and the returned frontier.
+        // Materialize cross-retire pending and the returned frontier (stays key-sorted).
         self.pending = new_pending
             .into_iter()
             .map(|(k, rs)| (k, rs.into_iter().map(|r| store.time(r)).collect()))
             .collect();
         let produced: Vec<(B1::Time, B2)> = tile_held.into_iter().zip(self.backend.finish()).collect();
         let mut frontier = Antichain::new();
-        for times in self.pending.values() {
+        for (_, times) in self.pending.iter() {
             for t in times {
                 frontier.insert_ref(t);
             }
