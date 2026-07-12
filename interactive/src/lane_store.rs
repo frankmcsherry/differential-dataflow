@@ -42,8 +42,6 @@ pub struct LaneStore {
     data: Vec<u64>,
     /// Content hash of a row's lanes → candidate ranks (verified by lane equality).
     index: HashMap<u64, Vec<Rank>, BuildHasherDefault<U64Hasher>>,
-    join_memo: HashMap<u64, Rank, BuildHasherDefault<U64Hasher>>,
-    meet_memo: HashMap<u64, Rank, BuildHasherDefault<U64Hasher>>,
     /// Encode/compute scratch row.
     scratch: Vec<u64>,
 }
@@ -54,8 +52,6 @@ impl Default for LaneStore {
             k: 1,
             data: Vec::new(),
             index: HashMap::default(),
-            join_memo: HashMap::default(),
-            meet_memo: HashMap::default(),
             scratch: Vec::new(),
         }
     }
@@ -165,46 +161,70 @@ impl TimeStore for LaneStore {
     }
 
     fn join(&mut self, a: Rank, b: Rank) -> Rank {
-        let key = mix(((a.min(b) as u64) << 32) | a.max(b) as u64);
-        if let Some(&r) = self.join_memo.get(&key) {
-            return r;
+        // Dominance fast path: comparable ranks (the common case — times meet/join against
+        // frontier-adjacent times) resolve with one k-lane scan, no hashing at all. The former
+        // rank-pair memo paid a mix+probe per call to save only the intern probe — a wash on
+        // hits, pure overhead on misses (6.8% combined self in B2 profiles).
+        if a == b {
+            return a;
         }
-        self.scratch.clear();
-        {
-            let i = a as usize * self.k;
-            let j = b as usize * self.k;
-            for l in 0..self.k {
-                self.scratch.push(self.data[i + l].max(self.data[j + l]));
+        let i = a as usize * self.k;
+        let j = b as usize * self.k;
+        let (mut a_ge, mut b_ge) = (true, true);
+        for l in 0..self.k {
+            let (x, y) = (self.data[i + l], self.data[j + l]);
+            if x < y {
+                a_ge = false;
+            }
+            if y < x {
+                b_ge = false;
             }
         }
-        let r = self.intern_scratch();
-        self.join_memo.insert(key, r);
-        r
+        if a_ge {
+            return a;
+        }
+        if b_ge {
+            return b;
+        }
+        self.scratch.clear();
+        for l in 0..self.k {
+            self.scratch.push(self.data[i + l].max(self.data[j + l]));
+        }
+        self.intern_scratch()
     }
 
     fn meet(&mut self, a: Rank, b: Rank) -> Rank {
-        let key = mix(((a.min(b) as u64) << 32) | a.max(b) as u64);
-        if let Some(&r) = self.meet_memo.get(&key) {
-            return r;
+        if a == b {
+            return a;
         }
-        self.scratch.clear();
-        {
-            let i = a as usize * self.k;
-            let j = b as usize * self.k;
-            for l in 0..self.k {
-                self.scratch.push(self.data[i + l].min(self.data[j + l]));
+        let i = a as usize * self.k;
+        let j = b as usize * self.k;
+        let (mut a_ge, mut b_ge) = (true, true);
+        for l in 0..self.k {
+            let (x, y) = (self.data[i + l], self.data[j + l]);
+            if x < y {
+                a_ge = false;
+            }
+            if y < x {
+                b_ge = false;
             }
         }
-        let r = self.intern_scratch();
-        self.meet_memo.insert(key, r);
-        r
+        if a_ge {
+            return b;
+        }
+        if b_ge {
+            return a;
+        }
+        self.scratch.clear();
+        for l in 0..self.k {
+            self.scratch.push(self.data[i + l].min(self.data[j + l]));
+        }
+        self.intern_scratch()
     }
 
     fn clear(&mut self) {
         self.data.clear();
         self.index.clear();
-        self.join_memo.clear();
-        self.meet_memo.clear();
         // k is retained: the program's depth does not shrink between retires.
     }
 }
