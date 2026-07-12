@@ -63,12 +63,10 @@ where
     // which we call `lower`, by assumption that after sealing a batcher we receive no more
     // updates with times not greater or equal to `upper`.
     fn seal(&mut self, upper: Antichain<M::Time>) -> (Vec<Self::Output>, Description<M::Time>) {
-        // EXTRACT-FIRST: split each chain by `upper` WITHOUT draining the ladder. Only the
-        // shipped parts — delta-sized — need linear (merged, consolidated) form for the
-        // builder; the kept residue is re-laddered as-is and copied only at geometric
-        // doubling events, never once per seal. (The former merge-then-extract policy
-        // recopied the residue every seal: measured 35–38× drained-over-shipped on
-        // enter_at-band arrangements, whose delay bands park updates far beyond `upper`.)
+        // Split each chain by `upper` without draining the ladder: only the shipped parts
+        // need linear (merged, consolidated) form for the builder. Kept updates (e.g.
+        // delayed far beyond `upper`) stay in their chains, and are copied only when the
+        // ladder's geometric maintenance merges them.
         self.frontier.clear();
         let mut ship_chains: Vec<Vec<M::Chunk>> = Vec::new();
         let mut kept_chains: Vec<Vec<M::Chunk>> = Vec::new();
@@ -84,19 +82,17 @@ where
             }
         }
         // Re-ladder the residue through the standard insertion, largest first: each
-        // `insert_chain` cascades tail merges until the geometric invariant holds, and
-        // starting from an empty chain list the invariant is maintained inductively —
-        // a bulk push with a single tail check would not restore it.
+        // `insert_chain` cascades tail merges until the geometric invariant holds, so
+        // inserting into the (currently empty) chain list maintains it inductively.
         kept_chains.sort_by_key(|c| std::cmp::Reverse(c.iter().map(M::len).sum::<usize>()));
         for kept in kept_chains {
             self.insert_chain(kept);
         }
-        // Merge the shipped chains pairwise by LIKE SIZE (smallest pair first), not in
-        // queue order: the readied set is often large — pending updates eventually ship,
-        // and one frontier advance can release a whole residue — so an accumulator fold
-        // would recopy the largest chain once per remaining chain. These merges are also
-        // where cross-chain consolidation of shipped updates happens; equal (data, time)
-        // updates cannot straddle the ship/keep split (it is by time), so this suffices.
+        // Merge the shipped chains smallest pair first, so total copying stays near-linear
+        // in shipped rows even when the readied set is large (pending updates eventually
+        // ship, and one frontier advance can release a whole residue). These merges also
+        // provide cross-chain consolidation of shipped updates; equal (data, time) updates
+        // cannot straddle the ship/keep split (it is by time), so this suffices.
         let mut ship_chains: Vec<(usize, Vec<M::Chunk>)> = ship_chains
             .into_iter()
             .map(|c| (c.iter().map(M::len).sum::<usize>(), c))
