@@ -10,6 +10,7 @@ pub use self::threshold::ThresholdTotal;
 
 pub mod arrange;
 pub mod recipes;
+pub mod rank_proxy;
 pub mod int_proxy;
 pub mod reduce;
 pub mod iterate;

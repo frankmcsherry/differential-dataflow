@@ -605,3 +605,121 @@ where
         }).collect()
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// The RANK binding: the same backend machinery behind the rank-proxy seam. Times never
+// materialize on the input path — the memoized presentations' interned tables map into the
+// store (table-sized work), and merge_presentations' u32 "granks" simply ARE store ranks
+// (intern order suffices: the tactic re-sorts through the store wherever order matters, and
+// netting needs only equality adjacency). Output times materialize once per emitted record.
+// ---------------------------------------------------------------------------------------------
+
+use differential_dataflow::operators::rank_proxy::{RankReduceBackend, RankWindow};
+use differential_dataflow::operators::recipes::{Rank, TimeStore};
+use crate::lane_store::LaneStore;
+
+type LTime = timely::order::Product<u64, differential_dataflow::dynamic::pointstamp::PointStamp<u64>>;
+
+impl RankReduceBackend<CBatch<LTime>, CBatch<LTime>> for CorgiReduceBackend<LTime> {
+    type Store = LaneStore;
+
+    fn seed_times(&mut self, instance: &ReduceInstance<'_, CBatch<LTime>, CBatch<LTime>>, store: &mut LaneStore) -> Vec<(u64, Rank)> {
+        let mut out: Vec<(u64, Rank)> = Vec::new();
+        for ch in chunks_of(instance.input_batches) {
+            let p = ch.presentation_or_init(|| build_presentation(ch));
+            let map: Vec<Rank> = p.times.iter().map(|t| store.intern(t.clone())).collect();
+            for i in 0..p.khs.len() {
+                out.push((p.khs[i], map[p.tranks[i] as usize]));
+            }
+        }
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    fn begin(&mut self, tiles: &[Description<LTime>]) {
+        <Self as ProxyReduceBackend<CBatch<LTime>, CBatch<LTime>>>::begin(self, tiles)
+    }
+
+    fn next_window(
+        &mut self,
+        instance: &ReduceInstance<'_, CBatch<LTime>, CBatch<LTime>>,
+        changed: &[u64],
+        cursor: &mut usize,
+        store: &mut LaneStore,
+    ) -> Option<RankWindow> {
+        if *cursor >= changed.len() {
+            return None;
+        }
+        let keys: Vec<u64> = changed[*cursor..].to_vec();
+        *cursor = changed.len();
+
+        let mut in_chunks = chunks_of(instance.input_batches);
+        in_chunks.extend(chunks_of(instance.source_batches));
+        let out_chunks = chunks_of(instance.output_batches);
+        let in_pres: Vec<&Presentation<LTime>> = in_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+        let out_pres: Vec<&Presentation<LTime>> = out_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+
+        // Per-chunk local rank -> STORE rank (table-sized; the store subsumes the window table).
+        let in_maps: Vec<Vec<u32>> = in_pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
+        let out_maps: Vec<Vec<u32>> = out_pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
+
+        let in_diffs: Vec<&[Diff]> = in_chunks.iter().map(|c| c.diffs()).collect();
+        let m_in = merge_presentations(&in_pres, &in_maps, &in_diffs, &keys);
+        self.in_index = IdMap::default();
+        let input = if m_in.khs.is_empty() {
+            self.in_vals = CValue::Unit(0);
+            Vec::new()
+        } else {
+            let key_srcs: Vec<Option<&CValue>> = in_chunks.iter().map(|c| Some(c.keys())).collect();
+            let val_srcs: Vec<Option<&CValue>> = in_chunks.iter().map(|c| Some(c.vals())).collect();
+            let in_keys = gather_lanes(&key_srcs, &m_in.tags, &m_in.offs);
+            let in_vals = gather_lanes(&val_srcs, &m_in.tags, &m_in.offs);
+            for (r, &vid) in m_in.vids.iter().enumerate() {
+                self.in_index.entry(vid).or_insert(r);
+            }
+            self.in_vals = in_vals;
+            self.register_keys(in_keys, &m_in.khs);
+            m_in.records
+        };
+
+        let o_diffs: Vec<&[Diff]> = out_chunks.iter().map(|c| c.diffs()).collect();
+        let m_out = merge_presentations(&out_pres, &out_maps, &o_diffs, &keys);
+        let output = if m_out.khs.is_empty() {
+            Vec::new()
+        } else {
+            let key_srcs: Vec<Option<&CValue>> = out_chunks.iter().map(|c| Some(c.keys())).collect();
+            let val_srcs: Vec<Option<&CValue>> = out_chunks.iter().map(|c| Some(c.vals())).collect();
+            let o_keys = gather_lanes(&key_srcs, &m_out.tags, &m_out.offs);
+            let o_vals = gather_lanes(&val_srcs, &m_out.tags, &m_out.offs);
+            self.register_keys(o_keys, &m_out.khs);
+            self.register_vals(o_vals, &m_out.vids);
+            m_out.records
+        };
+
+        Some(RankWindow { keys, input, output })
+    }
+
+    fn reduce_corrections(
+        &mut self,
+        keys: &[u64],
+        in_ends: &[usize],
+        input: &[(u64, i64)],
+        out_ends: &[usize],
+        output: &[(u64, i64)],
+    ) -> (Vec<(u64, i64)>, Vec<usize>) {
+        <Self as ProxyReduceBackend<CBatch<LTime>, CBatch<LTime>>>::reduce_corrections(self, keys, in_ends, input, out_ends, output)
+    }
+
+    fn emit(&mut self, tile: usize, records: &[((u64, u64), Rank, i64)], store: &LaneStore) {
+        // v1: materialize owned times once per emitted record (output-sized; a lane-native
+        // ColTimes egress is the follow-on).
+        let owned: Vec<((u64, u64), LTime, Diff)> =
+            records.iter().map(|&((k, v), r, d)| ((k, v), store.time(r), d)).collect();
+        <Self as ProxyReduceBackend<CBatch<LTime>, CBatch<LTime>>>::emit(self, tile, &owned)
+    }
+
+    fn finish(&mut self) -> Vec<CBatch<LTime>> {
+        <Self as ProxyReduceBackend<CBatch<LTime>, CBatch<LTime>>>::finish(self)
+    }
+}
