@@ -548,3 +548,508 @@ mod store_tests {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// RANK-SPACE twins of the replay/discovery helpers: same control flow, times as store ranks.
+// Rank equality is time equality (the store interns), so `==`/`dedup` work directly; anything
+// deriving REPLAY ORDER or answering order questions goes through the store (`cmp_ranks`/`le`/
+// `join`/`meet`). Netting-only sorts may use the raw u32 order (equal ranks are adjacent under
+// any equality-respecting order).
+// ---------------------------------------------------------------------------------------------
+
+/// [`EditList`](crate::operators::EditList) over ranks: per-value `(rank, diff)` edit runs.
+pub struct RankEditList<V, D> {
+    values: Vec<(V, usize)>,
+    edits: Vec<(Rank, D)>,
+}
+
+impl<V: Copy, D: Semigroup> RankEditList<V, D> {
+    fn new() -> Self {
+        RankEditList { values: Vec::new(), edits: Vec::new() }
+    }
+    fn clear(&mut self) {
+        self.values.clear();
+        self.edits.clear();
+    }
+    fn push(&mut self, time: Rank, diff: D) {
+        self.edits.push((time, diff));
+    }
+    fn seal(&mut self, value: V) {
+        let prev = self.values.last().map(|x| x.1).unwrap_or(0);
+        // Netting-only: u32 order groups equal ranks; replay order is imposed by `build`.
+        crate::consolidation::consolidate_from(&mut self.edits, prev);
+        if self.edits.len() > prev {
+            self.values.push((value, self.edits.len()));
+        }
+    }
+}
+
+/// [`ValueHistory`] over ranks; every order-bearing step takes the store.
+pub struct RankValueHistory<V, D> {
+    edits: RankEditList<V, D>,
+    history: Vec<(Rank, Rank, usize, usize)>, // (time, meet, value_index, edit_offset)
+    buffer: Vec<((V, Rank), D)>,
+}
+
+impl<V: Copy + Ord, D: Semigroup + Clone> RankValueHistory<V, D> {
+    /// An empty history, to be `load_iter`ed.
+    pub fn new() -> Self {
+        RankValueHistory { edits: RankEditList::new(), history: Vec::new(), buffer: Vec::new() }
+    }
+
+    /// Load `(value, rank, diff)` edits (grouped by consecutive value), advancing each rank by
+    /// `advance_by` if supplied, then organize the replay (store-ordered, suffix meets).
+    pub fn load_iter<S: TimeStore>(
+        &mut self,
+        edits: impl Iterator<Item = (V, Rank, D)>,
+        advance_by: Option<Rank>,
+        store: &mut S,
+    ) {
+        self.edits.clear();
+        let mut cur: Option<V> = None;
+        for (v, mut time, diff) in edits {
+            if cur != Some(v) {
+                if let Some(pv) = cur {
+                    self.edits.seal(pv);
+                }
+                cur = Some(v);
+            }
+            if let Some(m) = advance_by {
+                time = store.join(time, m);
+            }
+            self.edits.push(time, diff);
+        }
+        if let Some(pv) = cur {
+            self.edits.seal(pv);
+        }
+        self.build(store);
+    }
+
+    fn build<S: TimeStore>(&mut self, store: &mut S) {
+        self.buffer.clear();
+        self.history.clear();
+        for value_index in 0..self.edits.values.len() {
+            let lower = if value_index > 0 { self.edits.values[value_index - 1].1 } else { 0 };
+            let upper = self.edits.values[value_index].1;
+            for edit_index in lower..upper {
+                let time = self.edits.edits[edit_index].0;
+                self.history.push((time, time, value_index, edit_index));
+            }
+        }
+        // Descending by (time via store, then indices) so popping replays ascending — the
+        // owned twin's tuple sort with the store as the time comparator.
+        self.history.sort_by(|x, y| {
+            store
+                .cmp_ranks(y.0, x.0)
+                .then_with(|| (y.2, y.3).cmp(&(x.2, x.3)))
+        });
+        // The owned twin folds FORWARD over the descending list (each element meets the
+        // previous element's accumulated meet):
+        for i in 1..self.history.len() {
+            let prev_meet = self.history[i - 1].1;
+            self.history[i].1 = store.meet(self.history[i].1, prev_meet);
+        }
+    }
+
+    /// The next (least) un-replayed rank.
+    pub fn time(&self) -> Option<Rank> {
+        self.history.last().map(|x| x.0)
+    }
+    /// The meet of all un-replayed ranks.
+    pub fn meet(&self) -> Option<Rank> {
+        self.history.last().map(|x| x.1)
+    }
+    /// The next un-replayed edit, as `(value, rank, diff)`.
+    pub fn edit(&self) -> Option<(V, Rank, &D)> {
+        self.history.last().map(|&(t, _, v, e)| (self.edits.values[v].0, t, &self.edits.edits[e].1))
+    }
+    /// The buffered (stepped-in, advanced, consolidated) edits.
+    pub fn buffer(&self) -> &[((V, Rank), D)] {
+        &self.buffer[..]
+    }
+    /// Move the next edit into the buffer.
+    pub fn step(&mut self) {
+        let (time, _, value_index, edit_offset) = self.history.pop().unwrap();
+        self.buffer.push(((self.edits.values[value_index].0, time), self.edits.edits[edit_offset].1.clone()));
+    }
+    /// Step edits while the next rank equals `time`; true iff any did.
+    pub fn step_while_time_is(&mut self, time: Rank) -> bool {
+        let mut found = false;
+        while self.time() == Some(time) {
+            found = true;
+            self.step();
+        }
+        found
+    }
+    /// Step edits while the next rank is `<=` (total, via the store) the given rank.
+    pub fn step_through<S: TimeStore>(&mut self, time: Rank, store: &S) {
+        while self.time().is_some_and(|t| store.cmp_ranks(t, time) != Ordering::Greater) {
+            self.step();
+        }
+    }
+    /// Advance buffered ranks by `meet` and consolidate.
+    pub fn advance_buffer_by<S: TimeStore>(&mut self, meet: Rank, store: &mut S) {
+        for element in self.buffer.iter_mut() {
+            (element.0).1 = store.join((element.0).1, meet);
+        }
+        crate::consolidation::consolidate(&mut self.buffer);
+    }
+    /// True when every edit has been replayed.
+    pub fn is_done(&self) -> bool {
+        self.history.is_empty()
+    }
+}
+
+/// [`TimeHistory`] over ranks.
+pub struct RankTimeHistory {
+    history: Vec<(Rank, Rank)>,
+    buffer: Vec<Rank>,
+}
+
+impl RankTimeHistory {
+    /// An empty history, to be `load`ed.
+    pub fn new() -> Self {
+        RankTimeHistory { history: Vec::new(), buffer: Vec::new() }
+    }
+    /// Load ranks, advancing by `advance_by` if supplied, and organize the replay.
+    pub fn load<S: TimeStore>(&mut self, times: impl Iterator<Item = Rank>, advance_by: Option<Rank>, store: &mut S) {
+        self.history.clear();
+        self.buffer.clear();
+        for mut time in times {
+            if let Some(m) = advance_by {
+                time = store.join(time, m);
+            }
+            self.history.push((time, time));
+        }
+        self.history.sort_by(|x, y| store.cmp_ranks(y.0, x.0));
+        for i in 1..self.history.len() {
+            let prev_meet = self.history[i - 1].1;
+            self.history[i].1 = store.meet(self.history[i].1, prev_meet);
+        }
+    }
+    /// The next (least) un-replayed rank.
+    pub fn time(&self) -> Option<Rank> {
+        self.history.last().map(|x| x.0)
+    }
+    /// The meet of all un-replayed ranks.
+    pub fn meet(&self) -> Option<Rank> {
+        self.history.last().map(|x| x.1)
+    }
+    /// Step ranks while the next equals `time`; true iff any did.
+    pub fn step_while_time_is(&mut self, time: Rank) -> bool {
+        let mut found = false;
+        while self.time() == Some(time) {
+            found = true;
+            let (t, _) = self.history.pop().unwrap();
+            self.buffer.push(t);
+        }
+        found
+    }
+    /// Advance buffered ranks by `meet` and deduplicate.
+    pub fn advance_buffer_by<S: TimeStore>(&mut self, meet: Rank, store: &mut S) {
+        for time in self.buffer.iter_mut() {
+            *time = store.join(*time, meet);
+        }
+        self.buffer.sort_unstable();
+        self.buffer.dedup();
+    }
+    /// The buffered (stepped-in, advanced) ranks.
+    pub fn buffer(&self) -> &[Rank] {
+        &self.buffer
+    }
+}
+
+/// One key's view for [`rank_discover_times`]: the `((key_hash, value_id), rank, diff)` run
+/// slice plus the carried pending ranks (SORTED by the store's time order).
+pub struct RankKeyView<'a, RIn> {
+    /// The presented run this key's records live in.
+    pub p_in: &'a [((u64, u64), Rank, RIn)],
+    /// The key's first record.
+    pub i0: usize,
+    /// One past the key's last record.
+    pub i1: usize,
+    /// Interesting ranks pended by earlier retires, time-ordered.
+    pub pending: &'a [Rank],
+}
+
+/// Reusable scratch for [`rank_discover_times`].
+pub struct RankDiscoverScratch<RIn> {
+    batch_replay: RankTimeHistory,
+    input_replay: RankValueHistory<u64, RIn>,
+    output_replay: RankTimeHistory,
+    synth: Vec<Rank>,
+    times_current: Vec<Rank>,
+    temporary: Vec<Rank>,
+    meets: Vec<Rank>,
+}
+
+impl<RIn: Semigroup + Clone> RankDiscoverScratch<RIn> {
+    /// Fresh scratch; hold one per retire.
+    pub fn new() -> Self {
+        RankDiscoverScratch {
+            batch_replay: RankTimeHistory::new(),
+            input_replay: RankValueHistory::new(),
+            output_replay: RankTimeHistory::new(),
+            synth: Vec::new(),
+            times_current: Vec::new(),
+            temporary: Vec::new(),
+            meets: Vec::new(),
+        }
+    }
+}
+
+impl<RIn: Semigroup + Clone> Default for RankDiscoverScratch<RIn> {
+    fn default() -> Self { Self::new() }
+}
+
+/// `any frontier element <= t`, in rank space.
+pub fn frontier_le<S: TimeStore>(frontier: &[Rank], t: Rank, store: &S) -> bool {
+    frontier.iter().any(|&u| store.le(u, t))
+}
+
+/// [`discover_times`] in rank space: identical control flow, the store answering every order
+/// and lattice question. `upper` is the retire's upper frontier, pre-interned. The same
+/// protocol contract applies: `seed_times` must be the NOVEL batch's own support.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_discover_times<RIn, S: TimeStore>(
+    key: RankKeyView<'_, RIn>,
+    seed_times: impl Iterator<Item = Rank>,
+    out_times: impl Iterator<Item = Rank>,
+    upper: &[Rank],
+    scratch: &mut RankDiscoverScratch<RIn>,
+    moments: &mut Vec<Rank>,
+    pended: &mut Vec<Rank>,
+    store: &mut S,
+) where
+    RIn: Semigroup + Clone,
+{
+    let RankDiscoverScratch { batch_replay, input_replay, output_replay, synth, times_current, temporary, meets } = scratch;
+    synth.clear();
+    times_current.clear();
+    temporary.clear();
+
+    batch_replay.load(seed_times, None, store);
+
+    meets.clear();
+    meets.extend_from_slice(key.pending);
+    for i in (1..meets.len()).rev() {
+        let m = meets[i];
+        meets[i - 1] = store.meet(meets[i - 1], m);
+    }
+
+    let mut meet: Option<Rank> = None;
+    let mut update_meet = |meet: &mut Option<Rank>, other: Option<Rank>, store: &mut S| {
+        if let Some(time) = other {
+            *meet = Some(match *meet {
+                Some(m) => store.meet(m, time),
+                None => time,
+            });
+        }
+    };
+    update_meet(&mut meet, meets.first().copied(), store);
+    update_meet(&mut meet, batch_replay.meet(), store);
+
+    input_replay.load_iter(
+        (key.i0..key.i1).map(|i| (key.p_in[i].0.1, key.p_in[i].1, key.p_in[i].2.clone())),
+        meet,
+        store,
+    );
+    output_replay.load(out_times, meet, store);
+
+    let mut times_slice = key.pending;
+    let mut meets_slice = &meets[..];
+
+    loop {
+        // The least head across the five sources, by the store's order.
+        let mut next: Option<Rank> = None;
+        for cand in [batch_replay.time(), times_slice.first().copied(), input_replay.time(), output_replay.time(), synth.last().copied()] {
+            if let Some(c) = cand {
+                next = Some(match next {
+                    None => c,
+                    Some(n) if store.cmp_ranks(c, n) == Ordering::Less => c,
+                    Some(n) => n,
+                });
+            }
+        }
+        let Some(next_time) = next else { break };
+
+        input_replay.step_while_time_is(next_time);
+        output_replay.step_while_time_is(next_time);
+        let mut interesting = batch_replay.step_while_time_is(next_time);
+        if interesting {
+            if let Some(m) = meet {
+                batch_replay.advance_buffer_by(m, store);
+            }
+        }
+        while synth.last() == Some(&next_time) {
+            times_current.push(synth.pop().expect("nonempty"));
+            interesting = true;
+        }
+        while times_slice.first() == Some(&next_time) {
+            times_current.push(times_slice[0]);
+            times_slice = &times_slice[1..];
+            meets_slice = &meets_slice[1..];
+            interesting = true;
+        }
+        interesting = interesting || batch_replay.buffer().iter().any(|&t| store.le(t, next_time));
+        interesting = interesting || times_current.iter().any(|&t| store.le(t, next_time));
+
+        if !frontier_le(upper, next_time, store) {
+            if interesting {
+                if let Some(m) = meet {
+                    input_replay.advance_buffer_by(m, store);
+                }
+                let buffered: Vec<Rank> = input_replay.buffer().iter().map(|((_, t), _)| *t).collect();
+                for t in buffered {
+                    if !store.le(t, next_time) {
+                        temporary.push(store.join(next_time, t));
+                    }
+                }
+                if let Some(m) = meet {
+                    output_replay.advance_buffer_by(m, store);
+                }
+                let buffered: Vec<Rank> = output_replay.buffer().to_vec();
+                for t in buffered {
+                    if !store.le(t, next_time) {
+                        temporary.push(store.join(next_time, t));
+                    }
+                }
+                moments.push(next_time);
+            }
+            {
+                let buffered: Vec<Rank> = batch_replay.buffer().to_vec();
+                for t in buffered {
+                    if !store.le(t, next_time) {
+                        temporary.push(store.join(t, next_time));
+                    }
+                }
+            }
+            {
+                let current: Vec<Rank> = times_current.clone();
+                for t in current {
+                    if !store.le(t, next_time) {
+                        temporary.push(store.join(t, next_time));
+                    }
+                }
+            }
+            temporary.sort_unstable();
+            temporary.dedup();
+            let synth_len = synth.len();
+            for time in temporary.drain(..) {
+                if frontier_le(upper, time, store) {
+                    pended.push(time);
+                } else {
+                    synth.push(time);
+                }
+            }
+            if synth.len() > synth_len {
+                synth.sort_by(|&x, &y| store.cmp_ranks(y, x));
+                synth.dedup();
+            }
+        } else if interesting {
+            pended.push(next_time);
+        }
+
+        meet = None;
+        update_meet(&mut meet, batch_replay.meet(), store);
+        update_meet(&mut meet, input_replay.meet(), store);
+        update_meet(&mut meet, output_replay.meet(), store);
+        for i in 0..synth.len() {
+            let t = synth[i];
+            update_meet(&mut meet, Some(t), store);
+        }
+        update_meet(&mut meet, meets_slice.first().copied(), store);
+        if let Some(m) = meet {
+            for t in times_current.iter_mut() {
+                *t = store.join(*t, m);
+            }
+        }
+        times_current.sort_unstable();
+        times_current.dedup();
+    }
+    pended.sort_by(|&x, &y| store.cmp_ranks(x, y));
+    pended.dedup();
+}
+
+
+#[cfg(test)]
+mod rank_twin_tests {
+    use super::*;
+    use crate::dynamic::pointstamp::PointStamp;
+    use timely::order::Product;
+    use timely::progress::Antichain;
+
+    type T = Product<u64, PointStamp<u64>>;
+
+    fn xs(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
+
+    fn random_time(s: &mut u64) -> T {
+        let depth = (xs(s) % 3) as usize;
+        let coords: smallvec::SmallVec<[u64; 1]> = (0..depth).map(|_| xs(s) % 3).collect();
+        Product::new(xs(s) % 2, PointStamp::new(coords))
+    }
+
+    /// The rank twin of `discover_times` (through the OwnedStore) produces exactly the owned
+    /// original's moments and pended times, on randomized keys: novel seeds, history runs
+    /// (grouped by value id), output times, pending, and an upper frontier.
+    #[test]
+    fn rank_discover_matches_owned() {
+        for seed in 1u64..40 {
+            let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+
+            // Random key data.
+            let seeds_t: Vec<T> = (0..(xs(&mut s) % 6)).map(|_| random_time(&mut s)).collect();
+            let outs_t: Vec<T> = (0..(xs(&mut s) % 4)).map(|_| random_time(&mut s)).collect();
+            let mut pending_t: Vec<T> = (0..(xs(&mut s) % 4)).map(|_| random_time(&mut s)).collect();
+            pending_t.sort();
+            pending_t.dedup();
+            let mut run_t: Vec<((u64, u64), T, i64)> = (0..(xs(&mut s) % 8))
+                .map(|_| ((7, xs(&mut s) % 3), random_time(&mut s), (xs(&mut s) % 5) as i64 - 2))
+                .collect();
+            run_t.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            run_t.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+            let upper_t = Antichain::from_elem(random_time(&mut s));
+
+            // Owned original.
+            let mut scratch = DiscoverScratch::<T, i64>::new();
+            let (mut moments_o, mut pended_o) = (Vec::new(), Vec::new());
+            discover_times(
+                KeyView { p_in: &run_t[..], i0: 0, i1: run_t.len(), pending: &pending_t },
+                seeds_t.iter().cloned(),
+                outs_t.iter().cloned(),
+                &upper_t,
+                &mut scratch,
+                &mut moments_o,
+                &mut pended_o,
+            );
+
+            // Rank twin through the oracle store.
+            let mut store: OwnedStore<T> = Default::default();
+            let run_r: Vec<((u64, u64), Rank, i64)> =
+                run_t.iter().map(|(kv, t, d)| (*kv, store.intern(t.clone()), *d)).collect();
+            let pending_r: Vec<Rank> = pending_t.iter().map(|t| store.intern(t.clone())).collect();
+            let seeds_r: Vec<Rank> = seeds_t.iter().map(|t| store.intern(t.clone())).collect();
+            let outs_r: Vec<Rank> = outs_t.iter().map(|t| store.intern(t.clone())).collect();
+            let upper_r: Vec<Rank> = upper_t.elements().iter().map(|t| store.intern(t.clone())).collect();
+
+            let mut rscratch = RankDiscoverScratch::<i64>::new();
+            let (mut moments_r, mut pended_r) = (Vec::new(), Vec::new());
+            rank_discover_times(
+                RankKeyView { p_in: &run_r[..], i0: 0, i1: run_r.len(), pending: &pending_r },
+                seeds_r.iter().copied(),
+                outs_r.iter().copied(),
+                &upper_r,
+                &mut rscratch,
+                &mut moments_r,
+                &mut pended_r,
+                &mut store,
+            );
+
+            let moments_rt: Vec<T> = moments_r.iter().map(|&r| store.time(r)).collect();
+            let pended_rt: Vec<T> = pended_r.iter().map(|&r| store.time(r)).collect();
+            assert_eq!(moments_rt, moments_o, "moments (seed {seed})");
+            assert_eq!(pended_rt, pended_o, "pended (seed {seed})");
+        }
+    }
+}
