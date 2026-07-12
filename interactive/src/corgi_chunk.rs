@@ -297,9 +297,24 @@ where
         let kv = chunk.kv();
         let (times, diffs) = (chunk.times(), chunk.diffs());
         let (mut ki, mut si) = (Vec::new(), Vec::new());
+        // Distinct times per chunk are few; rows are many. Memoize the frontier verdict per
+        // distinct time as (representative row, keep) and compare rows against representatives
+        // IN REF SPACE (flat lane compares, no owned `PointStamp` per row). Owned
+        // materialization + antichain ops run once per distinct time only.
+        let mut memo: Vec<(usize, bool)> = Vec::new();
         for i in 0..chunk.len_() {
-            let ti = times.get(i);
-            if frontier.less_equal(&ti) { residual.insert_ref(&ti); ki.push(i); } else { si.push(i); }
+            let keep_i = if i > 0 && times.cmp(i - 1, i) == std::cmp::Ordering::Equal {
+                !si.last().is_some_and(|&s| s == i - 1)
+            } else if let Some(&(_, k)) = memo.iter().find(|(r, _)| times.cmp(*r, i) == std::cmp::Ordering::Equal) {
+                k
+            } else {
+                let ti = times.get(i);
+                let k = frontier.less_equal(&ti);
+                if k { residual.insert_ref(&ti); }
+                memo.push((i, k));
+                k
+            };
+            if keep_i { ki.push(i); } else { si.push(i); }
         }
         if !ki.is_empty() {
             let mut t = ColTimes::new();
