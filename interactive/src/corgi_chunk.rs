@@ -426,9 +426,9 @@ where
 /// Multi-record: one columnar `sort_perm` (discrimination sort) orders by `(key, val)`, one batched
 /// `compare_idx` flags adjacent-equal runs; only the small per-run *time* tiebreak is a Rust sort
 /// (time is not a corgi type). No per-pair `compare_at`.
-fn sort_consolidate<T, R>(keys: CValue, vals: CValue, times: Vec<T>, diffs: Vec<R>) -> (CValue, CValue, Vec<T>, Vec<R>)
+fn sort_consolidate<T, R>(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> (CValue, CValue, ColTimes<T>, Vec<R>)
 where
-    T: Ord + Clone + Columnar,
+    T: ColTime,
     R: Semigroup + Clone,
 {
     let n = times.len();
@@ -439,7 +439,7 @@ where
     // Batched argsort by (key, val); reorder the parallel Rust columns by the same permutation.
     let perm = sort_perm(&kv);
     let kv_s = gather(&kv, &perm);
-    let times_s: Vec<T> = perm.iter().map(|&i| times[i].clone()).collect();
+    let times_s = times.gather(&perm);
     let diffs_s: Vec<R> = perm.iter().map(|&i| diffs[i].clone()).collect();
     // Batched adjacent-equality over the kv-sorted column: `adj[m] == 0` iff `kv_s[m] == kv_s[m+1]`.
     let adj: Vec<i8> = if n > 1 {
@@ -451,7 +451,9 @@ where
     };
 
     // Walk maximal equal-`(key,val)` runs; within each, order by time and consolidate equal times.
-    let (mut keep, mut ot, mut od) = (Vec::new(), Vec::new(), Vec::new());
+    // Times compare and copy as SoA refs throughout — no owned `T` is ever materialized here.
+    let (mut keep, mut od) = (Vec::new(), Vec::new());
+    let mut ot: ColTimes<T> = ColTimes::new();
     let mut i = 0;
     while i < n {
         let mut j = i + 1;
@@ -459,20 +461,19 @@ where
             j += 1;
         }
         let mut run: Vec<usize> = (i..j).collect();
-        run.sort_by(|&a, &b| times_s[a].cmp(&times_s[b]));
+        run.sort_by(|&a, &b| times_s.cmp(a, b));
         let mut k = 0;
         while k < run.len() {
             let rep = run[k];
-            let t = times_s[rep].clone();
             let mut d = diffs_s[rep].clone();
             k += 1;
-            while k < run.len() && times_s[run[k]] == t {
+            while k < run.len() && times_s.cmp(run[k], rep) == std::cmp::Ordering::Equal {
                 d.plus_equals(&diffs_s[run[k]]);
                 k += 1;
             }
             if !d.is_zero() {
                 keep.push(rep);
-                ot.push(t);
+                ot.push_ref(&times_s, rep);
                 od.push(d);
             }
         }
@@ -489,9 +490,9 @@ where
 {
     /// One sorted+consolidated chunk from columns already in corgi form (the column-native arrange
     /// ingest — no transcode).
-    pub fn from_columns(keys: CValue, vals: CValue, times: Vec<T>, diffs: Vec<R>) -> Self {
+    pub fn from_columns(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> Self {
         let (keys, vals, times, diffs) = sort_consolidate(keys, vals, times, diffs);
-        Self::from_parts(keys, vals, ColTimes::from_iter(times), diffs)
+        Self::from_parts(keys, vals, times, diffs)
     }
 
 }
@@ -499,17 +500,17 @@ where
 /// Concatenate chunks' columns into flat `(keys, vals, times, diffs)` with **no transcode** — for
 /// reading an arrangement back column-natively (e.g. `Backend::as_collection` straight into a
 /// `CorgiContainer`), instead of untranscoding to rows and re-transcoding.
-pub fn chunks_to_columns<T, R>(chunks: &[CorgiChunk<T, R>]) -> (CValue, CValue, Vec<T>, Vec<R>)
+pub fn chunks_to_columns<T, R>(chunks: &[CorgiChunk<T, R>]) -> (CValue, CValue, ColTimes<T>, Vec<R>)
 where
     T: ColTime,
     R: Semigroup + Clone + 'static,
 {
     if chunks.iter().all(|c| c.len_() == 0) {
-        return (CValue::Unit(0), CValue::Unit(0), Vec::new(), Vec::new());
+        return (CValue::Unit(0), CValue::Unit(0), ColTimes::new(), Vec::new());
     }
     let (kv, times, diffs) = CorgiChunk::concat(chunks);
     let (keys, vals) = split_kv(kv);
-    (keys, vals, times.to_vec(), diffs)
+    (keys, vals, times, diffs)
 }
 
 /// Build a `ChunkBatch<CorgiChunk>` from corgi key/val COLUMNS directly (no transcode): sort +
@@ -520,7 +521,7 @@ where
     T: ColTime,
     R: Semigroup + Clone + 'static,
 {
-    let chunk = CorgiChunk::from_columns(keys, vals, times, diffs);
+    let chunk = CorgiChunk::from_columns(keys, vals, ColTimes::from_iter(times), diffs);
     settle_one(chunk, description)
 }
 
@@ -549,7 +550,7 @@ pub struct CorgiChunker<T: Columnar, R> {
     /// Un-consolidated key/val column blocks (one per absorbed container), flat time/diff.
     k_blocks: Vec<CValue>,
     v_blocks: Vec<CValue>,
-    times: Vec<T>,
+    times: ColTimes<T>,
     diffs: Vec<R>,
     ready: VecDeque<CorgiChunk<T, R>>,
     current: Option<CorgiChunk<T, R>>,
@@ -557,7 +558,7 @@ pub struct CorgiChunker<T: Columnar, R> {
 
 impl<T: Columnar, R> Default for CorgiChunker<T, R> {
     fn default() -> Self {
-        CorgiChunker { k_blocks: Vec::new(), v_blocks: Vec::new(), times: Vec::new(), diffs: Vec::new(), ready: VecDeque::new(), current: None }
+        CorgiChunker { k_blocks: Vec::new(), v_blocks: Vec::new(), times: ColTimes::new(), diffs: Vec::new(), ready: VecDeque::new(), current: None }
     }
 }
 
@@ -608,7 +609,9 @@ where
         }
         self.k_blocks.push(std::mem::replace(&mut c.keys, CValue::Unit(0)));
         self.v_blocks.push(std::mem::replace(&mut c.vals, CValue::Unit(0)));
-        self.times.append(&mut c.times);
+        // Flat time append: push the container's SoA refs straight across, then release its buffers.
+        self.times.push_range(&c.times, 0, c.times.len());
+        c.times.clear();
         self.diffs.append(&mut c.diffs);
         if self.times.len() >= TARGET {
             self.flush();
@@ -637,10 +640,10 @@ where
 /// A single sorted+consolidated run over corgi columns — the join tactic's per-side input, produced
 /// by merging a batch list [`flatten_batches`]. Separate `keys`/`vals` columns so the merge-join can
 /// compare by key (`compare_at`) and `gather` matched runs.
-pub struct SortedRun<T, R> {
+pub struct SortedRun<T: Columnar, R> {
     pub keys: CValue,
     pub vals: CValue,
-    pub times: Vec<T>,
+    pub times: ColTimes<T>,
     pub diffs: Vec<R>,
 }
 
@@ -668,7 +671,7 @@ where
     let chunks: Vec<CorgiChunk<T, R>> = merged.into();
     let (kv, times, diffs) = CorgiChunk::concat(&chunks);
     let (keys, vals) = split_kv(kv);
-    Some(SortedRun { keys, vals, times: times.to_vec(), diffs })
+    Some(SortedRun { keys, vals, times, diffs })
 }
 
 /// A DELTA-PROPORTIONAL flatten of the accumulated side of a bilinear join: instead of merging the
@@ -683,7 +686,7 @@ where
     R: Semigroup + Clone + 'static,
 {
     let (mut kblocks, mut vblocks): (Vec<CValue>, Vec<CValue>) = (Vec::new(), Vec::new());
-    let (mut times, mut diffs): (Vec<T>, Vec<R>) = (Vec::new(), Vec::new());
+    let (mut times, mut diffs): (ColTimes<T>, Vec<R>) = (ColTimes::new(), Vec::new());
     for b in acc {
         for ch in &b.chunks {
             if ch.len_() == 0 { continue; }
@@ -697,7 +700,7 @@ where
             kblocks.push(gather(ch.keys(), &idx));
             vblocks.push(gather(ch.vals(), &idx));
             for &j in &idx {
-                times.push(ch.times().get(j));
+                times.push_ref(ch.times(), j);
                 diffs.push(ch.diffs()[j].clone());
             }
         }

@@ -20,6 +20,7 @@ use corgi::Value as CValue;
 
 use differential_dataflow::trace::chunk::{Chunk, ChunkBatch};
 
+use crate::col_times::ColTimes;
 use crate::corgi_backend::CorgiContainer;
 use crate::col_times::ColTime;
 use crate::corgi_chunk::{flatten_batches, flatten_restricted, CorgiChunk};
@@ -96,7 +97,7 @@ where
     const WAVE: usize = 16;
     let (lo, hi) = find_ranges(&left.keys, &right.keys);
     let (mut li, mut ri): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
-    let (mut ot, mut od): (Vec<T>, Vec<Diff>) = (Vec::new(), Vec::new());
+    let (mut ot, mut od): (ColTimes<T>, Vec<Diff>) = (ColTimes::new(), Vec::new());
     let (mut h0, mut h1): (ValueHistory<u64, T, Diff>, ValueHistory<u64, T, Diff>) = (ValueHistory::new(), ValueHistory::new());
     let mut a = 0usize;
     while a < nl {
@@ -114,20 +115,23 @@ where
             e
         };
         if a_end - a >= WAVE && hi[a] - lo[a] >= WAVE {
-            h0.load_iter((a..a_end).map(|x| (x as u64, left.times[x].clone(), left.diffs[x])), None);
-            h1.load_iter((lo[a]..hi[a]).map(|x| (x as u64, right.times[x].clone(), right.diffs[x])), None);
+            h0.load_iter((a..a_end).map(|x| (x as u64, left.times.get(x), left.diffs[x])), None);
+            h1.load_iter((lo[a]..hi[a]).map(|x| (x as u64, right.times.get(x), right.diffs[x])), None);
             bilinear_wave(&mut h0, &mut h1, |x, y, t, d: Diff| {
                 li.push(x as usize);
                 ri.push(y as usize);
-                ot.push(t);
+                ot.push(&t);
                 od.push(d);
             });
         } else {
+            // Materialize this key-run's right times once (≤ once per pair; ranges repeat per x).
+            let rts: Vec<T> = (lo[a]..hi[a]).map(|b| right.times.get(b)).collect();
             for x in a..a_end {
+                let lt = left.times.get(x);
                 for b in lo[a]..hi[a] {
                     li.push(x);
                     ri.push(b);
-                    ot.push(left.times[x].join(&right.times[b]));
+                    ot.push(&lt.join(&rts[b - lo[a]]));
                     od.push(left.diffs[x] * right.diffs[b]);
                 }
             }

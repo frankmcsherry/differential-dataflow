@@ -51,9 +51,25 @@ where
 }
 
 /// SoA column of per-tuple times, backed by `<T as Columnar>::Container`.
-#[derive(Default)]
 pub struct ColTimes<T: Columnar> {
     store: <T as Columnar>::Container,
+}
+
+// Manual impl: the derive would demand `T: Default`, which the container does not need.
+impl<T: Columnar> Default for ColTimes<T> {
+    fn default() -> Self {
+        ColTimes { store: Default::default() }
+    }
+}
+
+/// Cloning a `ColTimes` clones the flat SoA buffers (a few memcpys) — never `n` owned `T`s.
+impl<T: Columnar> Clone for ColTimes<T>
+where
+    <T as Columnar>::Container: Clone,
+{
+    fn clone(&self) -> Self {
+        ColTimes { store: self.store.clone() }
+    }
 }
 
 impl<T: Columnar> ColTimes<T> {
@@ -108,8 +124,19 @@ impl<T: Columnar> ColTimes<T> {
         }
     }
 
-    /// Materialize the whole column to `Vec<T>` — the egress boundary (`SortedRun` for the join,
-    /// `CorgiContainer` for `as_collection`), where owned `T` is wanted anyway.
+    /// Gather rows `idx` into a new column, pushing `Ref`s straight across — no `T` materialized.
+    /// (The time-column analogue of corgi's `gather`, for filter/flatmap/sort permutations.)
+    pub fn gather(&self, idx: &[usize]) -> ColTimes<T> {
+        let mut out: ColTimes<T> = ColTimes::new();
+        let b = self.store.borrow();
+        for &i in idx {
+            out.store.push(b.get(i));
+        }
+        out
+    }
+
+    /// Materialize the whole column to `Vec<T>` — the egress boundary (row-update egress in
+    /// `into_updates`), where owned `T` is wanted anyway.
     pub fn to_vec(&self) -> Vec<T> {
         let b = self.store.borrow();
         (0..b.len()).map(|i| <T as Columnar>::into_owned(b.get(i))).collect()

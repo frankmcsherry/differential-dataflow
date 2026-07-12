@@ -70,7 +70,7 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                 let keep: Vec<usize> = (0..mask.len()).filter(|&i| mask[i] != 0).collect();
                 let keys = gather(&c.keys, &keep);
                 let vals = gather(&c.vals, &keep);
-                let times = keep.iter().map(|&i| c.times[i].clone()).collect();
+                let times = c.times.gather(&keep);
                 let diffs = keep.iter().map(|&i| c.diffs[i]).collect();
                 CorgiContainer { keys, vals, times, diffs }
             }
@@ -115,15 +115,19 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                 let g = compile_flatmap(field, &kshape, &vshape);
                 let raw = corgi::eval_graph(&g, CValue::Prod(vec![c.keys.clone(), c.vals.clone()])).into_u64("enter_at field");
                 let idx = level.saturating_sub(1);
-                for (t, &r) in c.times.iter_mut().zip(raw.iter()) {
+                let mut new_times = crate::col_times::ColTimes::new();
+                for (i, &r) in raw.iter().enumerate() {
                     let delay = 256 * (64 - r.leading_zeros() as u64);
+                    let mut t = c.times.get(i);
                     let mut coords = std::mem::take(&mut t.inner).into_inner();
                     if coords.len() <= idx {
                         coords.resize(idx + 1, 0);
                     }
                     coords[idx] = coords[idx].max(delay);
                     t.inner = PointStamp::new(coords);
+                    new_times.push(&t);
                 }
+                c.times = new_times;
                 c
             }
             // Columnar LiftIter: vals gain one integer lane read from each row's iteration
@@ -132,8 +136,8 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                 if matches!(corgi::shape_of_value(&c.vals), corgi::Shape::Prod(_) | corgi::Shape::Unit) =>
             {
                 let idx = level.saturating_sub(1);
-                let iters: Vec<u64> = c.times.iter()
-                    .map(|t| t.inner.get(idx).copied().unwrap_or(0))
+                let iters: Vec<u64> = (0..c.times.len())
+                    .map(|i| c.times.get(i).inner.get(idx).copied().unwrap_or(0))
                     .collect();
                 let lane = CValue::u64(iters);
                 let vals = match c.vals {
@@ -211,7 +215,7 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                 }
                 let keys = gather(&c.keys, &reps);
                 let vals = CValue::Prod(vec![CValue::u64(pos), elems]);
-                let times = reps.iter().map(|&r| c.times[r].clone()).collect();
+                let times = c.times.gather(&reps);
                 let diffs = reps.iter().map(|&r| c.diffs[r]).collect();
                 CorgiContainer { keys, vals, times, diffs }
             }
@@ -368,11 +372,15 @@ impl Backend for CorgiBackend {
                 v.truncate(level - 1);
                 new_time.inner = PointStamp::new(v);
                 let new_cap = cap.delayed(&new_time, 0);
-                for t in data.times.iter_mut() {
+                let mut new_times = crate::col_times::ColTimes::new();
+                for i in 0..data.times.len() {
+                    let mut t = data.times.get(i);
                     let mut v = std::mem::take(&mut t.inner).into_inner();
                     v.truncate(level - 1);
                     t.inner = PointStamp::new(v);
+                    new_times.push(&t);
                 }
+                data.times = new_times;
                 output.session(&new_cap).give_container(data);
             });
         });

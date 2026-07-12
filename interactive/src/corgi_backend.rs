@@ -6,44 +6,48 @@
 //! Minimal trait surface for a pipelined (single-worker) dataflow: `Accountable + Default + Clone`
 //! (= `timely::Container`). `Negate`/`Enter`/`Leave`/`ResultsIn` (iterative scopes) come with M3.
 
+use columnar::Columnar;
 use timely::Accountable;
 use timely::progress::{PathSummary, Timestamp};
 
 use differential_dataflow::collection::containers::{Enter, Leave, Negate, ResultsIn};
 use differential_dataflow::difference::Abelian;
 
+use crate::col_times::ColTimes;
 use crate::corgi_logic::{infer_shape_cols, transcode, untranscode};
 use crate::ir::Value as DValue;
 
 type Row = DValue;
 
-/// A batch of `(key, val, time, diff)` updates: payload columnar (corgi), time/diff native Rust.
-pub struct CorgiContainer<T, R> {
+/// A batch of `(key, val, time, diff)` updates: payload columnar (corgi), times flat SoA
+/// ([`ColTimes`] — no owned `PointStamp` per row on the dataflow edges), diffs native Rust.
+pub struct CorgiContainer<T: Columnar, R> {
     /// Key column (corgi columnar `Value`).
     pub keys: corgi::Value,
     /// Val column (corgi columnar `Value`).
     pub vals: corgi::Value,
-    /// Per-update times (corgi never reads these; the Rust side keeps the lattice algebra).
-    pub times: Vec<T>,
+    /// Per-update times, SoA-columnar (corgi never reads these; the Rust side keeps the lattice algebra).
+    pub times: ColTimes<T>,
     /// Per-update diffs.
     pub diffs: Vec<R>,
 }
 
-impl<T, R> Default for CorgiContainer<T, R> {
+impl<T: Columnar, R> Default for CorgiContainer<T, R> {
     fn default() -> Self {
         // Empty sentinel columns (shape-agnostic length-0 unit columns).
-        CorgiContainer { keys: corgi::Value::Unit(0), vals: corgi::Value::Unit(0), times: Vec::new(), diffs: Vec::new() }
+        CorgiContainer { keys: corgi::Value::Unit(0), vals: corgi::Value::Unit(0), times: ColTimes::new(), diffs: Vec::new() }
     }
 }
 
-impl<T: Clone, R: Clone> Clone for CorgiContainer<T, R> {
+impl<T: Columnar, R: Clone> Clone for CorgiContainer<T, R> {
     fn clone(&self) -> Self {
-        // corgi `Value` clone is an Arc bump on the leaf buffers — columns are shared, not copied.
+        // corgi `Value` clone is an Arc bump on the leaf buffers; the time column clone is flat
+        // buffer memcpys — no per-row owned times either way.
         CorgiContainer { keys: self.keys.clone(), vals: self.vals.clone(), times: self.times.clone(), diffs: self.diffs.clone() }
     }
 }
 
-impl<T: 'static, R: 'static> Accountable for CorgiContainer<T, R> {
+impl<T: Columnar + 'static, R: 'static> Accountable for CorgiContainer<T, R> {
     #[inline]
     fn record_count(&self) -> i64 {
         self.times.len() as i64
@@ -54,7 +58,7 @@ impl<T: 'static, R: 'static> Accountable for CorgiContainer<T, R> {
 /// `ContainerChunker<Vec<((key,val),T,R)>>` chunk a corgi-container stream into row chains for the
 /// reused `MergeBatcher`, which the `CorgiBatchBuilder` then transcodes back to corgi columns at
 /// arrangement build (the one ingest-boundary round-trip; reduce/join read corgi columns).
-impl<T: Clone + 'static, R: Clone + 'static> timely::container::DrainContainer for CorgiContainer<T, R> {
+impl<T: Columnar + Clone + 'static, R: Clone + 'static> timely::container::DrainContainer for CorgiContainer<T, R> {
     type Item<'a> = ((Row, Row), T, R) where Self: 'a;
     type DrainIter<'a> = std::vec::IntoIter<((Row, Row), T, R)> where Self: 'a;
     fn drain(&mut self) -> Self::DrainIter<'_> {
@@ -62,7 +66,7 @@ impl<T: Clone + 'static, R: Clone + 'static> timely::container::DrainContainer f
     }
 }
 
-impl<T: Clone + 'static, R: Clone + 'static> CorgiContainer<T, R> {
+impl<T: Columnar + Clone + 'static, R: Clone + 'static> CorgiContainer<T, R> {
     /// Build a container from DDIR row updates — the **ingest boundary** transcode (once per batch).
     /// Shapes are inferred by scanning the whole column ([`infer_shape_cols`]) — required so a
     /// `Variant` column discovers all its arms (a single sample shows only one tag).
@@ -74,7 +78,10 @@ impl<T: Clone + 'static, R: Clone + 'static> CorgiContainer<T, R> {
         let vals_rows: Vec<DValue> = updates.iter().map(|u| u.0 .1.clone()).collect();
         let kshape = infer_shape_cols(&keys_rows);
         let vshape = infer_shape_cols(&vals_rows);
-        let times = updates.iter().map(|u| u.1.clone()).collect();
+        let mut times = ColTimes::new();
+        for u in &updates {
+            times.push(&u.1);
+        }
         let diffs = updates.iter().map(|u| u.2.clone()).collect();
         CorgiContainer { keys: transcode(&keys_rows, &kshape), vals: transcode(&vals_rows, &vshape), times, diffs }
     }
@@ -92,7 +99,7 @@ impl<T: Clone + 'static, R: Clone + 'static> CorgiContainer<T, R> {
         keys_rows
             .into_iter()
             .zip(vals_rows)
-            .zip(self.times)
+            .zip(self.times.to_vec())
             .zip(self.diffs)
             .map(|(((k, v), t), d)| ((k, v), t, d))
             .collect()
@@ -104,7 +111,7 @@ impl<T: Clone + 'static, R: Clone + 'static> CorgiContainer<T, R> {
 // (`gather`) when `ResultsIn` drops rows. `Enter`/`Leave` are identity for DDIR's same-Time dynamic
 // timestamp model (region entry doesn't change the time type; `leave_dynamic` pops the coord).
 
-impl<T: Timestamp, R: Abelian + 'static> Negate for CorgiContainer<T, R> {
+impl<T: Timestamp + Columnar, R: Abelian + 'static> Negate for CorgiContainer<T, R> {
     fn negate(mut self) -> Self {
         for d in self.diffs.iter_mut() {
             d.negate();
@@ -113,29 +120,30 @@ impl<T: Timestamp, R: Abelian + 'static> Negate for CorgiContainer<T, R> {
     }
 }
 
-impl<T: Timestamp, R: 'static> Enter<T, T> for CorgiContainer<T, R> {
+impl<T: Timestamp + Columnar, R: 'static> Enter<T, T> for CorgiContainer<T, R> {
     type InnerContainer = Self;
     fn enter(self) -> Self {
         self
     }
 }
 
-impl<T: Timestamp, R: 'static> Leave<T, T> for CorgiContainer<T, R> {
+impl<T: Timestamp + Columnar, R: 'static> Leave<T, T> for CorgiContainer<T, R> {
     type OuterContainer = Self;
     fn leave(self) -> Self {
         self
     }
 }
 
-impl<T: Timestamp, R: Clone + 'static> ResultsIn<T::Summary> for CorgiContainer<T, R> {
+impl<T: Timestamp + Columnar, R: Clone + 'static> ResultsIn<T::Summary> for CorgiContainer<T, R> {
     fn results_in(self, step: &T::Summary) -> Self {
         let n = self.times.len();
         let mut keep = Vec::with_capacity(n);
-        let mut new_times = Vec::with_capacity(n);
-        for (i, t) in self.times.iter().enumerate() {
-            if let Some(nt) = step.results_in(t) {
+        let mut new_times = ColTimes::new();
+        for i in 0..n {
+            let t = self.times.get(i);
+            if let Some(nt) = step.results_in(&t) {
                 keep.push(i);
-                new_times.push(nt);
+                new_times.push(&nt);
             }
         }
         if keep.len() == n {
