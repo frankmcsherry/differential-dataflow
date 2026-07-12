@@ -75,12 +75,25 @@ pub struct RankReduceTactic<T, Bk, S> {
     /// key hash, keys unique — every producer and consumer walks keys in ascending order, so
     /// a sorted vec replaces the former BTreeMap (whose inserts were ~4% of SCC profiles).
     pending: Vec<(u64, Vec<T>)>,
+    /// `RANK_PRESENT_STATS=1` diagnostics: rows presented to the tactic vs rows remaining
+    /// after netting `(vid, time ⋁ meet)` — sizes what a meet-at-presentation pass would
+    /// save. Reported on drop.
+    stats: Option<(u64, u64)>,
+}
+
+impl<T, Bk, S> Drop for RankReduceTactic<T, Bk, S> {
+    fn drop(&mut self) {
+        if let Some((presented, netted)) = self.stats {
+            eprintln!("RANK_PRESENT_STATS presented={presented} netted={netted} ratio={:.2}", presented as f64 / netted.max(1) as f64);
+        }
+    }
 }
 
 impl<T, Bk, S: Default> RankReduceTactic<T, Bk, S> {
     /// A tactic deferring value semantics to `backend`, times to a fresh store.
     pub fn new(backend: Bk) -> Self {
-        RankReduceTactic { backend, store: S::default(), pending: Vec::new() }
+        let stats = std::env::var("RANK_PRESENT_STATS").is_ok().then_some((0, 0));
+        RankReduceTactic { backend, store: S::default(), pending: Vec::new(), stats }
     }
 }
 
@@ -282,6 +295,18 @@ where
                 for i in (1..st.meets.len()).rev() {
                     let m = st.meets[i];
                     st.meets[i - 1] = store.meet(st.meets[i - 1], m);
+                }
+                if let (Some((presented, netted)), Some(&m0)) = (self.stats.as_mut(), st.meets.first()) {
+                    *presented += (i1 - i0) as u64 + (o1 - o0) as u64;
+                    let mut sc: Vec<((u64, Rank), i64)> = Vec::with_capacity((i1 - i0) + (o1 - o0));
+                    for i in i0..i1 {
+                        sc.push(((p_in[i].0.1, store.join(p_in[i].1, m0)), p_in[i].2));
+                    }
+                    for o in o0..o1 {
+                        sc.push(((p_out[o].0.1, store.join(p_out[o].1, m0)), p_out[o].2));
+                    }
+                    crate::consolidation::consolidate(&mut sc);
+                    *netted += sc.len() as u64;
                 }
                 st.in_replay.load_iter((i0..i1).map(|i| (p_in[i].0.1, p_in[i].1, p_in[i].2)), st.meets.first().copied(), store);
                 st.out_replay.load_iter((o0..o1).map(|o| (p_out[o].0.1, p_out[o].1, p_out[o].2)), st.meets.first().copied(), store);
