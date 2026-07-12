@@ -760,23 +760,14 @@ impl RankTimeHistory {
     }
 }
 
-/// One key's view for [`rank_discover_times`]: the `((key_hash, value_id), rank, diff)` run
-/// slice plus the carried pending ranks (SORTED by the store's time order).
-pub struct RankKeyView<'a, RIn> {
-    /// The presented run this key's records live in.
-    pub p_in: &'a [((u64, u64), Rank, RIn)],
-    /// The key's first record.
-    pub i0: usize,
-    /// One past the key's last record.
-    pub i1: usize,
-    /// Interesting ranks pended by earlier retires, time-ordered.
-    pub pending: &'a [Rank],
-}
-
-/// Reusable scratch for [`rank_discover_times`].
-pub struct RankDiscoverScratch<RIn> {
+/// Reusable scratch for [`rank_discover_times`]. Discovery is TIME logic only: the input
+/// side is a times-only replay (values and diffs never influenced it — the former row view
+/// discarded both), which is what lets callers feed cheap per-key DISTINCT time sets
+/// instead of presented rows. Extra times whose rows would net to zero are a safe
+/// over-approximation (a non-interesting moment produces no corrections).
+pub struct RankDiscoverScratch {
     batch_replay: RankTimeHistory,
-    input_replay: RankValueHistory<u64, RIn>,
+    input_replay: RankTimeHistory,
     output_replay: RankTimeHistory,
     synth: Vec<Rank>,
     times_current: Vec<Rank>,
@@ -784,12 +775,12 @@ pub struct RankDiscoverScratch<RIn> {
     meets: Vec<Rank>,
 }
 
-impl<RIn: Semigroup + Clone> RankDiscoverScratch<RIn> {
+impl RankDiscoverScratch {
     /// Fresh scratch; hold one per retire.
     pub fn new() -> Self {
         RankDiscoverScratch {
             batch_replay: RankTimeHistory::new(),
-            input_replay: RankValueHistory::new(),
+            input_replay: RankTimeHistory::new(),
             output_replay: RankTimeHistory::new(),
             synth: Vec::new(),
             times_current: Vec::new(),
@@ -799,7 +790,7 @@ impl<RIn: Semigroup + Clone> RankDiscoverScratch<RIn> {
     }
 }
 
-impl<RIn: Semigroup + Clone> Default for RankDiscoverScratch<RIn> {
+impl Default for RankDiscoverScratch {
     fn default() -> Self { Self::new() }
 }
 
@@ -812,18 +803,17 @@ pub fn frontier_le<S: TimeStore>(frontier: &[Rank], t: Rank, store: &S) -> bool 
 /// and lattice question. `upper` is the retire's upper frontier, pre-interned. The same
 /// protocol contract applies: `seed_times` must be the NOVEL batch's own support.
 #[allow(clippy::too_many_arguments)]
-pub fn rank_discover_times<RIn, S: TimeStore>(
-    key: RankKeyView<'_, RIn>,
+pub fn rank_discover_times<S: TimeStore>(
+    in_times: impl Iterator<Item = Rank>,
+    pending: &[Rank],
     seed_times: impl Iterator<Item = Rank>,
     out_times: impl Iterator<Item = Rank>,
     upper: &[Rank],
-    scratch: &mut RankDiscoverScratch<RIn>,
+    scratch: &mut RankDiscoverScratch,
     moments: &mut Vec<Rank>,
     pended: &mut Vec<Rank>,
     store: &mut S,
-) where
-    RIn: Semigroup + Clone,
-{
+) {
     let RankDiscoverScratch { batch_replay, input_replay, output_replay, synth, times_current, temporary, meets } = scratch;
     synth.clear();
     times_current.clear();
@@ -832,7 +822,7 @@ pub fn rank_discover_times<RIn, S: TimeStore>(
     batch_replay.load(seed_times, None, store);
 
     meets.clear();
-    meets.extend_from_slice(key.pending);
+    meets.extend_from_slice(pending);
     for i in (1..meets.len()).rev() {
         let m = meets[i];
         meets[i - 1] = store.meet(meets[i - 1], m);
@@ -850,14 +840,10 @@ pub fn rank_discover_times<RIn, S: TimeStore>(
     update_meet(&mut meet, meets.first().copied(), store);
     update_meet(&mut meet, batch_replay.meet(), store);
 
-    input_replay.load_iter(
-        (key.i0..key.i1).map(|i| (key.p_in[i].0.1, key.p_in[i].1, key.p_in[i].2.clone())),
-        meet,
-        store,
-    );
+    input_replay.load(in_times, meet, store);
     output_replay.load(out_times, meet, store);
 
-    let mut times_slice = key.pending;
+    let mut times_slice = pending;
     let mut meets_slice = &meets[..];
 
     loop {
@@ -900,7 +886,7 @@ pub fn rank_discover_times<RIn, S: TimeStore>(
                 if let Some(m) = meet {
                     input_replay.advance_buffer_by(m, store);
                 }
-                let buffered: Vec<Rank> = input_replay.buffer().iter().map(|((_, t), _)| *t).collect();
+                let buffered: Vec<Rank> = input_replay.buffer().to_vec();
                 for t in buffered {
                     if !store.le(t, next_time) {
                         temporary.push(store.join(next_time, t));
@@ -1004,8 +990,10 @@ mod rank_twin_tests {
             let mut pending_t: Vec<T> = (0..(xs(&mut s) % 4)).map(|_| random_time(&mut s)).collect();
             pending_t.sort();
             pending_t.dedup();
+            // Unit diffs: the rank twin is now times-only (netting-free by design), so the
+            // strict-equality oracle needs the owned side's netting to be a no-op too.
             let mut run_t: Vec<((u64, u64), T, i64)> = (0..(xs(&mut s) % 8))
-                .map(|_| ((7, xs(&mut s) % 3), random_time(&mut s), (xs(&mut s) % 5) as i64 - 2))
+                .map(|_| ((7, xs(&mut s) % 3), random_time(&mut s), 1))
                 .collect();
             run_t.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
             run_t.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
@@ -1033,10 +1021,14 @@ mod rank_twin_tests {
             let outs_r: Vec<Rank> = outs_t.iter().map(|t| store.intern(t.clone())).collect();
             let upper_r: Vec<Rank> = upper_t.elements().iter().map(|t| store.intern(t.clone())).collect();
 
-            let mut rscratch = RankDiscoverScratch::<i64>::new();
+            let mut rscratch = RankDiscoverScratch::new();
             let (mut moments_r, mut pended_r) = (Vec::new(), Vec::new());
+            // Times-only input: the distinct times of the run (order preserved; discovery
+            // sorts internally).
+            let in_times_r: Vec<Rank> = run_r.iter().map(|(_, r, _)| *r).collect();
             rank_discover_times(
-                RankKeyView { p_in: &run_r[..], i0: 0, i1: run_r.len(), pending: &pending_r },
+                in_times_r.iter().copied(),
+                &pending_r,
                 seeds_r.iter().copied(),
                 outs_r.iter().copied(),
                 &upper_r,

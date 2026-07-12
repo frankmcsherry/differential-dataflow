@@ -85,6 +85,17 @@ pub struct CorgiReduceBackend<T> {
     val_index: IdMap,
     val_blocks: Vec<CValue>,
     val_len: usize,
+    /// Two-phase rank-window stash: hit ranges and per-chunk store-rank maps computed by the
+    /// rank `next_window`, consumed by `present_historical` (which re-derives the same chunk
+    /// lists deterministically from the instance). `rank_novel_*` carry the novel side's
+    /// gathered value column and vids so the input pool can be finished after the historical
+    /// gather.
+    rank_in_hits: Vec<(u32, u32, u32, u32)>,
+    rank_in_maps: Vec<Vec<u32>>,
+    rank_out_hits: Vec<(u32, u32, u32, u32)>,
+    rank_out_maps: Vec<Vec<u32>>,
+    rank_novel_vals: CValue,
+    rank_novel_vids: Vec<u64>,
     _t: std::marker::PhantomData<T>,
 }
 
@@ -96,6 +107,12 @@ impl<T> CorgiReduceBackend<T> {
             in_index: IdMap::default(),
             tiles: Vec::new(),
             tile_rows: Vec::new(),
+            rank_in_hits: Vec::new(),
+            rank_in_maps: Vec::new(),
+            rank_out_hits: Vec::new(),
+            rank_out_maps: Vec::new(),
+            rank_novel_vals: CValue::Unit(0),
+            rank_novel_vids: Vec::new(),
             key_index: IdMap::default(),
             key_blocks: Vec::new(),
             key_len: 0,
@@ -694,6 +711,172 @@ use crate::lane_store::LaneStore;
 
 type LTime = timely::order::Product<u64, differential_dataflow::dynamic::pointstamp::PointStamp<u64>>;
 
+/// The source batches that are NOT this retire's novel input batches (Rc identity) — the
+/// historical accumulation the two-phase window presents lazily.
+fn hist_batches_of(instance: &ReduceInstance<'_, CBatch<LTime>, CBatch<LTime>>) -> Vec<CBatch<LTime>> {
+    instance
+        .source_batches
+        .iter()
+        .filter(|b| !instance.input_batches.iter().any(|ib| std::rc::Rc::ptr_eq(ib, b)))
+        .cloned()
+        .collect()
+}
+
+/// Per-key DISTINCT time sets over `chunks`, restricted to `keys`: the hit ranges (counting-
+/// sorted by key index, chunk order preserved), the per-chunk trank→store-rank maps, and the
+/// flat time sets with per-key exclusive ends. The hits/maps feed [`present_side`] later.
+fn hist_time_sets(
+    chunks: &[&CorgiChunk<LTime, Diff>],
+    keys: &[u64],
+    store: &mut LaneStore,
+) -> (Vec<(u32, u32, u32, u32)>, Vec<Vec<u32>>, Vec<Rank>, Vec<usize>) {
+    let pres: Vec<&Presentation<LTime>> =
+        chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+    let maps: Vec<Vec<u32>> =
+        pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
+
+    // Hits: per chunk, two-pointer restriction (the concat_restricted pass-1 shape).
+    let mut hits: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for (c, p) in pres.iter().enumerate() {
+        let khs = &p.khs;
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < khs.len() && j < keys.len() {
+            if khs[i] < keys[j] {
+                i += 1;
+            } else if khs[i] > keys[j] {
+                j += 1;
+            } else {
+                let s = i;
+                while i < khs.len() && khs[i] == keys[j] {
+                    i += 1;
+                }
+                hits.push((j as u32, c as u32, s as u32, i as u32));
+                j += 1;
+            }
+        }
+    }
+    // Counting sort by key index (chunk order preserved within a key).
+    let mut counts = vec![0u32; keys.len() + 1];
+    for &(j, ..) in &hits {
+        counts[j as usize + 1] += 1;
+    }
+    for k in 1..counts.len() {
+        counts[k] += counts[k - 1];
+    }
+    let mut ordered: Vec<(u32, u32, u32, u32)> = vec![(0, 0, 0, 0); hits.len()];
+    for &h in &hits {
+        let slot = counts[h.0 as usize];
+        ordered[slot as usize] = h;
+        counts[h.0 as usize] += 1;
+    }
+
+    // Distinct store ranks per key: a seen-stamp per chunk time-table entry (tables are tiny).
+    let mut seen: Vec<Vec<u32>> = pres.iter().map(|p| vec![u32::MAX; p.times.len()]).collect();
+    let mut times: Vec<Rank> = Vec::new();
+    let mut ends: Vec<usize> = Vec::with_capacity(keys.len());
+    let mut h = 0usize;
+    for ki in 0..keys.len() {
+        while h < ordered.len() && ordered[h].0 as usize == ki {
+            let (_, c, lo, hi) = ordered[h];
+            let (c, lo, hi) = (c as usize, lo as usize, hi as usize);
+            let p = pres[c];
+            let map = &maps[c];
+            let stamp = &mut seen[c];
+            for i in lo..hi {
+                let t = p.tranks[i] as usize;
+                if stamp[t] != ki as u32 {
+                    stamp[t] = ki as u32;
+                    times.push(map[t]);
+                }
+            }
+            h += 1;
+        }
+        ends.push(times.len());
+    }
+    (ordered, maps, times, ends)
+}
+
+/// Present one historical side: rows netted under each key's meet (skip `None` keys), plus
+/// the (tag, off) gather plan and (khs, vids) for pool registration — one entry per emitted
+/// row, the netted group's representative. Within a hit range rows are `(vid asc, trank asc)`
+/// and rank advance is monotone in time, so equal `(vid, advanced-rank)` groups are adjacent.
+fn present_side(
+    chunks: &[&CorgiChunk<LTime, Diff>],
+    hits: &[(u32, u32, u32, u32)],
+    maps: &[Vec<u32>],
+    nkeys: usize,
+    meets: &[Option<Rank>],
+    store: &mut LaneStore,
+) -> (Vec<((u64, u64), Rank, i64)>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<u64>, Vec<u64>) {
+    let pres: Vec<&Presentation<LTime>> =
+        chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+    let diffs: Vec<&[Diff]> = chunks.iter().map(|c| c.diffs()).collect();
+    let mut rows: Vec<((u64, u64), Rank, i64)> = Vec::new();
+    let mut ends: Vec<usize> = Vec::with_capacity(nkeys);
+    let (mut tags, mut offs) = (Vec::new(), Vec::new());
+    let (mut khs_out, mut vids_out) = (Vec::new(), Vec::new());
+    let mut h = 0usize;
+    for ki in 0..nkeys {
+        match meets[ki] {
+            None => {
+                while h < hits.len() && hits[h].0 as usize == ki {
+                    h += 1;
+                }
+            }
+            Some(meet) => {
+                while h < hits.len() && hits[h].0 as usize == ki {
+                    let (_, c, lo, hi) = hits[h];
+                    let (c, lo, hi) = (c as usize, lo as usize, hi as usize);
+                    let p = pres[c];
+                    let map = &maps[c];
+                    let d = diffs[c];
+                    let mut memo: (u32, Rank) = (u32::MAX, 0);
+                    // (vid, advanced rank, running sum, representative row)
+                    let mut cur: Option<(u64, Rank, i64, usize)> = None;
+                    for i in lo..hi {
+                        let tr = p.tranks[i];
+                        if memo.0 != tr {
+                            memo = (tr, store.join(map[tr as usize], meet));
+                        }
+                        let adv = memo.1;
+                        let vid = p.vids[i];
+                        let di = d[p.perm[i] as usize];
+                        match cur.as_mut() {
+                            Some((cv, ca, sum, _)) if *cv == vid && *ca == adv => {
+                                *sum += di;
+                            }
+                            _ => {
+                                if let Some((cv, ca, sum, rep)) = cur.take() {
+                                    if sum != 0 {
+                                        rows.push(((p.khs[rep], cv), ca, sum));
+                                        tags.push(c);
+                                        offs.push(p.perm[rep] as usize);
+                                        khs_out.push(p.khs[rep]);
+                                        vids_out.push(cv);
+                                    }
+                                }
+                                cur = Some((vid, adv, di, i));
+                            }
+                        }
+                    }
+                    if let Some((cv, ca, sum, rep)) = cur.take() {
+                        if sum != 0 {
+                            rows.push(((p.khs[rep], cv), ca, sum));
+                            tags.push(c);
+                            offs.push(p.perm[rep] as usize);
+                            khs_out.push(p.khs[rep]);
+                            vids_out.push(cv);
+                        }
+                    }
+                    h += 1;
+                }
+            }
+        }
+        ends.push(rows.len());
+    }
+    (rows, ends, tags, offs, khs_out, vids_out)
+}
+
 impl RankReduceBackend<CBatch<LTime>, CBatch<LTime>> for CorgiReduceBackend<LTime> {
     type Store = LaneStore;
 
@@ -727,50 +910,98 @@ impl RankReduceBackend<CBatch<LTime>, CBatch<LTime>> for CorgiReduceBackend<LTim
         let keys: Vec<u64> = changed[*cursor..].to_vec();
         *cursor = changed.len();
 
-        let mut in_chunks = chunks_of(instance.input_batches);
-        in_chunks.extend(chunks_of(instance.source_batches));
-        let out_chunks = chunks_of(instance.output_batches);
-        let in_pres: Vec<&Presentation<LTime>> = in_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
-        let out_pres: Vec<&Presentation<LTime>> = out_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
-
-        // Per-chunk local rank -> STORE rank (table-sized; the store subsumes the window table).
-        let in_maps: Vec<Vec<u32>> = in_pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
-        let out_maps: Vec<Vec<u32>> = out_pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
-
-        let in_diffs: Vec<&[Diff]> = in_chunks.iter().map(|c| c.diffs()).collect();
-        let m_in = concat_restricted(&in_pres, &in_maps, &in_diffs, &keys);
+        // NOVEL side, in the clear: this retire's input batches only. Rows, gathered
+        // key/value columns, and vids stashed for the pool finish in `present_historical`.
+        let novel_chunks = chunks_of(instance.input_batches);
+        let novel_pres: Vec<&Presentation<LTime>> =
+            novel_chunks.iter().map(|c| c.presentation_or_init(|| build_presentation(c))).collect();
+        let novel_maps: Vec<Vec<u32>> =
+            novel_pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
+        let novel_diffs: Vec<&[Diff]> = novel_chunks.iter().map(|c| c.diffs()).collect();
+        let m_novel = concat_restricted(&novel_pres, &novel_maps, &novel_diffs, &keys);
         self.in_index = IdMap::default();
-        let input = if m_in.khs.is_empty() {
-            self.in_vals = CValue::Unit(0);
-            Vec::new()
+        self.rank_novel_vids.clear();
+        if m_novel.khs.is_empty() {
+            self.rank_novel_vals = CValue::Unit(0);
         } else {
-            let key_srcs: Vec<Option<&CValue>> = in_chunks.iter().map(|c| Some(c.keys())).collect();
-            let val_srcs: Vec<Option<&CValue>> = in_chunks.iter().map(|c| Some(c.vals())).collect();
-            let in_keys = gather_lanes(&key_srcs, &m_in.tags, &m_in.offs);
-            let in_vals = gather_lanes(&val_srcs, &m_in.tags, &m_in.offs);
-            for (r, &vid) in m_in.vids.iter().enumerate() {
+            let key_srcs: Vec<Option<&CValue>> = novel_chunks.iter().map(|c| Some(c.keys())).collect();
+            let val_srcs: Vec<Option<&CValue>> = novel_chunks.iter().map(|c| Some(c.vals())).collect();
+            let nk = gather_lanes(&key_srcs, &m_novel.tags, &m_novel.offs);
+            self.rank_novel_vals = gather_lanes(&val_srcs, &m_novel.tags, &m_novel.offs);
+            for (r, &vid) in m_novel.vids.iter().enumerate() {
                 self.in_index.entry(vid).or_insert(r);
             }
-            self.in_vals = in_vals;
-            self.register_keys(in_keys, &m_in.khs);
-            m_in.records
-        };
+            self.register_keys(nk, &m_novel.khs);
+            self.rank_novel_vids.extend_from_slice(&m_novel.vids);
+        }
 
-        let o_diffs: Vec<&[Diff]> = out_chunks.iter().map(|c| c.diffs()).collect();
-        let m_out = concat_restricted(&out_pres, &out_maps, &o_diffs, &keys);
-        let output = if m_out.khs.is_empty() {
-            Vec::new()
+        // HISTORICAL side: source minus the novel batches (Rc identity), TIME SETS only —
+        // the rows follow in `present_historical`, netted under the discovered meets.
+        let hist_batches = hist_batches_of(instance);
+        let hist_chunks = chunks_of(&hist_batches);
+        let (in_hits, in_maps, hist_in_times, hist_in_ends) = hist_time_sets(&hist_chunks, &keys, store);
+        let out_chunks = chunks_of(instance.output_batches);
+        let (out_hits, out_maps, hist_out_times, hist_out_ends) = hist_time_sets(&out_chunks, &keys, store);
+        self.rank_in_hits = in_hits;
+        self.rank_in_maps = in_maps;
+        self.rank_out_hits = out_hits;
+        self.rank_out_maps = out_maps;
+
+        Some(RankWindow {
+            keys,
+            novel: m_novel.records,
+            hist_in_times,
+            hist_in_ends,
+            hist_out_times,
+            hist_out_ends,
+        })
+    }
+
+    fn present_historical(
+        &mut self,
+        instance: &ReduceInstance<'_, CBatch<LTime>, CBatch<LTime>>,
+        window: &RankWindow,
+        meets: &[Option<Rank>],
+        store: &mut LaneStore,
+    ) -> (Vec<((u64, u64), Rank, i64)>, Vec<usize>, Vec<((u64, u64), Rank, i64)>, Vec<usize>) {
+        // Same deterministic chunk lists as `next_window`.
+        let hist_batches = hist_batches_of(instance);
+        let hist_chunks = chunks_of(&hist_batches);
+        let out_chunks = chunks_of(instance.output_batches);
+
+        let (in_rows, in_ends, in_tags, in_offs, in_khs, in_vids) =
+            present_side(&hist_chunks, &self.rank_in_hits, &self.rank_in_maps, window.keys.len(), meets, store);
+        let (out_rows, out_ends, out_tags, out_offs, out_khs, out_vids) =
+            present_side(&out_chunks, &self.rank_out_hits, &self.rank_out_maps, window.keys.len(), meets, store);
+
+        // Finish the input value pool: novel block first (its `in_index` rows were assigned
+        // in `next_window`), then the netted historical block at the novel offset.
+        let novel_len = self.rank_novel_vals.len();
+        let hist_in_vals = if in_rows.is_empty() {
+            CValue::Unit(0)
         } else {
+            let val_srcs: Vec<Option<&CValue>> = hist_chunks.iter().map(|c| Some(c.vals())).collect();
+            gather_lanes(&val_srcs, &in_tags, &in_offs)
+        };
+        self.in_vals = concat_columns(&[std::mem::replace(&mut self.rank_novel_vals, CValue::Unit(0)), hist_in_vals]);
+        for (r, &vid) in in_vids.iter().enumerate() {
+            self.in_index.entry(vid).or_insert(novel_len + r);
+        }
+        if !in_rows.is_empty() {
+            let key_srcs: Vec<Option<&CValue>> = hist_chunks.iter().map(|c| Some(c.keys())).collect();
+            let hist_in_keys = gather_lanes(&key_srcs, &in_tags, &in_offs);
+            self.register_keys(hist_in_keys, &in_khs);
+        }
+        if !out_rows.is_empty() {
             let key_srcs: Vec<Option<&CValue>> = out_chunks.iter().map(|c| Some(c.keys())).collect();
             let val_srcs: Vec<Option<&CValue>> = out_chunks.iter().map(|c| Some(c.vals())).collect();
-            let o_keys = gather_lanes(&key_srcs, &m_out.tags, &m_out.offs);
-            let o_vals = gather_lanes(&val_srcs, &m_out.tags, &m_out.offs);
-            self.register_keys(o_keys, &m_out.khs);
-            self.register_vals(o_vals, &m_out.vids);
-            m_out.records
-        };
+            let o_keys = gather_lanes(&key_srcs, &out_tags, &out_offs);
+            let o_vals = gather_lanes(&val_srcs, &out_tags, &out_offs);
+            self.register_keys(o_keys, &out_khs);
+            self.register_vals(o_vals, &out_vids);
+        }
 
-        Some(RankWindow { keys, input, output })
+        (in_rows, in_ends, out_rows, out_ends)
     }
 
     fn reduce_corrections(

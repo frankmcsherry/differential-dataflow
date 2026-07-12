@@ -16,21 +16,30 @@ use crate::lattice::Lattice;
 use crate::trace::{BatchReader, Description};
 use crate::operators::reduce::ReduceTactic;
 use crate::operators::recipes::{
-    frontier_le, rank_discover_times, tile_descriptions, Rank, RankDiscoverScratch, RankKeyView,
+    frontier_le, rank_discover_times, tile_descriptions, Rank, RankDiscoverScratch,
     RankValueHistory, TimeStore,
 };
 use crate::operators::int_proxy::reduce::ReduceInstance;
 
-/// One window of changed keys, in rank space: sorted by `key_hash` and grouped by
-/// `(key_hash, value_id)` with equal ranks netted (rank ORDER need not be time order — the
-/// tactic re-sorts wherever replay order matters).
+/// One window of changed keys, in rank space, presented in TWO PHASES: the novel rows in
+/// the clear (they seed discovery and will not compress), and the historical side as
+/// per-key DISTINCT time sets only — full historical rows are presented afterwards by
+/// [`RankReduceBackend::present_historical`], netted under each key's discovered meet
+/// (rank ORDER need not be time order — the tactic re-sorts wherever replay order matters).
 pub struct RankWindow {
     /// The window's key hashes, ascending.
     pub keys: Vec<u64>,
-    /// Input presentation (history ∪ novel), restricted to `keys`.
-    pub input: Vec<((u64, u64), Rank, i64)>,
-    /// Output-history presentation, same keys.
-    pub output: Vec<((u64, u64), Rank, i64)>,
+    /// NOVEL input rows (this retire's new batches only), in the clear, sorted by
+    /// `(key_hash, value_id)`.
+    pub novel: Vec<((u64, u64), Rank, i64)>,
+    /// Distinct HISTORICAL input times, concatenated per key.
+    pub hist_in_times: Vec<Rank>,
+    /// Per-key exclusive ends into `hist_in_times`, aligned with `keys`.
+    pub hist_in_ends: Vec<usize>,
+    /// Distinct historical output times, concatenated per key.
+    pub hist_out_times: Vec<Rank>,
+    /// Per-key exclusive ends into `hist_out_times`, aligned with `keys`.
+    pub hist_out_ends: Vec<usize>,
 }
 
 /// The rank-space reduce backend: value semantics + a [`TimeStore`] the tactic drives.
@@ -50,6 +59,19 @@ pub trait RankReduceBackend<B1: BatchReader, B2: BatchReader<Time = B1::Time>> {
         cursor: &mut usize,
         store: &mut Self::Store,
     ) -> Option<RankWindow>;
+    /// Present the HISTORICAL rows for `window`'s keys: each key's times advanced by its
+    /// meet (`meets[k]`; `None` skips the key — it discovered no moments and needs no rows)
+    /// and equal `(value_id, advanced-rank)` rows netted, zeros dropped. Returns
+    /// `(input rows, per-key ends, output rows, per-key ends)`, rows grouped per key with
+    /// ends aligned to `window.keys`. Row order within a key is unconstrained (the tactic
+    /// groups by value and store-sorts at load).
+    fn present_historical(
+        &mut self,
+        instance: &ReduceInstance<'_, B1, B2>,
+        window: &RankWindow,
+        meets: &[Option<Rank>],
+        store: &mut Self::Store,
+    ) -> (Vec<((u64, u64), Rank, i64)>, Vec<usize>, Vec<((u64, u64), Rank, i64)>, Vec<usize>);
     /// Value reconciliation, identical to the int_proxy contract (no times cross here).
     fn reduce_corrections(
         &mut self,
@@ -75,16 +97,16 @@ pub struct RankReduceTactic<T, Bk, S> {
     /// key hash, keys unique — every producer and consumer walks keys in ascending order, so
     /// a sorted vec replaces the former BTreeMap (whose inserts were ~4% of SCC profiles).
     pending: Vec<(u64, Vec<T>)>,
-    /// `RANK_PRESENT_STATS=1` diagnostics: rows presented to the tactic vs rows remaining
-    /// after netting `(vid, time ⋁ meet)` — sizes what a meet-at-presentation pass would
-    /// save. Reported on drop.
-    stats: Option<(u64, u64)>,
+    /// `RANK_PRESENT_STATS=1` diagnostics: rows loaded into the replay histories (novel +
+    /// meet-netted historical). Compare with the pre-two-phase `presented`/`net_meet`
+    /// numbers recorded in the read-out. Reported on drop.
+    stats: Option<u64>,
 }
 
 impl<T, Bk, S> Drop for RankReduceTactic<T, Bk, S> {
     fn drop(&mut self) {
-        if let Some((presented, netted)) = self.stats {
-            eprintln!("RANK_PRESENT_STATS presented={presented} netted={netted} ratio={:.2}", presented as f64 / netted.max(1) as f64);
+        if let Some(loaded) = self.stats {
+            eprintln!("RANK_PRESENT_STATS loaded={loaded}");
         }
     }
 }
@@ -92,7 +114,7 @@ impl<T, Bk, S> Drop for RankReduceTactic<T, Bk, S> {
 impl<T, Bk, S: Default> RankReduceTactic<T, Bk, S> {
     /// A tactic deferring value semantics to `backend`, times to a fresh store.
     pub fn new(backend: Bk) -> Self {
-        let stats = std::env::var("RANK_PRESENT_STATS").is_ok().then_some((0, 0));
+        let stats = std::env::var("RANK_PRESENT_STATS").is_ok().then_some(0);
         RankReduceTactic { backend, store: S::default(), pending: Vec::new(), stats }
     }
 }
@@ -200,7 +222,7 @@ where
         let mut ns = 0usize;
         let mut ps = 0usize;
 
-        let mut discover_scratch: RankDiscoverScratch<i64> = RankDiscoverScratch::new();
+        let mut discover_scratch: RankDiscoverScratch = RankDiscoverScratch::new();
         let mut states: Vec<RankKeyState> = Vec::new();
         let mut tile_deltas: Vec<Vec<((u64, u64), Rank, i64)>> = (0..held_elems.len()).map(|_| Vec::new()).collect();
         let mut batch_keys: Vec<u64> = Vec::new();
@@ -214,33 +236,33 @@ where
         let mut moments_scratch: Vec<Rank> = Vec::new();
         let mut pended_scratch: Vec<Rank> = Vec::new();
 
-        while let Some(window) = self.backend.next_window(&instance, &changed, &mut cursor, store) {
-            let p_in = &window.input;
-            let p_out = &window.output;
+        let mut key_moments: Vec<Vec<Rank>> = Vec::new();
+        let mut key_meets: Vec<Option<Rank>> = Vec::new();
+        let mut load_scratch: Vec<(u64, Rank, i64)> = Vec::new();
 
+        while let Some(window) = self.backend.next_window(&instance, &changed, &mut cursor, store) {
             for deltas in tile_deltas.iter_mut() {
                 deltas.clear();
             }
 
-            let mut n_states = 0usize;
-            let (mut is, mut os) = (0usize, 0usize);
-            for &key in &window.keys {
-                while is < p_in.len() && p_in[is].0.0 < key {
-                    is += 1;
+            // PASS 1 — discovery, times only: novel rows' times + the historical distinct
+            // time sets. Produces per-key moments and the meet the presentation may apply.
+            key_moments.clear();
+            key_meets.clear();
+            let mut nv = 0usize;
+            for (ki, &key) in window.keys.iter().enumerate() {
+                while nv < window.novel.len() && window.novel[nv].0.0 < key {
+                    nv += 1;
                 }
-                let i0 = is;
-                while is < p_in.len() && p_in[is].0.0 == key {
-                    is += 1;
+                let v0 = nv;
+                while nv < window.novel.len() && window.novel[nv].0.0 == key {
+                    nv += 1;
                 }
-                let i1 = is;
-                while os < p_out.len() && p_out[os].0.0 < key {
-                    os += 1;
-                }
-                let o0 = os;
-                while os < p_out.len() && p_out[os].0.0 == key {
-                    os += 1;
-                }
-                let o1 = os;
+                let v1 = nv;
+                let hi0 = if ki == 0 { 0 } else { window.hist_in_ends[ki - 1] };
+                let hi1 = window.hist_in_ends[ki];
+                let ho0 = if ki == 0 { 0 } else { window.hist_out_ends[ki - 1] };
+                let ho1 = window.hist_out_ends[ki];
                 while ns < seeds.len() && seeds[ns].0 < key {
                     ns += 1;
                 }
@@ -249,35 +271,65 @@ where
                     ns += 1;
                 }
                 let n1 = ns;
+                while ps < pending_ranks.len() && pending_ranks[ps].0 < key {
+                    ps += 1;
+                }
+                let pending: &[Rank] = match pending_ranks.get(ps) {
+                    Some((k, rs)) if *k == key => &rs[..],
+                    _ => &[],
+                };
 
                 moments_scratch.clear();
                 pended_scratch.clear();
-                {
-                    while ps < pending_ranks.len() && pending_ranks[ps].0 < key {
-                        ps += 1;
-                    }
-                    let pending: &[Rank] = match pending_ranks.get(ps) {
-                        Some((k, rs)) if *k == key => &rs[..],
-                        _ => &[],
-                    };
-                    let seed_times = seeds[n0..n1].iter().map(|(_, t)| *t);
-                    let out_times = (o0..o1).map(|o| p_out[o].1);
-                    rank_discover_times(
-                        RankKeyView { p_in, i0, i1, pending },
-                        seed_times,
-                        out_times,
-                        &upper_ranks,
-                        &mut discover_scratch,
-                        &mut moments_scratch,
-                        &mut pended_scratch,
-                        store,
-                    );
-                }
+                rank_discover_times(
+                    window.hist_in_times[hi0..hi1]
+                        .iter()
+                        .copied()
+                        .chain(window.novel[v0..v1].iter().map(|r| r.1)),
+                    pending,
+                    seeds[n0..n1].iter().map(|(_, t)| *t),
+                    window.hist_out_times[ho0..ho1].iter().copied(),
+                    &upper_ranks,
+                    &mut discover_scratch,
+                    &mut moments_scratch,
+                    &mut pended_scratch,
+                    store,
+                );
                 if !pended_scratch.is_empty() {
                     debug_assert!(new_pending.last().is_none_or(|(k, _)| *k < key));
                     new_pending.push((key, std::mem::take(&mut pended_scratch)));
                 }
                 if moments_scratch.is_empty() {
+                    key_moments.push(Vec::new());
+                    key_meets.push(None);
+                } else {
+                    let mut m = moments_scratch[0];
+                    for &t in &moments_scratch[1..] {
+                        m = store.meet(m, t);
+                    }
+                    key_meets.push(Some(m));
+                    key_moments.push(std::mem::take(&mut moments_scratch));
+                }
+            }
+
+            // PASS 2 — historical rows, netted under each key's meet (backend time logic).
+            let (hist_in, hist_in_ends, hist_out, hist_out_ends) =
+                self.backend.present_historical(&instance, &window, &key_meets, store);
+
+            // PASS 3 — per-key replay state: novel rows in the clear chained with the
+            // netted historical rows, grouped by value for the history load.
+            let mut n_states = 0usize;
+            let mut nv = 0usize;
+            for (ki, &key) in window.keys.iter().enumerate() {
+                while nv < window.novel.len() && window.novel[nv].0.0 < key {
+                    nv += 1;
+                }
+                let v0 = nv;
+                while nv < window.novel.len() && window.novel[nv].0.0 == key {
+                    nv += 1;
+                }
+                let v1 = nv;
+                if key_moments[ki].is_empty() {
                     continue;
                 }
 
@@ -289,27 +341,33 @@ where
                 st.cursor = 0;
                 st.produced.clear();
                 st.moments.clear();
-                st.moments.extend(moments_scratch.drain(..));
+                st.moments.append(&mut key_moments[ki]);
                 st.meets.clear();
                 st.meets.extend(st.moments.iter().copied());
                 for i in (1..st.meets.len()).rev() {
                     let m = st.meets[i];
                     st.meets[i - 1] = store.meet(st.meets[i - 1], m);
                 }
-                if let (Some((presented, netted)), Some(&m0)) = (self.stats.as_mut(), st.meets.first()) {
-                    *presented += (i1 - i0) as u64 + (o1 - o0) as u64;
-                    let mut sc: Vec<((u64, Rank), i64)> = Vec::with_capacity((i1 - i0) + (o1 - o0));
-                    for i in i0..i1 {
-                        sc.push(((p_in[i].0.1, store.join(p_in[i].1, m0)), p_in[i].2));
-                    }
-                    for o in o0..o1 {
-                        sc.push(((p_out[o].0.1, store.join(p_out[o].1, m0)), p_out[o].2));
-                    }
-                    crate::consolidation::consolidate(&mut sc);
-                    *netted += sc.len() as u64;
+
+                let hi0 = if ki == 0 { 0 } else { hist_in_ends[ki - 1] };
+                let hi1 = hist_in_ends[ki];
+                let ho0 = if ki == 0 { 0 } else { hist_out_ends[ki - 1] };
+                let ho1 = hist_out_ends[ki];
+
+                load_scratch.clear();
+                load_scratch.extend(window.novel[v0..v1].iter().map(|r| (r.0.1, r.1, r.2)));
+                load_scratch.extend(hist_in[hi0..hi1].iter().map(|r| (r.0.1, r.1, r.2)));
+                // Group by value (the load's only ordering requirement; time order is the
+                // history's own store-sort).
+                load_scratch.sort_by_key(|r| r.0);
+                if let Some(loaded) = self.stats.as_mut() {
+                    *loaded += (load_scratch.len() + (ho1 - ho0)) as u64;
                 }
-                st.in_replay.load_iter((i0..i1).map(|i| (p_in[i].0.1, p_in[i].1, p_in[i].2)), st.meets.first().copied(), store);
-                st.out_replay.load_iter((o0..o1).map(|o| (p_out[o].0.1, p_out[o].1, p_out[o].2)), st.meets.first().copied(), store);
+                st.in_replay.load_iter(load_scratch.iter().copied(), st.meets.first().copied(), store);
+                load_scratch.clear();
+                load_scratch.extend(hist_out[ho0..ho1].iter().map(|r| (r.0.1, r.1, r.2)));
+                load_scratch.sort_by_key(|r| r.0);
+                st.out_replay.load_iter(load_scratch.iter().copied(), st.meets.first().copied(), store);
                 n_states += 1;
             }
 
