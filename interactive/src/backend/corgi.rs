@@ -313,16 +313,18 @@ impl Backend for CorgiBackend {
     }
 
     fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer) -> Self::Arr<'s> {
-        // CORGI_RANK_REDUCE=1 selects the rank-proxy tactic (times as LaneStore ranks) —
-        // the differential twin of the default int_proxy tactic during bring-up.
-        if std::env::var("CORGI_RANK_REDUCE").is_ok() {
+        // The rank-proxy tactic (times as LaneStore ranks) is the DEFAULT: it swept the
+        // int_proxy tactic on every benchmark, all correctness-checked (see the read-out's
+        // rung-4 sections). CORGI_INT_PROXY_REDUCE=1 selects the owned-time tactic — kept
+        // reachable as the differential-testing reference.
+        if std::env::var("CORGI_INT_PROXY_REDUCE").is_ok() {
+            reduce_with_tactic::<_, CTrace, _>(a, "CorgiReduce", ProxyReduceTactic::new(CorgiReduceBackend::new(reducer.clone())))
+        } else {
             reduce_with_tactic::<_, CTrace, _>(
                 a,
                 "CorgiReduce",
                 differential_dataflow::operators::rank_proxy::RankReduceTactic::new(CorgiReduceBackend::new(reducer.clone())),
             )
-        } else {
-            reduce_with_tactic::<_, CTrace, _>(a, "CorgiReduce", ProxyReduceTactic::new(CorgiReduceBackend::new(reducer.clone())))
         }
     }
 
