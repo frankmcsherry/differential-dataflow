@@ -37,10 +37,6 @@ pub struct MergeBatcher<M: Merger> {
     logger: Option<Logger>,
     /// Timely operator ID.
     operator_id: usize,
-    /// `MERGE_SEAL_STATS=1` diagnostics: per seal, rows entering the ladder drain vs rows
-    /// shipped vs rows kept. `drain/shipped` is the recopy amplification an extract-first
-    /// seal policy would remove (kept residue is re-merged every seal today). On drop.
-    seal_stats: Option<(u64, u64, u64)>,
 }
 
 impl<M> Batcher for MergeBatcher<M>
@@ -59,7 +55,6 @@ where
             stash: Vec::new(),
             frontier: Antichain::new(),
             lower: Antichain::from_elem(M::Time::minimum()),
-            seal_stats: std::env::var("MERGE_SEAL_STATS").is_ok().then_some((0, 0, 0)),
         }
     }
 
@@ -68,9 +63,6 @@ where
     // which we call `lower`, by assumption that after sealing a batcher we receive no more
     // updates with times not greater or equal to `upper`.
     fn seal(&mut self, upper: Antichain<M::Time>) -> (Vec<Self::Output>, Description<M::Time>) {
-        if let Some((drained, _, _)) = self.seal_stats.as_mut() {
-            *drained += self.chains.iter().map(|(w, _)| *w as u64).sum::<u64>();
-        }
         // EXTRACT-FIRST: split each chain by `upper` WITHOUT draining the ladder. Only the
         // shipped parts — delta-sized — need linear (merged, consolidated) form for the
         // builder; the kept residue is re-laddered as-is and copied only at geometric
@@ -91,32 +83,34 @@ where
                 ship_chains.push(ship);
             }
         }
-        // Re-ladder the residue: descending weight, then restore the geometric invariant
-        // (merge the smallest pair while it violates), so chain count stays logarithmic.
+        // Re-ladder the residue through the standard insertion, largest first: each
+        // `insert_chain` cascades tail merges until the geometric invariant holds, and
+        // starting from an empty chain list the invariant is maintained inductively —
+        // a bulk push with a single tail check would not restore it.
         kept_chains.sort_by_key(|c| std::cmp::Reverse(c.iter().map(M::len).sum::<usize>()));
         for kept in kept_chains {
-            self.chain_push(kept);
+            self.insert_chain(kept);
         }
-        while self.chains.len() > 1
-            && self.chains[self.chains.len() - 1].0 >= self.chains[self.chains.len() - 2].0 / 2
-        {
-            let list1 = self.chain_pop().unwrap();
-            let list2 = self.chain_pop().unwrap();
-            let merged = self.merge_by(list1, list2);
-            self.chain_push(merged);
+        // Merge the shipped chains pairwise by LIKE SIZE (smallest pair first), not in
+        // queue order: the readied set is often large — pending updates eventually ship,
+        // and one frontier advance can release a whole residue — so an accumulator fold
+        // would recopy the largest chain once per remaining chain. These merges are also
+        // where cross-chain consolidation of shipped updates happens; equal (data, time)
+        // updates cannot straddle the ship/keep split (it is by time), so this suffices.
+        let mut ship_chains: Vec<(usize, Vec<M::Chunk>)> = ship_chains
+            .into_iter()
+            .map(|c| (c.iter().map(M::len).sum::<usize>(), c))
+            .collect();
+        ship_chains.sort_by_key(|&(w, _)| std::cmp::Reverse(w));
+        while ship_chains.len() > 1 {
+            let (_, a) = ship_chains.pop().unwrap();
+            let (_, b) = ship_chains.pop().unwrap();
+            let merged = self.merge_by(a, b);
+            let w = merged.iter().map(M::len).sum::<usize>();
+            let pos = ship_chains.partition_point(|&(cw, _)| cw > w);
+            ship_chains.insert(pos, (w, merged));
         }
-        // Merge the shipped chains (few, delta-sized) into one consolidated chain — this is
-        // where cross-chain consolidation of shipped updates happens. Equal (data, time)
-        // updates cannot straddle ship/keep (the split is by time), so this suffices.
-        let mut readied = ship_chains.pop().unwrap_or_default();
-        while let Some(other) = ship_chains.pop() {
-            readied = self.merge_by(readied, other);
-        }
-
-        if let Some((_, shipped_n, kept_n)) = self.seal_stats.as_mut() {
-            *shipped_n += readied.iter().map(|c| M::len(c) as u64).sum::<u64>();
-            *kept_n += self.chains.iter().map(|(w, _)| *w as u64).sum::<u64>();
-        }
+        let readied = ship_chains.pop().map(|(_, c)| c).unwrap_or_default();
 
         self.stash.clear();
 
@@ -215,13 +209,6 @@ impl<M: Merger> MergeBatcher<M> {
 
 impl<M: Merger> Drop for MergeBatcher<M> {
     fn drop(&mut self) {
-        if let Some((drained, shipped, kept)) = self.seal_stats {
-            eprintln!(
-                "MERGE_SEAL_STATS op={} drained={drained} shipped={shipped} kept={kept} drain/ship={:.2}",
-                self.operator_id,
-                drained as f64 / shipped.max(1) as f64,
-            );
-        }
         // Cleanup chain to retract accounting information.
         while self.chain_pop().is_some() {}
     }
