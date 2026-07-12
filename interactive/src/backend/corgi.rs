@@ -100,6 +100,52 @@ fn apply_ops(mut c: CC, ops: &[LinearOp], level: usize) -> CC {
                 }
                 c
             }
+            // Columnar EnterAt: the key/val columns are IDENTITY — only times change. Evaluate
+            // the delay field columnar, then adjust each time in place (exactly the row-wise
+            // path's t.join(Product(0, PointStamp([0,..,0, delay]))), without constructing the
+            // delta or round-tripping the columns through rows).
+            LinearOp::EnterAt(field)
+                if {
+                    let shapes = [corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals)];
+                    compilable(field, &shapes)
+                        && matches!(crate::corgi_logic::term_shape(field, &shapes), Some(corgi::Shape::Prim(_)))
+                } =>
+            {
+                let (kshape, vshape) = (corgi::shape_of_value(&c.keys), corgi::shape_of_value(&c.vals));
+                let g = compile_flatmap(field, &kshape, &vshape);
+                let raw = corgi::eval_graph(&g, CValue::Prod(vec![c.keys.clone(), c.vals.clone()])).into_u64("enter_at field");
+                let idx = level.saturating_sub(1);
+                for (t, &r) in c.times.iter_mut().zip(raw.iter()) {
+                    let delay = 256 * (64 - r.leading_zeros() as u64);
+                    let mut coords = std::mem::take(&mut t.inner).into_inner();
+                    if coords.len() <= idx {
+                        coords.resize(idx + 1, 0);
+                    }
+                    coords[idx] = coords[idx].max(delay);
+                    t.inner = PointStamp::new(coords);
+                }
+                c
+            }
+            // Columnar LiftIter: vals gain one integer lane read from each row's iteration
+            // coordinate; keys/times/diffs untouched. (Tuple-shaped vals only; others fall back.)
+            LinearOp::LiftIter
+                if matches!(corgi::shape_of_value(&c.vals), corgi::Shape::Prod(_) | corgi::Shape::Unit) =>
+            {
+                let idx = level.saturating_sub(1);
+                let iters: Vec<u64> = c.times.iter()
+                    .map(|t| t.inner.get(idx).copied().unwrap_or(0))
+                    .collect();
+                let lane = CValue::u64(iters);
+                let vals = match c.vals {
+                    CValue::Prod(mut fields) => {
+                        fields.push(lane);
+                        CValue::Prod(fields)
+                    }
+                    CValue::Unit(_) => CValue::Prod(vec![lane]),
+                    other => unreachable!("LiftIter fast path on non-Prod/Unit vals: {other:?}"),
+                };
+                CorgiContainer { keys: c.keys, vals, times: c.times, diffs: c.diffs }
+            }
             // Row-wise ops (parity with `backend::vec::render_linear`).
             LinearOp::EnterAt(field) => {
                 let mut out: Vec<Upd> = Vec::new();
