@@ -17,7 +17,7 @@
 
 use std::cmp::Ordering;
 
-use columnar::{Borrow, Clear, Columnar, Index, Len, Push};
+use columnar::{Borrow, Clear, Columnar, Container, Index, Len, Push};
 
 use differential_dataflow::lattice::Lattice;
 use timely::progress::Timestamp;
@@ -114,14 +114,12 @@ impl<T: Columnar> ColTimes<T> {
         <T as Columnar>::into_owned(self.store.borrow().get(i))
     }
 
-    /// Append rows `[s, e)` of `other`, pushing `Ref`s straight across — no `T` materialized. The
-    /// range copy used by `emit`/`concat`/merge-suffix.
+    /// Append rows `[s, e)` of `other` as a bulk range copy (`extend_from_self` — the derive
+    /// specializes it to slice memcpys of the flat lanes plus rebased bounds), not a per-row
+    /// `push(Ref)` loop. The range copy used by `emit`/`concat`/seal/chunker append.
     #[inline]
     pub fn push_range(&mut self, other: &ColTimes<T>, s: usize, e: usize) {
-        let b = other.store.borrow();
-        for i in s..e {
-            self.store.push(b.get(i));
-        }
+        self.store.extend_from_self(other.store.borrow(), s..e);
     }
 
     /// Gather rows `idx` into a new column, pushing `Ref`s straight across — no `T` materialized.
