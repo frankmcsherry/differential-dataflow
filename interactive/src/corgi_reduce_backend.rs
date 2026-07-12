@@ -607,6 +607,79 @@ where
 }
 
 
+
+
+/// Key-major concatenation of the chunks' restricted presentation ranges — the rank bridge's
+/// replacement for the k-way merge. The rank tactic's replays re-sort per key and net equal
+/// `(value_id, rank)` records in their buffers, so no cross-chunk merge order (and no
+/// pre-netting) is needed: per changed key, each chunk's matching range is appended whole.
+/// Bucketing is a counting sort over (key index → hits), so there are no per-key allocations
+/// and no per-record compares — the per-record work is four array reads and the pushes.
+fn concat_restricted<T>(
+    pres: &[&Presentation<T>],
+    maps: &[Vec<u32>],
+    diffs: &[&[Diff]],
+    changed: &[u64],
+) -> MergedSide {
+    // Pass 1: per chunk, two-pointer restriction emitting (key index, chunk, lo, hi) hits.
+    let mut hits: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for (c, p) in pres.iter().enumerate() {
+        let khs = &p.khs;
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < khs.len() && j < changed.len() {
+            if khs[i] < changed[j] {
+                i += 1;
+            } else if khs[i] > changed[j] {
+                j += 1;
+            } else {
+                let s = i;
+                while i < khs.len() && khs[i] == changed[j] {
+                    i += 1;
+                }
+                hits.push((j as u32, c as u32, s as u32, i as u32));
+                j += 1;
+            }
+        }
+    }
+    // Pass 2: counting sort of hits by key index (chunk order preserved within a key).
+    let mut counts = vec![0u32; changed.len() + 1];
+    for &(j, ..) in &hits {
+        counts[j as usize + 1] += 1;
+    }
+    for k in 1..counts.len() {
+        counts[k] += counts[k - 1];
+    }
+    let mut ordered: Vec<(u32, u32, u32, u32)> = vec![(0, 0, 0, 0); hits.len()];
+    for &h in &hits {
+        let slot = counts[h.0 as usize];
+        ordered[slot as usize] = h;
+        counts[h.0 as usize] += 1;
+    }
+    // Pass 3: key-major flat rebuild.
+    let total: usize = ordered.iter().map(|&(_, _, lo, hi)| (hi - lo) as usize).sum();
+    let mut out = MergedSide {
+        tags: Vec::with_capacity(total),
+        offs: Vec::with_capacity(total),
+        khs: Vec::with_capacity(total),
+        vids: Vec::with_capacity(total),
+        records: Vec::with_capacity(total),
+    };
+    for &(_, c, lo, hi) in &ordered {
+        let (lo, hi, c) = (lo as usize, hi as usize, c as usize);
+        let p = pres[c];
+        let map = &maps[c];
+        let d = diffs[c];
+        out.khs.extend_from_slice(&p.khs[lo..hi]);
+        out.vids.extend_from_slice(&p.vids[lo..hi]);
+        out.tags.extend(std::iter::repeat(c).take(hi - lo));
+        out.offs.extend(p.perm[lo..hi].iter().map(|&x| x as usize));
+        out.records.extend((lo..hi).map(|i| {
+            ((p.khs[i], p.vids[i]), map[p.tranks[i] as usize], d[p.perm[i] as usize])
+        }));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------------------------
 // The RANK binding: the same backend machinery behind the rank-proxy seam. Times never
 // materialize on the input path — the memoized presentations' interned tables map into the
@@ -665,7 +738,7 @@ impl RankReduceBackend<CBatch<LTime>, CBatch<LTime>> for CorgiReduceBackend<LTim
         let out_maps: Vec<Vec<u32>> = out_pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
 
         let in_diffs: Vec<&[Diff]> = in_chunks.iter().map(|c| c.diffs()).collect();
-        let m_in = merge_presentations(&in_pres, &in_maps, &in_diffs, &keys);
+        let m_in = concat_restricted(&in_pres, &in_maps, &in_diffs, &keys);
         self.in_index = IdMap::default();
         let input = if m_in.khs.is_empty() {
             self.in_vals = CValue::Unit(0);
@@ -684,7 +757,7 @@ impl RankReduceBackend<CBatch<LTime>, CBatch<LTime>> for CorgiReduceBackend<LTim
         };
 
         let o_diffs: Vec<&[Diff]> = out_chunks.iter().map(|c| c.diffs()).collect();
-        let m_out = merge_presentations(&out_pres, &out_maps, &o_diffs, &keys);
+        let m_out = concat_restricted(&out_pres, &out_maps, &o_diffs, &keys);
         let output = if m_out.khs.is_empty() {
             Vec::new()
         } else {
