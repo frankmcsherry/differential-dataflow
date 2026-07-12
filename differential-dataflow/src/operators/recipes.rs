@@ -20,6 +20,8 @@
 //! type is the one representation these helpers still own, and is the intended next
 //! abstraction seam (ranks into a caller-supplied store).
 
+use std::cmp::Ordering;
+
 use timely::progress::{Antichain, Timestamp};
 
 use crate::difference::{Multiply, Semigroup};
@@ -380,4 +382,169 @@ pub fn discover_times<T, RIn>(
         sort_dedup(times_current);
     }
     sort_dedup(pended);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// The TIME STORE: times leave the operator seam as ranks.
+// ---------------------------------------------------------------------------------------------
+
+/// A rank names an interned time within one store (per-retire scope: build, use, `clear`).
+pub type Rank = u32;
+
+/// Interned time algebra: every tactic-side structure holds [`Rank`]s; the store owns the one
+/// canonical value per distinct time and answers order/lattice questions about ranks. This is
+/// the seam that lets a representation specialize (e.g. flat fixed-width lanes for
+/// `Product<u64, PointStamp<u64>>`) without the operator logic knowing what a time is.
+///
+/// Invariants an implementation must uphold:
+/// * rank equality ⟺ time equality (`intern` canonicalizes; the same time never gets two ranks
+///   within one epoch of the store);
+/// * `cmp` agrees with `Self::Time`'s total `Ord`, `le` with its `PartialOrder`;
+/// * `join`/`meet` agree with its `Lattice`, interning their results.
+pub trait TimeStore {
+    /// The represented time type.
+    type Time: Timestamp + Lattice;
+    /// Intern an owned time, returning its rank (stable until `clear`).
+    fn intern(&mut self, t: Self::Time) -> Rank;
+    /// Materialize the time named by a rank (the egress edge — owned, canonical).
+    fn time(&self, r: Rank) -> Self::Time;
+    /// The number of distinct interned times.
+    fn len(&self) -> usize;
+    /// Whether no times are interned.
+    fn is_empty(&self) -> bool { self.len() == 0 }
+    /// Total order on ranks, agreeing with `Time`'s `Ord`.
+    fn cmp_ranks(&self, a: Rank, b: Rank) -> Ordering;
+    /// Partial order on ranks, agreeing with `Time`'s `PartialOrder`.
+    fn le(&self, a: Rank, b: Rank) -> bool;
+    /// Lattice join; the result is interned.
+    fn join(&mut self, a: Rank, b: Rank) -> Rank;
+    /// Lattice meet; the result is interned.
+    fn meet(&mut self, a: Rank, b: Rank) -> Rank;
+    /// Forget everything (capacity retained) — the per-retire reset.
+    fn clear(&mut self);
+}
+
+/// The reference [`TimeStore`]: an owned-`T` table with direct operations — the
+/// differential-testing ORACLE every specialized store must agree with, and a perfectly
+/// serviceable store for time types without a flat specialization.
+pub struct OwnedStore<T> {
+    table: Vec<T>,
+    index: std::collections::HashMap<T, Rank>,
+    join_memo: std::collections::HashMap<(Rank, Rank), Rank>,
+    meet_memo: std::collections::HashMap<(Rank, Rank), Rank>,
+}
+
+impl<T> Default for OwnedStore<T> {
+    fn default() -> Self {
+        OwnedStore {
+            table: Vec::new(),
+            index: std::collections::HashMap::new(),
+            join_memo: std::collections::HashMap::new(),
+            meet_memo: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T> TimeStore for OwnedStore<T>
+where
+    T: Timestamp + Lattice + std::hash::Hash,
+{
+    type Time = T;
+
+    fn intern(&mut self, t: T) -> Rank {
+        if let Some(&r) = self.index.get(&t) {
+            return r;
+        }
+        let r = self.table.len() as Rank;
+        self.index.insert(t.clone(), r);
+        self.table.push(t);
+        r
+    }
+    fn time(&self, r: Rank) -> T {
+        self.table[r as usize].clone()
+    }
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+    fn cmp_ranks(&self, a: Rank, b: Rank) -> Ordering {
+        self.table[a as usize].cmp(&self.table[b as usize])
+    }
+    fn le(&self, a: Rank, b: Rank) -> bool {
+        use timely::PartialOrder;
+        self.table[a as usize].less_equal(&self.table[b as usize])
+    }
+    fn join(&mut self, a: Rank, b: Rank) -> Rank {
+        let key = (a.min(b), a.max(b));
+        if let Some(&r) = self.join_memo.get(&key) {
+            return r;
+        }
+        let j = self.table[a as usize].join(&self.table[b as usize]);
+        let r = self.intern(j);
+        self.join_memo.insert(key, r);
+        r
+    }
+    fn meet(&mut self, a: Rank, b: Rank) -> Rank {
+        let key = (a.min(b), a.max(b));
+        if let Some(&r) = self.meet_memo.get(&key) {
+            return r;
+        }
+        let m = self.table[a as usize].meet(&self.table[b as usize]);
+        let r = self.intern(m);
+        self.meet_memo.insert(key, r);
+        r
+    }
+    fn clear(&mut self) {
+        self.table.clear();
+        self.index.clear();
+        self.join_memo.clear();
+        self.meet_memo.clear();
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::{OwnedStore, TimeStore};
+    use crate::dynamic::pointstamp::PointStamp;
+    use crate::lattice::Lattice;
+    use timely::order::Product;
+    use timely::PartialOrder;
+
+    fn xs(s: &mut u64) -> u64 { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; *s }
+
+    fn random_time(s: &mut u64) -> Product<u64, PointStamp<u64>> {
+        let depth = (xs(s) % 4) as usize; // 0..=3 coords, incl. values that trim
+        let coords: smallvec::SmallVec<[u64; 1]> = (0..depth).map(|_| xs(s) % 3).collect();
+        Product::new(xs(s) % 3, PointStamp::new(coords))
+    }
+
+    /// The oracle obeys its own contract on randomized deep times: intern canonicalizes
+    /// (equal times share a rank), `time` round-trips, and the rank algebra agrees with the
+    /// owned algebra.
+    #[test]
+    fn owned_store_contract() {
+        for seed in 1u64..20 {
+            let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut store: OwnedStore<Product<u64, PointStamp<u64>>> = Default::default();
+            let times: Vec<_> = (0..50).map(|_| random_time(&mut s)).collect();
+            let ranks: Vec<_> = times.iter().map(|t| store.intern(t.clone())).collect();
+            for (t, &r) in times.iter().zip(&ranks) {
+                assert_eq!(store.time(r), *t, "round-trip");
+            }
+            for (i, ti) in times.iter().enumerate() {
+                for (j, tj) in times.iter().enumerate() {
+                    assert_eq!(ranks[i] == ranks[j], ti == tj, "rank eq iff time eq");
+                    assert_eq!(store.cmp_ranks(ranks[i], ranks[j]), ti.cmp(tj), "cmp");
+                    assert_eq!(store.le(ranks[i], ranks[j]), ti.less_equal(tj), "le");
+                    let (ri, rj) = (ranks[i], ranks[j]);
+                    let jr = store.join(ri, rj);
+                    assert_eq!(store.time(jr), ti.join(tj), "join");
+                    let mr = store.meet(ri, rj);
+                    assert_eq!(store.time(mr), ti.meet(tj), "meet");
+                }
+            }
+            store.clear();
+            assert_eq!(store.len(), 0);
+        }
+    }
 }
