@@ -223,7 +223,40 @@ where
     let khs: Vec<u64> = perm.iter().map(|&i| kh[i as usize]).collect();
     let vids: Vec<u64> = perm.iter().map(|&i| vid[i as usize]).collect();
     let tranks: Vec<u32> = perm.iter().map(|&i| rank[tfirst[i as usize] as usize]).collect();
-    Presentation { perm, khs, vids, tranks, times }
+    // Key-group index + per-group distinct tranks (paid once per immutable chunk; the
+    // two-phase reduce window reads these instead of scanning rows every retire).
+    let mut gkeys: Vec<u64> = Vec::new();
+    let mut gends: Vec<u32> = Vec::new();
+    let mut gtimes: Vec<u32> = Vec::new();
+    let mut gtends: Vec<u32> = Vec::new();
+    let mut i = 0usize;
+    while i < khs.len() {
+        let start = i;
+        while i < khs.len() && khs[i] == khs[start] {
+            i += 1;
+        }
+        gkeys.push(khs[start]);
+        gends.push(i as u32);
+        let tstart = gtimes.len();
+        let mut last = u32::MAX;
+        for r in start..i {
+            if tranks[r] != last {
+                last = tranks[r];
+                gtimes.push(tranks[r]);
+            }
+        }
+        gtimes[tstart..].sort_unstable();
+        let mut w = tstart;
+        for r in tstart..gtimes.len() {
+            if w == tstart || gtimes[r] != gtimes[w - 1] {
+                gtimes[w] = gtimes[r];
+                w += 1;
+            }
+        }
+        gtimes.truncate(w);
+        gtends.push(gtimes.len() as u32);
+    }
+    Presentation { perm, khs, vids, tranks, times, gkeys, gends, gtimes, gtends }
 }
 
 /// One side's merged presentation: gather coordinates + per-record ids (aligned, pre-netting,
@@ -735,27 +768,28 @@ fn hist_time_sets(
     let maps: Vec<Vec<u32>> =
         pres.iter().map(|p| p.times.iter().map(|t| store.intern(t.clone())).collect()).collect();
 
-    // Hits: per chunk, two-pointer restriction (the concat_restricted pass-1 shape).
+    // Hits: per chunk, two-pointer over the memoized KEY GROUPS (not rows) — a hit carries
+    // the group's row range plus its group index (for the memoized per-group time sets).
     let mut hits: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut hit_groups: Vec<u32> = Vec::new();
     for (c, p) in pres.iter().enumerate() {
-        let khs = &p.khs;
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < khs.len() && j < keys.len() {
-            if khs[i] < keys[j] {
-                i += 1;
-            } else if khs[i] > keys[j] {
+        let gk = &p.gkeys;
+        let (mut g, mut j) = (0usize, 0usize);
+        while g < gk.len() && j < keys.len() {
+            if gk[g] < keys[j] {
+                g += 1;
+            } else if gk[g] > keys[j] {
                 j += 1;
             } else {
-                let s = i;
-                while i < khs.len() && khs[i] == keys[j] {
-                    i += 1;
-                }
-                hits.push((j as u32, c as u32, s as u32, i as u32));
+                let lo = if g == 0 { 0 } else { p.gends[g - 1] };
+                hits.push((j as u32, c as u32, lo, p.gends[g]));
+                hit_groups.push(g as u32);
+                g += 1;
                 j += 1;
             }
         }
     }
-    // Counting sort by key index (chunk order preserved within a key).
+    // Counting sort by key index (chunk order preserved within a key), carrying group ids.
     let mut counts = vec![0u32; keys.len() + 1];
     for &(j, ..) in &hits {
         counts[j as usize + 1] += 1;
@@ -764,31 +798,28 @@ fn hist_time_sets(
         counts[k] += counts[k - 1];
     }
     let mut ordered: Vec<(u32, u32, u32, u32)> = vec![(0, 0, 0, 0); hits.len()];
-    for &h in &hits {
+    let mut ordered_groups: Vec<u32> = vec![0; hits.len()];
+    for (hi, &h) in hits.iter().enumerate() {
         let slot = counts[h.0 as usize];
         ordered[slot as usize] = h;
+        ordered_groups[slot as usize] = hit_groups[hi];
         counts[h.0 as usize] += 1;
     }
 
-    // Distinct store ranks per key: a seen-stamp per chunk time-table entry (tables are tiny).
-    let mut seen: Vec<Vec<u32>> = pres.iter().map(|p| vec![u32::MAX; p.times.len()]).collect();
+    // Per-key time sets straight from the memoized per-group distinct tranks — table-sized
+    // work, no row scans (cross-chunk duplicates tolerated; discovery handles multiplicity).
     let mut times: Vec<Rank> = Vec::new();
     let mut ends: Vec<usize> = Vec::with_capacity(keys.len());
     let mut h = 0usize;
     for ki in 0..keys.len() {
         while h < ordered.len() && ordered[h].0 as usize == ki {
-            let (_, c, lo, hi) = ordered[h];
-            let (c, lo, hi) = (c as usize, lo as usize, hi as usize);
+            let c = ordered[h].1 as usize;
+            let g = ordered_groups[h] as usize;
             let p = pres[c];
             let map = &maps[c];
-            let stamp = &mut seen[c];
-            for i in lo..hi {
-                let t = p.tranks[i] as usize;
-                if stamp[t] != ki as u32 {
-                    stamp[t] = ki as u32;
-                    times.push(map[t]);
-                }
-            }
+            let t0 = if g == 0 { 0 } else { p.gtends[g - 1] as usize };
+            let t1 = p.gtends[g] as usize;
+            times.extend(p.gtimes[t0..t1].iter().map(|&tr| map[tr as usize]));
             h += 1;
         }
         ends.push(times.len());

@@ -77,6 +77,15 @@ pub struct Presentation<T> {
     pub tranks: Vec<u32>,
     /// The chunk's distinct times, ascending.
     pub times: Vec<T>,
+    /// Distinct key hashes, one per key group, ascending (the group axis of the fields below).
+    pub gkeys: Vec<u64>,
+    /// Exclusive ROW ends per key group (into `khs`/`vids`/`tranks`/`perm`).
+    pub gends: Vec<u32>,
+    /// Distinct `tranks` per key group, concatenated, ascending within each group — the
+    /// memoized per-key time sets the two-phase reduce window reads instead of scanning rows.
+    pub gtimes: Vec<u32>,
+    /// Exclusive ends into `gtimes` per key group.
+    pub gtends: Vec<u32>,
 }
 
 /// A sorted, consolidated run of `((key, val), time, diff)` with corgi-columnar key/val, shared via `Rc`.
