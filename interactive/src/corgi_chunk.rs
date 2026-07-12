@@ -326,13 +326,26 @@ where
             };
             if keep_i { ki.push(i); } else { si.push(i); }
         }
-        if !ki.is_empty() {
+        // Uniform chunks pass through INTACT — no gather, no rebuild. Under extract-first
+        // sealing the long-lived residue is all-keep almost every seal, so this fast path
+        // reduces its per-seal cost to the verdict scan.
+        if si.is_empty() {
+            drop((ki, si));
+            keep.push_back(chunk);
+            return;
+        }
+        if ki.is_empty() {
+            drop((ki, si));
+            ship.push_back(chunk);
+            return;
+        }
+        {
             let mut t = ColTimes::new();
             for &i in &ki { t.push_ref(times, i); }
             let d: Vec<R> = ki.iter().map(|&i| diffs[i].clone()).collect();
             keep.push_back(Self::from_kv(gather(&kv, &ki), t, d));
         }
-        if !si.is_empty() {
+        {
             let mut t = ColTimes::new();
             for &i in &si { t.push_ref(times, i); }
             let d: Vec<R> = si.iter().map(|&i| diffs[i].clone()).collect();
