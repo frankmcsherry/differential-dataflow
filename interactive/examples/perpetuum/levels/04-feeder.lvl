@@ -1,0 +1,24 @@
+# Level 4: a feeder tail into a ring (a merge junction: 52 and 63 both
+# feed 60), plus a 3-ring. The tail component rests at 4, 5, 6 or 7 items
+# (ring full, plus a contiguous suffix of the tail pressed against it).
+# 7 items, and 7 = 4 + 3: fix the counts and let the machine settle itself.
+name The Feeder
+blurb A feeder belt presses into a ring; a junction chooses who enters.
+blurb This machine can rest holding 4, 5, 6 or 7 items — the ring full,
+blurb and a queue leaning on it. You have one move. Fix the arithmetic;
+blurb the machine will do its own settling, and the meter will show you
+blurb what settling costs.
+
+chain 50 51 52 60
+cycle 60 61 62 63
+cycle 70 71 72
+
+items 50 51 52 60 61
+items 70 71
+
+mv 1
+par 18
+
+row tail 50 51 52
+row ring 60 61 62 63
+row spare 70 71 72

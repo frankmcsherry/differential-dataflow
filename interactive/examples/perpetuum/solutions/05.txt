@@ -1,0 +1,7 @@
+cut 13 14
+cut 16 10
+link 13 10
+link 16 14
+mv 14 13
+mv 15 4
+mv 16 5

@@ -1,0 +1,4 @@
+let succ = input 0 | key($0[0] ; $0[1]);
+let occ  = input 1 | key($0[0] ;);
+let oc   = occ | join(succ, ($2 ; $0)) | join(occ, ($1 ; $0));
+export "result" = oc | key($0, $1 ;) | arrange;

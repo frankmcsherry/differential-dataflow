@@ -1,0 +1,21 @@
+# Level 2: three rings (3, 4, 6), nine items. Rings rest full or empty,
+# so stillness is arithmetic: 9 = 3 + 6, and no other way.
+name Change Machine
+blurb Three belts of sizes 3, 4 and 6, and nine items that must go somewhere.
+blurb A ring is silent only when full or empty, so you are really being asked
+blurb to write 9 as a sum of ring sizes. There is only one way.
+
+cycle 20 21 22
+cycle 30 31 32 33
+cycle 40 41 42 43 44 45
+
+items 20 21
+items 30 31 32
+items 40 41 42 43
+
+mv 3
+par 6
+
+row three 20 21 22
+row four 30 31 32 33
+row six 40 41 42 43 44 45

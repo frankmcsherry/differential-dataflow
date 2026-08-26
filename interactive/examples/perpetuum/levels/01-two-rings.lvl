@@ -1,0 +1,19 @@
+# Level 1: two rings, five items. A ring with a gap churns forever
+# (the bubble circulates); a full ring is silent. 5 = 5 + 0.
+name Two Rings
+blurb Two belts, five items, and no way to be rid of any of them.
+blurb A ring with a gap never rests: the gap itself circles forever, and the
+blurb machine pays for every lap. Watch it with `t 10` if you like — the
+blurb energy meter is watching too. Rings only rest full, or empty.
+
+cycle 0 1 2 3 4
+cycle 10 11 12
+
+items 0 1 2
+items 10 11
+
+mv 2
+par 4
+
+row big 0 1 2 3 4
+row small 10 11 12

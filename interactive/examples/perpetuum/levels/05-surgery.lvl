@@ -1,0 +1,25 @@
+# Level 5: rings of 6 and 7, ten items. No subset of {6, 7} sums to 10:
+# as built, this machine CANNOT rest. It must be re-plumbed — cut and
+# re-link belts into cycles whose sizes can absorb exactly ten items.
+# One good plan: split the 7 into 4 + 3, then fill the 6 and the 4.
+# The win requires every cell keeps an out-edge: a cut that just dead-ends
+# a belt makes a jam, and a jam is not a fixed point of a whole machine.
+name Surgery
+blurb Six-belt, seven-belt, ten items. 6 can't hold them; 6+7 won't fill.
+blurb As built, this machine has NO resting state — the fix is not placement
+blurb but plumbing. Cut belts and re-link them into shapes whose sums work.
+blurb Loose ends don't count as rest: every cell must keep its out-edge.
+
+cycle 0 1 2 3 4 5
+cycle 10 11 12 13 14 15 16
+
+items 0 1 2 3
+items 10 11 12 14 15 16
+
+mv 3
+cut 3
+link 3
+par 10
+
+row six 0 1 2 3 4 5
+row seven 10 11 12 13 14 15 16
