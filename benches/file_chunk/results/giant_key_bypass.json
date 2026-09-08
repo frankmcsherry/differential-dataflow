@@ -1,0 +1,20 @@
+{
+  "case": "giant_key_bypass",
+  "command": [
+    "/Users/mcsherry/Projects/dd-file-chunk-spike/target/release/examples/file_chunk_spike",
+    "100",
+    "2097152",
+    "2",
+    "1",
+    "0",
+    "--nocache"
+  ],
+  "exit_code": -9,
+  "stopped_by": "rss_watchdog",
+  "elapsed_s": 4.33,
+  "sampled_peak_rss_kib": 156288,
+  "kernel_peak_rss_kib": 156288.0,
+  "watchdog_mib": 128,
+  "verified": false,
+  "log": "benches/file_chunk/results/giant_key_bypass.log"
+}

@@ -1,0 +1,20 @@
+{
+  "case": "medium_bypass",
+  "command": [
+    "/Users/mcsherry/Projects/dd-file-chunk-spike/target/release/examples/file_chunk_spike",
+    "1048576",
+    "16",
+    "6",
+    "10485",
+    "0",
+    "--nocache"
+  ],
+  "exit_code": 0,
+  "stopped_by": null,
+  "elapsed_s": 3.114,
+  "sampled_peak_rss_kib": 29328,
+  "kernel_peak_rss_kib": 29328.0,
+  "watchdog_mib": 128,
+  "verified": true,
+  "log": "benches/file_chunk/results/medium_bypass.log"
+}

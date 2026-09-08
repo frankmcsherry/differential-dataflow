@@ -1,0 +1,14 @@
+build keys=1048576 fanout=16 records=16777216 hot=10485 capacity=178246 nocache=true elapsed_ms=323 rss_kib=3440 file_bytes=411500544 writes=2048
+round=0 elapsed_us=459755 rss_kib=35664 reads=2048 read_bytes=411500544 writes=0 active_keys=10485 calls=1
+round=1 elapsed_us=7105 rss_kib=35824 reads=0 read_bytes=0 writes=0 active_keys=0 calls=2
+round=2 elapsed_us=7852 rss_kib=35920 reads=0 read_bytes=0 writes=0 active_keys=10485 calls=3
+round=3 elapsed_us=7367 rss_kib=35968 reads=0 read_bytes=0 writes=0 active_keys=0 calls=4
+round=4 elapsed_us=7799 rss_kib=35984 reads=0 read_bytes=0 writes=0 active_keys=10485 calls=5
+round=5 elapsed_us=7412 rss_kib=36000 reads=0 read_bytes=0 writes=0 active_keys=0 calls=6
+round=6 elapsed_us=7807 rss_kib=36000 reads=0 read_bytes=0 writes=0 active_keys=10485 calls=7
+round=7 elapsed_us=7477 rss_kib=36000 reads=0 read_bytes=0 writes=0 active_keys=0 calls=8
+round=8 elapsed_us=7658 rss_kib=36032 reads=0 read_bytes=0 writes=0 active_keys=10485 calls=9
+round=9 elapsed_us=7438 rss_kib=36048 reads=0 read_bytes=0 writes=0 active_keys=0 calls=10
+round=10 elapsed_us=7666 rss_kib=36064 reads=0 read_bytes=0 writes=0 active_keys=10485 calls=11
+round=11 elapsed_us=7252 rss_kib=36080 reads=0 read_bytes=0 writes=0 active_keys=0 calls=12
+verified rounds=12 rss_kib=36096 file_bytes=0 total_read_bytes=411500544

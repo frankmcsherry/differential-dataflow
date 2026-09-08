@@ -1,0 +1,34 @@
+   Compiling differential-dataflow v0.25.1 (/Users/mcsherry/Projects/dd-file-chunk-spike/differential-dataflow)
+    Finished `release` profile [optimized + debuginfo] target(s) in 4.15s
+     Running tests/key_cache.rs (target/release/deps/key_cache-cb44d8c3197aff52)
+
+running 9 tests
+test a_vanished_batch_can_cancel_a_cached_prefix ... ok
+test preserves_history_and_reads_only_requested_keys ... ok
+test wraps_a_real_chunk_spine ... ok
+test capacity_accounts_for_absent_keys_and_bypasses_oversized_results ... ok
+test compaction_crossing_a_cached_upper_does_not_double_count ... ok
+test cursor_free_chunks_support_antichain_coverage ... ok
+test paged_reads_reuse_overlapping_selections_and_fetch_only_new_batches ... ok
+test large_keys_straddle_chunks_and_pack_without_losing_history ... ok
+test columnar_selection_copies_string_keys_and_straddling_value_histories ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/file_chunk_spike.rs (target/release/examples/file_chunk_spike-cbcecbe44862d3ab)
+
+running 6 tests
+test storage::tests::advance_single_group_split_across_chunks ... ok
+test storage::tests::settle_existing_full_chunks_without_io ... ok
+test storage::tests::file_roundtrip_selection_and_reclamation ... ok
+test storage::tests::file_spine_cache_reads_only_new_suffix_and_survives_compaction ... ok
+test storage::tests::batcher_merge_and_extract_match_independent_oracle ... ok
+test storage::tests::fueled_batch_merge_advances_and_cancels_across_file_boundaries ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests examples/key_cache_bench.rs (target/release/examples/key_cache_bench-e1c10f4f83bd40ac)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

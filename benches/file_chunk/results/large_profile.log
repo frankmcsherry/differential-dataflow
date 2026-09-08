@@ -1,0 +1,26 @@
+build keys=4194304 fanout=16 records=67108864 hot=41943 capacity=713032 nocache=true elapsed_ms=1282 rss_kib=3936 file_bytes=1646002176 writes=8192
+selected call=1 rss_kib=48240 charge=713032 chunks=82
+round=0 elapsed_us=1837004 rss_kib=86304 reads=8192 read_bytes=1646002176 writes=0 active_keys=41943 calls=1
+selected call=2 rss_kib=86544 charge=713032 chunks=82
+round=1 elapsed_us=32693 rss_kib=86944 reads=0 read_bytes=0 writes=0 active_keys=0 calls=2
+selected call=3 rss_kib=86944 charge=713032 chunks=82
+round=2 elapsed_us=35524 rss_kib=87008 reads=0 read_bytes=0 writes=0 active_keys=41943 calls=3
+selected call=4 rss_kib=87184 charge=713032 chunks=82
+round=3 elapsed_us=33688 rss_kib=87840 reads=0 read_bytes=0 writes=0 active_keys=0 calls=4
+selected call=5 rss_kib=87856 charge=713032 chunks=82
+round=4 elapsed_us=34796 rss_kib=88016 reads=0 read_bytes=0 writes=0 active_keys=41943 calls=5
+selected call=6 rss_kib=88016 charge=713032 chunks=82
+round=5 elapsed_us=33840 rss_kib=88080 reads=0 read_bytes=0 writes=0 active_keys=0 calls=6
+selected call=7 rss_kib=88080 charge=713032 chunks=82
+round=6 elapsed_us=34944 rss_kib=88080 reads=0 read_bytes=0 writes=0 active_keys=41943 calls=7
+selected call=8 rss_kib=88080 charge=713032 chunks=82
+round=7 elapsed_us=33839 rss_kib=88096 reads=0 read_bytes=0 writes=0 active_keys=0 calls=8
+selected call=9 rss_kib=88112 charge=713032 chunks=82
+round=8 elapsed_us=35759 rss_kib=88112 reads=0 read_bytes=0 writes=0 active_keys=41943 calls=9
+selected call=10 rss_kib=88144 charge=713032 chunks=82
+round=9 elapsed_us=34074 rss_kib=88144 reads=0 read_bytes=0 writes=0 active_keys=0 calls=10
+selected call=11 rss_kib=88144 charge=713032 chunks=82
+round=10 elapsed_us=34950 rss_kib=88192 reads=0 read_bytes=0 writes=0 active_keys=41943 calls=11
+selected call=12 rss_kib=88192 charge=713032 chunks=82
+round=11 elapsed_us=33217 rss_kib=88192 reads=0 read_bytes=0 writes=0 active_keys=0 calls=12
+verified rounds=12 rss_kib=88240 file_bytes=0 total_read_bytes=1646002176

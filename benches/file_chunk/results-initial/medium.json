@@ -1,0 +1,20 @@
+{
+  "case": "medium",
+  "command": [
+    "/Users/mcsherry/Projects/dd-file-chunk-spike/target/release/examples/file_chunk_spike",
+    "1048576",
+    "16",
+    "12",
+    "10485",
+    "178246",
+    "--nocache"
+  ],
+  "exit_code": 0,
+  "stopped_by": null,
+  "elapsed_s": 0.907,
+  "sampled_peak_rss_kib": 36000,
+  "kernel_peak_rss_kib": 36096.0,
+  "watchdog_mib": 128,
+  "verified": true,
+  "log": "benches/file_chunk/results/medium.log"
+}
