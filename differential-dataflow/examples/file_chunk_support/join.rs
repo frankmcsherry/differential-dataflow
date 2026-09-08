@@ -8,7 +8,7 @@ use differential_dataflow::operators::join::{Fresh, JoinTactic};
 use differential_dataflow::trace::chunk::ChunkBatch;
 use differential_dataflow::trace::implementations::ValSpine;
 use differential_dataflow::trace::wrappers::cached::CachedTrace;
-use differential_dataflow::trace::{Cursor, Navigable, TraceReader};
+use differential_dataflow::trace::{Cursor, Navigable, Span, TraceReader};
 use timely::progress::{frontier::AntichainRef, Antichain};
 
 pub type Batch = Rc<ChunkBatch<DiskChunk>>;
@@ -16,14 +16,14 @@ type QueryBatch = <ValSpine<u64, u64, u64, i64> as TraceReader>::Batch;
 
 #[derive(Clone)]
 pub struct StaticTrace {
-    pub batch: Batch,
+    pub span: Span<u64, Batch>,
     logical: Antichain<u64>,
     physical: Antichain<u64>,
 }
 impl StaticTrace {
-    pub fn new(batch: Batch) -> Self {
+    pub fn new(span: Span<u64, Batch>) -> Self {
         Self {
-            batch,
+            span,
             logical: Antichain::from_elem(0),
             physical: Antichain::from_elem(0),
         }
@@ -32,11 +32,11 @@ impl StaticTrace {
 impl TraceReader for StaticTrace {
     type Time = u64;
     type Batch = Batch;
-    fn batches_through(&mut self, upper: AntichainRef<u64>) -> Option<Vec<Batch>> {
+    fn spans_through(&mut self, upper: AntichainRef<u64>) -> Option<Vec<Span<u64, Batch>>> {
         if upper.less_equal(&0) {
             Some(Vec::new())
         } else if upper.is_empty() {
-            Some(vec![Rc::clone(&self.batch)])
+            Some(vec![self.span.clone()])
         } else {
             None
         }
@@ -53,8 +53,8 @@ impl TraceReader for StaticTrace {
     fn get_physical_compaction(&mut self) -> AntichainRef<'_, u64> {
         self.physical.borrow()
     }
-    fn map_batches<F: FnMut(&Batch)>(&self, mut f: F) {
-        f(&self.batch);
+    fn map_spans<F: FnMut(&Span<u64, Batch>)>(&self, mut f: F) {
+        f(&self.span);
     }
 }
 
@@ -72,7 +72,7 @@ impl Tactic {
         }
     }
 }
-impl JoinTactic<Batch, QueryBatch, Vec<(u64, u64, i64)>> for Tactic {
+impl JoinTactic<u64, Batch, QueryBatch, Vec<(u64, u64, i64)>> for Tactic {
     fn prep(
         &mut self,
         source: Vec<Batch>,
@@ -89,7 +89,10 @@ impl JoinTactic<Batch, QueryBatch, Vec<(u64, u64, i64)>> for Tactic {
             "changing the cold side needs a symmetric tactic"
         );
         assert_eq!(source.len(), 1);
-        assert!(Rc::ptr_eq(&source[0], &self.cache.inner().batch));
+        assert!(Rc::ptr_eq(
+            &source[0],
+            self.cache.inner().span.inner.as_ref().unwrap()
+        ));
         let mut queries: BTreeMap<u64, Vec<(u64, i64)>> = BTreeMap::new();
         for batch in query {
             let mut c = batch.cursor();
@@ -107,7 +110,7 @@ impl JoinTactic<Batch, QueryBatch, Vec<(u64, u64, i64)>> for Tactic {
         let keys: Vec<_> = queries.keys().copied().collect();
         let selected = self
             .cache
-            .batch_through_keys(AntichainRef::new(&[]), &keys)
+            .span_through_keys(AntichainRef::new(&[]), &keys)
             .unwrap();
         self.calls.set(self.calls.get() + 1);
         if self.profile {
@@ -116,11 +119,15 @@ impl JoinTactic<Batch, QueryBatch, Vec<(u64, u64, i64)>> for Tactic {
                 self.calls.get(),
                 super::rss_kib(),
                 self.cache.charge(),
-                selected.chunks.len()
+                selected.inner.as_ref().map_or(0, |b| b.chunks.len())
             );
         }
         Box::new(JoinOutput {
-            chunks: selected.chunks.clone().into_iter(),
+            chunks: selected
+                .inner
+                .as_ref()
+                .map_or_else(Vec::new, |b| b.chunks.clone())
+                .into_iter(),
             rows: Vec::new().into_iter(),
             current: None,
             index: 0,

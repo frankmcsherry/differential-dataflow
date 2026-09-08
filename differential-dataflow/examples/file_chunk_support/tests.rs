@@ -1,8 +1,9 @@
 use super::*;
+use differential_dataflow::batcher::merge::Merger as BatcherMerger;
 use differential_dataflow::columnar::updates::UpdatesTyped;
 use differential_dataflow::trace::chunk::{ChunkBatch, ChunkBatchMerger, ChunkMerger};
-use differential_dataflow::trace::implementations::merge_batcher::Merger as BatcherMerger;
-use differential_dataflow::trace::{Description, Merger};
+use differential_dataflow::trace::implementations::spine_fueled::Merger;
+use differential_dataflow::trace::Description;
 use timely::container::PushInto;
 
 type Row = ((u64, u64), u64, i64);
@@ -150,22 +151,8 @@ fn fueled_batch_merge_advances_and_cancels_across_file_boundaries() {
         .flat_map(|k| [((k, 0), 2, -3), ((k, 1), 3, 1)])
         .collect();
     let expected = consolidated(left.iter().chain(&right).map(|&(d, t, r)| (d, t.max(4), r)));
-    let a = ChunkBatch::new(
-        chunks(&left, 601),
-        Description::new(
-            Antichain::from_elem(0),
-            Antichain::from_elem(2),
-            Antichain::from_elem(0),
-        ),
-    );
-    let b = ChunkBatch::new(
-        chunks(&right, 399),
-        Description::new(
-            Antichain::from_elem(2),
-            Antichain::from_elem(4),
-            Antichain::from_elem(0),
-        ),
-    );
+    let a = ChunkBatch::new(chunks(&left, 601));
+    let b = ChunkBatch::new(chunks(&right, 399));
     let mut merger = ChunkBatchMerger::new(&a, &b, AntichainRef::new(&[4]));
     loop {
         let mut fuel = 100;
@@ -174,7 +161,7 @@ fn fueled_batch_merge_advances_and_cancels_across_file_boundaries() {
             break;
         }
     }
-    let merged = merger.done();
+    let merged = merger.done().unwrap();
     graded(&merged.chunks);
     assert_eq!(flatten(&merged.chunks), expected);
     uninstall();
@@ -208,30 +195,30 @@ fn file_spine_cache_reads_only_new_suffix_and_survives_compaction() {
     let (trace, mut writer) = TraceAgent::new(spine, info, None);
     let batch = |time, diff| {
         let data: Vec<_> = (0..20_000).map(|k| ((k, 0), time, diff)).collect();
-        Rc::new(ChunkBatch::new(
+        make_span(
             chunks(&data, DiskChunk::TARGET),
             Description::new(
                 Antichain::from_elem(time),
                 Antichain::from_elem(time + 1),
                 Antichain::from_elem(0),
             ),
-        ))
+        )
     };
-    writer.insert(batch(0, 1), None);
+    writer.insert(batch(0, 1), Default::default());
     let mut cache = CachedTrace::new(trace, 100);
     let first = cache
-        .batch_through_keys(AntichainRef::new(&[]), &[1, 19_999])
+        .span_through_keys(AntichainRef::new(&[]), &[1, 19_999])
         .unwrap();
     assert_eq!(stats.reads.get(), 2);
     let hit = cache
-        .batch_through_keys(AntichainRef::new(&[]), &[19_999, 1])
+        .span_through_keys(AntichainRef::new(&[]), &[19_999, 1])
         .unwrap();
     assert!(Rc::ptr_eq(&first, &hit));
     assert_eq!(stats.reads.get(), 2);
-    writer.insert(batch(1, -1), None);
+    writer.insert(batch(1, -1), Default::default());
     let before = stats.reads.get();
     let extended = cache
-        .batch_through_keys(AntichainRef::new(&[]), &[1, 19_999])
+        .span_through_keys(AntichainRef::new(&[]), &[1, 19_999])
         .unwrap();
     assert_eq!(
         stats.reads.get() - before,
@@ -239,7 +226,7 @@ fn file_spine_cache_reads_only_new_suffix_and_survives_compaction() {
         "read only the two intersecting chunks in the new batch"
     );
     assert_eq!(
-        flatten(&extended.chunks),
+        flatten(&extended.inner.as_ref().unwrap().chunks),
         vec![
             ((1, 0), 0, 1),
             ((1, 0), 1, -1),
@@ -251,11 +238,28 @@ fn file_spine_cache_reads_only_new_suffix_and_survives_compaction() {
     cache.set_logical_compaction(AntichainRef::new(&[2]));
     cache.set_physical_compaction(AntichainRef::new(&[2]));
     let compacted = cache
-        .batch_through_keys(AntichainRef::new(&[]), &[1, 2, 19_999])
+        .span_through_keys(AntichainRef::new(&[]), &[1, 2, 19_999])
         .unwrap();
     assert_eq!(
-        flatten(&compacted.chunks).iter().map(|r| r.2).sum::<i64>(),
+        compacted
+            .inner
+            .iter()
+            .flat_map(|b| flatten(&b.chunks))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|r| r.2)
+            .sum::<i64>(),
         0
     );
     uninstall();
+}
+
+fn make_span<C: differential_dataflow::trace::chunk::Chunk>(
+    chunks: Vec<C>,
+    desc: differential_dataflow::trace::Description<C::Time>,
+) -> differential_dataflow::trace::Span<C::Time, Rc<ChunkBatch<C>>> {
+    differential_dataflow::trace::Span::new(
+        desc,
+        (!chunks.is_empty()).then(|| Rc::new(ChunkBatch::new(chunks))),
+    )
 }

@@ -13,24 +13,32 @@ join, or a hard memory bound for arbitrary key histories.
 
 ## Location and reproduction
 
-Checkpoint branch: `file-chunk-spike` in
-[`frankmcsherry/differential-dataflow`](https://github.com/frankmcsherry/differential-dataflow/tree/file-chunk-spike),
-based on `c9824fb8`. The local worktree is
-`/Users/mcsherry/Projects/dd-file-chunk-spike`. The key-cache prototype and its
-earlier benchmarks were copied from `dd-key-cache`; that worktree and the
-original source worktree were not edited. This is a research checkpoint, not
-a proposed production change.
+PR branch: `file-chunk-spike-master-next` in
+[`frankmcsherry/differential-dataflow`](https://github.com/frankmcsherry/differential-dataflow/tree/file-chunk-spike-master-next),
+based on `TimelyDataflow/differential-dataflow:master-next` at `75fba2b9`.
+The local PR worktree is `/Users/mcsherry/Projects/dd-file-chunk-pr`.
+This is a research checkpoint, not a proposed production change.
 
-The checkpoint separates the key-cache prototype from the file-backed spike.
-Earlier cache measurements are in
-[key_cache/README.md](../../differential-dataflow/benches/key_cache/README.md).
+The original measured checkpoint remains at
+[`file-chunk-spike` / `3fecff64`](https://github.com/frankmcsherry/differential-dataflow/tree/3fecff64),
+based on `c9824fb8`. The large-run numbers in this report and the
+`results` / `results-initial` folders come from that checkpoint, **not a new
+performance measurement of the master-next port**. The PR branch adapts the code
+to spans carrying descriptions separately from optional batch payloads, updated
+join tactic signatures, and relocated merger traits. The selected-read method
+is now `span_through_keys`; update-free results carry `inner: None`.
+
+The first two commits preserve the key-cache prototype and file-backed spike;
+a follow-up commit ports them to the current APIs. Earlier cache measurements
+are in [key_cache/README.md](../../differential-dataflow/benches/key_cache/README.md).
 The wrapper's decode/selection code and the custom join tactic are example
-support code, not additions to the public library API.
+support code, not additions to the public library API. The original source
+and cache worktrees remain unchanged.
 
 From this worktree, with Cargo on PATH:
 
 ```sh
-cp benches/file_chunk/Cargo.lock Cargo.lock # Restore the measured dependency snapshot in a fresh checkout.
+cp benches/file_chunk/Cargo.lock Cargo.lock # Restore the dependency snapshot for the master-next port in a fresh checkout.
 cargo build --release -p differential-dataflow --example file_chunk_spike --locked
 cargo test --release -p differential-dataflow --example file_chunk_spike --test key_cache --locked
 python3 benches/file_chunk/run.py --case all --memory-mib 128
@@ -98,7 +106,7 @@ the current `--nocache` implementation is macOS-specific.
   Retractions must remove the previous counts completely. Probe advancement
   is included in the timings; initial source construction is logged separately.
 
-The spike adds about 790 formatted Rust lines for storage, tactic, and example,
+At the original checkpoint, the spike added about 790 formatted Rust lines for storage, tactic, and example,
 plus 261 test lines and the Python runner, on top of the copied key cache.
 
 ## Measurements
@@ -172,11 +180,11 @@ when retention is disabled.
    to scan input chunks in key order, release decoded inputs as it advances,
    carry incomplete key groups, and settle/spill output incrementally. Use
    keyed cached reads for later sparse updates. There is no automatic
-   unrestricted-read bypass in `batch_through_keys`: an empty key list selects
+   unrestricted-read bypass in `span_through_keys`: an empty key list selects
    nothing, and requesting all keys materializes all selected data. A streaming
    scan can instead consume shared source batch handles. A single huge key may
    still require spillable reducer state.
-2. **Stream selected results under a byte budget.** `batch_through_keys` returns
+2. **Stream selected results under a byte budget.** `span_through_keys` returns
    a fully resident batch; capacity is checked after materialization. Add an
    incremental selected-read interface and a non-retaining streaming path.
    Partitioning a request by key helps many-key requests but cannot bound a
@@ -238,7 +246,7 @@ structural column ordering. Its larger chunks also need separate memory tests.
 
 ## Validation
 
-All **15 targeted tests pass**: nine copied key-cache tests plus six new file
+At the original measured checkpoint, all **15 targeted tests passed**: nine copied key-cache tests plus six new file
 wrapper tests. The latter cover round trips and detached selections, bounds
 that avoid reads, repeated loads that do not pin sources, segment reclamation,
 zero-I/O settling of full stored chunks, batcher merge/extract against a row
@@ -247,3 +255,8 @@ file boundaries, a single history spanning chunks, and real-spine suffix-cache
 reads followed by compaction. Every successful benchmark checks the full DD
 count output each round. The two watchdog stops are retained as experimental
 limits, not reported as successful complete runs.
+
+The master-next port also adds a test for update-free span progress, canonical
+absent payloads, and extending a cached absence when a key first appears.
+Port verification is recorded separately in `tests-master-next.log` and
+`results-master-next`; the historical logs above are unchanged.

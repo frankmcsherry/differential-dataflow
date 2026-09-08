@@ -9,7 +9,7 @@ use differential_dataflow::input::InputSession;
 use differential_dataflow::operators::arrange::Arranged;
 use differential_dataflow::operators::join::join_with_tactic;
 use differential_dataflow::trace::chunk::{Chunk, ChunkBatch};
-use differential_dataflow::trace::Description;
+use differential_dataflow::trace::{Description, Span};
 use differential_dataflow::AsCollection;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -62,14 +62,14 @@ fn main() {
         let mut chunks = Vec::new();
         generate(keys, fanout, |c| chunks.push(DiskChunk::new(c).persist()));
         assert!(chunks.iter().all(DiskChunk::is_file));
-        let batch = Rc::new(ChunkBatch::new(
-            chunks,
+        let batch = Span::new(
             Description::new(
                 Antichain::from_elem(0),
                 Antichain::new(),
                 Antichain::from_elem(0),
             ),
-        ));
+            Some(Rc::new(ChunkBatch::new(chunks))),
+        );
         store.borrow_mut().rotate();
         println!("build keys={keys} fanout={fanout} records={} hot={hot_count} capacity={capacity} nocache={nocache} elapsed_ms={} rss_kib={} file_bytes={} writes={}", keys * fanout, start.elapsed().as_millis(), rss_kib(), stats.live_bytes.get(), stats.writes.get());
         let trace = join::StaticTrace::new(batch);
@@ -82,7 +82,7 @@ fn main() {
         tactic.profile = profile;
         worker.dataflow::<u64, _, _>(|scope| {
             let cold = Arranged {
-                stream: vec![Rc::clone(&trace.batch)].into_iter().to_stream(scope),
+                stream: vec![trace.span.clone()].into_iter().to_stream(scope),
                 trace,
             };
             let queries = input.to_collection(scope).arrange_by_key();
@@ -179,14 +179,7 @@ fn cursor_control(keys: u64, fanout: u64, rounds: u64, hot_count: u64, nocache: 
         Inner::settle(&mut VecDeque::from([c]), true, &mut chunks)
     });
     store.borrow_mut().rotate();
-    let batch = ChunkBatch::new(
-        chunks.into(),
-        Description::new(
-            Antichain::from_elem(0),
-            Antichain::new(),
-            Antichain::from_elem(0),
-        ),
-    );
+    let batch = ChunkBatch::new(chunks.into());
     println!("build mode=cursor keys={keys} fanout={fanout} records={} hot={hot_count} nocache={nocache} elapsed_ms={} rss_kib={} file_bytes={} writes={}", keys * fanout, start.elapsed().as_millis(), rss_kib(), stats.live_bytes.get(), stats.writes.get());
     for round in 0..rounds {
         let start = Instant::now();

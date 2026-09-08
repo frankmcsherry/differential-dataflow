@@ -1,0 +1,90 @@
+   Compiling differential-dataflow v0.25.1 (/Users/mcsherry/Projects/dd-file-chunk-pr/differential-dataflow)
+    Finished `release` profile [optimized + debuginfo] target(s) in 32.49s
+     Running unittests src/lib.rs (target/release/deps/differential_dataflow-a5155d62f56d193f)
+
+running 43 tests
+test batcher::merge::test::frontier_is_post_consolidation ... ok
+test batcher::merge::test::frontier_survivor_minimum ... ok
+test columnar::collection::container::test::recorded_updates_bytes_round_trip ... ok
+test columnar::trace::chunk::test::advance_emits_complete_groups_eagerly ... ok
+test columnar::trace::chunk::test::cursor_handles_straddle ... ok
+test columnar::trace::chunk::test::advance_resumable_matches_oneshot ... ok
+test columnar::trace::chunk::test::advance_single_key_spanning_pushes ... ok
+test columnar::updates::tests::test_cancellation ... ok
+test algorithms::identifiers::tests::are_unique ... ok
+test columnar::updates::tests::test_empty ... ok
+test columnar::updates::tests::test_first_key_cancels ... ok
+test columnar::updates::tests::test_first_val_cancels ... ok
+test columnar::updates::tests::test_interleaved_cancellations ... ok
+test columnar::updates::tests::test_middle_time_cancels ... ok
+test columnar::updates::tests::test_multiple_vals_and_times ... ok
+test columnar::updates::tests::test_push_and_consolidate_basic ... ok
+test columnar::updates::tests::test_total_cancellation ... ok
+test columnar::updates::tests::test_unsorted_input ... ok
+test columnar::updates::tests::test_val_cancellation_propagates ... ok
+test consolidation::tests::test_consolidate ... ok
+test consolidation::tests::test_consolidate_into ... ok
+test consolidation::tests::test_consolidate_updates ... ok
+test consolidation::tests::test_consolidating_container_builder ... ok
+test difference::vector::tests::test_semigroup_vec ... ok
+test trace::chunk::vec::test::advance_emits_complete_groups_eagerly ... ok
+test columnar::trace::chunk::test::settle_maximal_packing ... ok
+test trace::chunk::vec::test::advance_resumable_matches_oneshot ... ok
+test trace::chunk::vec::test::advance_single_key_spanning_pushes ... ok
+test trace::chunk::vec::test::batch_merger_resumable_matches_reference ... ok
+test trace::chunk::vec::test::cursor_handles_straddle ... ok
+test trace::chunk::vec::test::merge_chains_consolidates ... ok
+test columnar::trace::chunk::test::advance_matches_row_reference ... ok
+test trace::chunk::vec::test::seek_microbench ... ignored
+test trace::chunk::vec::test::seek_key_hint_is_direction_independent ... ok
+test trace::chunk::vec::test::merge_emits_graded_chunks ... ok
+test trace::chunk::vec::test::settle_maximal_packing ... ok
+test trace::chunk::vec::test::merge_matches_reference ... ok
+test trace::chunk::vec::test::extract_partitions_and_grades ... ok
+test columnar::trace::chunk::test::batch_merger_resumable_matches_reference ... ok
+test columnar::trace::chunk::test::merge_matches_reference ... ok
+test columnar::trace::chunk::test::settle_pages_and_round_trips ... ok
+test consolidation::tests::test_consolidator_duration_vec ... ok
+test consolidation::tests::test_consolidator_duration ... ok
+
+test result: ok. 42 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.48s
+
+     Running tests/key_cache.rs (target/release/deps/key_cache-c35ea601a5c8ac9b)
+
+running 10 tests
+test a_vanished_batch_can_cancel_a_cached_prefix ... ok
+test capacity_accounts_for_absent_keys_and_bypasses_oversized_results ... ok
+test compaction_crossing_a_cached_upper_does_not_double_count ... ok
+test cursor_free_chunks_support_antichain_coverage ... ok
+test selected_spans_track_update_free_progress_without_empty_payloads ... ok
+test preserves_history_and_reads_only_requested_keys ... ok
+test wraps_a_real_chunk_spine ... ok
+test paged_reads_reuse_overlapping_selections_and_fetch_only_new_batches ... ok
+test large_keys_straddle_chunks_and_pack_without_losing_history ... ok
+test columnar_selection_copies_string_keys_and_straddling_value_histories ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/file_chunk_spike.rs (target/release/examples/file_chunk_spike-f8f3611b8891f80e)
+
+running 6 tests
+test storage::tests::advance_single_group_split_across_chunks ... ok
+test storage::tests::file_roundtrip_selection_and_reclamation ... ok
+test storage::tests::settle_existing_full_chunks_without_io ... ok
+test storage::tests::file_spine_cache_reads_only_new_suffix_and_survives_compaction ... ok
+test storage::tests::batcher_merge_and_extract_match_independent_oracle ... ok
+test storage::tests::fueled_batch_merge_advances_and_cancels_across_file_boundaries ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests examples/key_cache.rs (target/release/examples/key_cache-0273e2a89fcd9091)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/key_cache_bench.rs (target/release/examples/key_cache_bench-21e273fd9b9fc707)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

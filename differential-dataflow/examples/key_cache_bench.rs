@@ -63,7 +63,10 @@ impl Drop for SpillGuard {
     }
 }
 
-fn batch(keys: impl IntoIterator<Item = u64>, time: u64) -> Batch {
+fn batch(
+    keys: impl IntoIterator<Item = u64>,
+    time: u64,
+) -> differential_dataflow::trace::Span<u64, Batch> {
     let mut chunks = Vec::new();
     let mut rows = UpdatesTyped::<Data>::default();
     for key in keys {
@@ -77,14 +80,14 @@ fn batch(keys: impl IntoIterator<Item = u64>, time: u64) -> Batch {
     if rows.len() > 0 {
         chunks.push(ColChunk::from_trie(rows.consolidate()));
     }
-    Rc::new(ChunkBatch::new(
+    make_span(
         settle_all(chunks),
         Description::new(
             Antichain::from_elem(time),
             Antichain::from_elem(time + 1),
             Antichain::from_elem(0),
         ),
-    ))
+    )
 }
 
 fn consume(batches: &[Batch], keys: &[u64]) -> u64 {
@@ -136,7 +139,7 @@ fn requests(kind: &str, count: usize, key_count: usize) -> Vec<Vec<u64>> {
 }
 
 fn run(
-    base: &[Batch],
+    base: &[differential_dataflow::trace::Span<u64, Batch>],
     requests: &[Vec<u64>],
     mode: &str,
     capacity: usize,
@@ -147,7 +150,7 @@ fn run(
     let spine = ChunkSpine::new(info.clone(), None, None);
     let (reader, mut writer) = TraceAgent::new(spine, info, None);
     for b in base {
-        writer.insert(Rc::clone(b), None);
+        writer.insert(b.clone(), Default::default());
     }
     let mut cache = CachedTrace::new(reader, if mode == "cached" { capacity } else { 0 });
     let mut times = Vec::new();
@@ -158,7 +161,10 @@ fn run(
     let mut peak_entries = 0;
     for (i, keys) in requests.iter().enumerate() {
         if workload.starts_with("append") {
-            writer.insert(batch(keys.iter().copied(), (base.len() + i) as u64), None);
+            writer.insert(
+                batch(keys.iter().copied(), (base.len() + i) as u64),
+                Default::default(),
+            );
         }
         if workload == "append_compact" {
             cache.set_physical_compaction(AntichainRef::new(&[(base.len() + i) as u64]));
@@ -173,9 +179,9 @@ fn run(
             )
         } else {
             let selected = cache
-                .batch_through_keys(AntichainRef::new(&[]), keys)
+                .span_through_keys(AntichainRef::new(&[]), keys)
                 .unwrap();
-            consume(std::slice::from_ref(&selected), keys)
+            consume(&selected.inner.iter().cloned().collect::<Vec<_>>(), keys)
         };
         times.push(start.elapsed().as_nanos() as u64);
         checksum = checksum.wrapping_add(value);
@@ -253,4 +259,14 @@ fn main() {
             }
         }
     }
+}
+
+fn make_span<C: differential_dataflow::trace::chunk::Chunk>(
+    chunks: Vec<C>,
+    desc: differential_dataflow::trace::Description<C::Time>,
+) -> differential_dataflow::trace::Span<C::Time, Rc<ChunkBatch<C>>> {
+    differential_dataflow::trace::Span::new(
+        desc,
+        (!chunks.is_empty()).then(|| Rc::new(ChunkBatch::new(chunks))),
+    )
 }

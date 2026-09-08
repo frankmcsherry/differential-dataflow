@@ -107,7 +107,10 @@ dependencies = [
 [[package]]
 name = "corgi"
 version = "0.1.0"
-source = "git+https://github.com/frankmcsherry/wip?rev=222157885ef424674163aeaf3f97775c9f160293#222157885ef424674163aeaf3f97775c9f160293"
+source = "git+https://github.com/frankmcsherry/WIP?rev=be003988f17e3998a8abba3e168a2520a46d10e4#be003988f17e3998a8abba3e168a2520a46d10e4"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -135,21 +138,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
-name = "dd_server"
+name = "ddir-server"
 version = "0.1.0"
 dependencies = [
+ "diagnostics",
  "differential-dataflow",
- "libloading",
+ "interactive",
+ "mimalloc",
+ "serde",
  "timely",
-]
-
-[[package]]
-name = "degr_dist"
-version = "0.1.0"
-dependencies = [
- "dd_server",
- "differential-dataflow",
- "timely",
+ "tungstenite",
 ]
 
 [[package]]
@@ -338,11 +336,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hdrhist"
-version = "0.5.1-pre"
-source = "git+https://github.com/utaal/hdrhist#0ffc327d058698daedb0aec1252737e1ad6be987"
-
-[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -372,7 +365,6 @@ dependencies = [
  "corgi",
  "diagnostics",
  "differential-dataflow",
- "mimalloc",
  "serde",
  "smallvec",
  "timely",
@@ -417,16 +409,6 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "libloading"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
 
 [[package]]
 name = "libmimalloc-sys"
@@ -501,14 +483,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
 dependencies = [
  "libmimalloc-sys",
-]
-
-[[package]]
-name = "neighborhood"
-version = "0.1.0"
-dependencies = [
- "dd_server",
- "differential-dataflow",
 ]
 
 [[package]]
@@ -681,31 +655,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "random_graph"
-version = "0.1.0"
-dependencies = [
- "dd_server",
- "differential-dataflow",
- "hdrhist",
- "rand 0.3.23",
- "timely",
-]
-
-[[package]]
 name = "rdrand"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "678054eb77286b51581ba43620cc911abf02758c91f93f479767aed0f90458b2"
 dependencies = [
  "rand_core 0.3.2",
-]
-
-[[package]]
-name = "reachability"
-version = "0.1.0"
-dependencies = [
- "dd_server",
- "differential-dataflow",
 ]
 
 [[package]]
@@ -848,8 +803,7 @@ dependencies = [
 [[package]]
 name = "timely"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced05836c8e471cc85b5a12fbbe9a72568d98ea3b5a79e4a965918bc002108d9"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#6a0ffa8b886f5f14118f5e339d0e30c6f88922dd"
 dependencies = [
  "bincode",
  "byteorder",
@@ -868,14 +822,12 @@ dependencies = [
 [[package]]
 name = "timely_bytes"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad328384fad249cbe20f742d842ee9e3d2c6086bcde6277fb11bb154f21fb92e"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#6a0ffa8b886f5f14118f5e339d0e30c6f88922dd"
 
 [[package]]
 name = "timely_communication"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe397622e1c1957f3486efa0f706908b245c6ee73e7634ddaaf72f48bb3687dc"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#6a0ffa8b886f5f14118f5e339d0e30c6f88922dd"
 dependencies = [
  "byteorder",
  "columnar",
@@ -889,14 +841,12 @@ dependencies = [
 [[package]]
 name = "timely_container"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de8c518a66e00ef8af9e9fae7e01b7d2628b970948f32855dfc89e503403ff5a"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#6a0ffa8b886f5f14118f5e339d0e30c6f88922dd"
 
 [[package]]
 name = "timely_logging"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ae9187f19aec95c932196b95c1981708090d9c35213ae266d7bac0f32432886"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#6a0ffa8b886f5f14118f5e339d0e30c6f88922dd"
 dependencies = [
  "timely_container",
 ]
@@ -1026,18 +976,18 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
 dependencies = [
  "proc-macro2",
  "quote",

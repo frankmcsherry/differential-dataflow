@@ -14,9 +14,10 @@ use timely::progress::{frontier::AntichainRef, Antichain};
 use differential_dataflow::columnar::trace::{spill, ColChunk};
 use differential_dataflow::columnar::updates::UpdatesTyped;
 use differential_dataflow::operators::arrange::TraceAgent;
+use differential_dataflow::trace::chunk::Chunk;
 use differential_dataflow::trace::chunk::{settle_all, ChunkBatch, ChunkSpine};
 use differential_dataflow::trace::wrappers::cached::CachedTrace;
-use differential_dataflow::trace::{BatchReader, Description, Trace};
+use differential_dataflow::trace::{Description, Span, Trace};
 
 type Data = (u64, u64, u64, i64);
 
@@ -54,20 +55,20 @@ impl Drop for SpillGuard {
     }
 }
 
-fn batch(time: u64) -> Rc<ChunkBatch<ColChunk<Data>>> {
+fn batch(time: u64) -> Span<u64, Rc<ChunkBatch<ColChunk<Data>>>> {
     let mut updates = UpdatesTyped::default();
     for key in 0..16_384u64 {
         updates.push_into(((key, 0), time, 1));
     }
     let chunks = settle_all([ColChunk::from_trie(updates.consolidate())]);
-    Rc::new(ChunkBatch::new(
+    make_span(
         chunks,
         Description::new(
             Antichain::from_elem(time),
             Antichain::from_elem(time + 1),
             Antichain::from_elem(0),
         ),
-    ))
+    )
 }
 
 fn main() {
@@ -87,32 +88,48 @@ fn main() {
     let info = OperatorInfo::new(0, 0, [].into());
     let spine = ChunkSpine::new(info.clone(), None, None);
     let (reader, mut writer) = TraceAgent::new(spine, info, None);
-    writer.insert(batch(0), None);
-    writer.insert(batch(1), None);
+    writer.insert(batch(0), Default::default());
+    writer.insert(batch(1), Default::default());
     let mut cache = CachedTrace::new(reader, 1024);
     let keys = [1, 9000];
 
     for phase in ["cold", "repeat", "new batch", "evicted"] {
         if phase == "new batch" {
-            writer.insert(batch(2), None);
+            writer.insert(batch(2), Default::default());
         }
         if phase == "evicted" {
             cache.clear();
         }
         let before = loads.get();
         let result = cache
-            .batch_through_keys(AntichainRef::new(&[]), &keys)
+            .span_through_keys(AntichainRef::new(&[]), &keys)
             .unwrap();
         println!(
             "{phase:>9}: {} file reads, {} updates in {} cached chunks, upper {:?}",
             loads.get() - before,
-            result.len(),
-            result.chunks.len(),
+            result
+                .inner
+                .iter()
+                .flat_map(|b| &b.chunks)
+                .map(Chunk::len)
+                .sum::<usize>(),
+            result.inner.as_ref().map_or(0, |b| b.chunks.len()),
             result.upper().elements()
         );
         assert!(result
-            .chunks
+            .inner
             .iter()
+            .flat_map(|b| &b.chunks)
             .all(|c| matches!(c, ColChunk::Resident(_))));
     }
+}
+
+fn make_span<C: differential_dataflow::trace::chunk::Chunk>(
+    chunks: Vec<C>,
+    desc: differential_dataflow::trace::Description<C::Time>,
+) -> differential_dataflow::trace::Span<C::Time, Rc<ChunkBatch<C>>> {
+    differential_dataflow::trace::Span::new(
+        desc,
+        (!chunks.is_empty()).then(|| Rc::new(ChunkBatch::new(chunks))),
+    )
 }

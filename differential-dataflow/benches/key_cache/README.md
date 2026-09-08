@@ -80,10 +80,15 @@ cached cut. These measurements do not exercise repeated loss of those cuts.
 
 ## Reproduce
 
+These measurements are from the original `file-chunk-spike` checkpoint at
+`3fecff64`. This PR ports the benchmark to current master-next; its results
+should be recorded separately when rerun. The original dependency snapshot
+is available on the checkpoint branch.
+
 From the workspace root:
 
 ```sh
-cp benches/file_chunk/Cargo.lock Cargo.lock # Dependency snapshot included in the file-chunk-spike checkpoint.
+cp benches/file_chunk/Cargo.lock Cargo.lock # Dependency snapshot for the master-next port.
 cargo build --release -p differential-dataflow --example key_cache_bench --locked
 target/release/examples/key_cache_bench 65536 256 65536
 target/release/examples/key_cache_bench 262144 256 65536

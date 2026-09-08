@@ -22,11 +22,11 @@ pub trait KeyedChunk: Chunk {
 }
 
 impl<C: KeyedChunk> ChunkBatch<C> {
-    /// Materialize selected keys, retaining this batch's coverage and `since`.
+    /// Materialize selected keys from this batch payload.
     ///
     /// `keys` must be sorted and distinct. The returned batch describes only
-    /// these keys; callers must retain that selection alongside the batch.
+    /// these keys; callers must retain the selection and span description alongside it.
     pub fn select_keys(&self, keys: &[C::Key]) -> Self {
-        Self::new(C::select_keys(&self.chunks, keys), self.description.clone())
+        Self::new(C::select_keys(&self.chunks, keys))
     }
 }

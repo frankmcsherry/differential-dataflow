@@ -2,15 +2,15 @@
 //!
 //! [`CachedTrace`] wraps any reader of `Rc<ChunkBatch<C>>`, including a shared
 //! trace agent. Ordinary [`TraceReader`] methods retain their usual meaning;
-//! [`CachedTrace::batch_through_keys`] opts into key selection and caching.
+//! [`CachedTrace::span_through_keys`] opts into key selection and caching.
 //! Each entry records both its requested keys (including absent keys) and its
 //! committed upper. Reads can reuse overlapping selections and fetch only the
-//! uncovered suffix for cached keys. Source batch descriptions are consulted on
+//! uncovered suffix for cached keys. Source span descriptions are consulted on
 //! every read, but cached prefixes do not require reading source chunk bodies.
 //!
 //! The prototype does not pin physical compaction. An entry is reusable only if
 //! its upper is still protected by the reader's physical compaction frontier,
-//! and no source batch straddles it. Otherwise the keys are read afresh. No
+//! and no source span straddles it. Otherwise the keys are read afresh. No
 //! timestamp filtering reconstructs provenance.
 //! Cache contents keep their timestamps, with `since` tracking any logical
 //! compaction already performed by the sources.
@@ -31,11 +31,11 @@ use timely::PartialOrder;
 
 use crate::lattice::Lattice;
 use crate::trace::chunk::{merge_chains, ChunkBatch, KeyedChunk};
-use crate::trace::{BatchReader, Description, TraceReader};
+use crate::trace::{Description, Span, TraceReader};
 
 struct Entry<C: KeyedChunk> {
     keys: Vec<C::Key>,
-    batch: Rc<ChunkBatch<C>>,
+    batch: Rc<Span<C::Time, Rc<ChunkBatch<C>>>>,
 }
 
 /// A trace reader with an optional, cursor-free cache of selected keys.
@@ -110,25 +110,31 @@ where
     C: KeyedChunk + 'static,
     Tr: TraceReader<Time = C::Time, Batch = Rc<ChunkBatch<C>>>,
 {
-    /// Materialize exactly `keys` through `upper` as one compact resident batch.
+    /// Materialize exactly `keys` through `upper` as a span with a compact resident batch.
     ///
     /// Keys may be unordered or repeated. The upper must satisfy the wrapped
-    /// reader's `batches_through` contract. In particular, an empty frontier
+    /// reader's `spans_through` contract. In particular, an empty frontier
     /// requests all committed data, not future data: the returned description
     /// and cache coverage end at the trace's current committed upper.
     ///
+    /// No span is returned when the requested/committed upper is the minimum
+    /// timestamp: that prefix has no time interval to describe.
+    ///
     /// Results preserve timestamp distinctions; only identical `(key,val,time)`
-    /// updates consolidate. A returned batch covers only the requested keys and
+    /// updates consolidate. A returned span covers only the requested keys and
     /// must not be inserted into the source trace as additional updates.
-    pub fn batch_through_keys(
+    pub fn span_through_keys(
         &mut self,
         upper: AntichainRef<C::Time>,
         keys: &[C::Key],
-    ) -> Option<Rc<ChunkBatch<C>>> {
-        let sources = self.trace.batches_through(upper)?;
+    ) -> Option<Rc<Span<C::Time, Rc<ChunkBatch<C>>>>> {
+        let sources = self.trace.spans_through(upper)?;
         let mut committed = Antichain::new();
         self.trace.read_upper(&mut committed);
         let upper = upper.to_owned().meet(&committed);
+        if upper.less_equal(&C::Time::minimum()) {
+            return None;
+        }
         let mut keys = keys.to_vec();
         keys.sort_unstable();
         keys.dedup();
@@ -156,9 +162,8 @@ where
                 continue;
             }
             let cut = entry.batch.upper();
-            // A vanished empty batch can hide cancellation across the cut, so
-            // checking only the descriptions returned by batches_through is
-            // insufficient once physical compaction has passed it.
+            // Reuse prefixes only while physical compaction protects their cut,
+            // including when cancellation changes the source payloads.
             if !PartialOrder::less_equal(&physical, cut) {
                 continue;
             }
@@ -180,11 +185,11 @@ where
             if selected.is_empty() {
                 continue;
             }
-            since = since.join(entry.batch.description().since());
+            since = since.join(entry.batch.desc.since());
             chains.push(if selected == entry.keys {
-                entry.batch.chunks.clone()
+                chunks(&entry.batch).to_vec()
             } else {
-                C::select_keys(&entry.batch.chunks, &selected)
+                C::select_keys(chunks(&entry.batch), &selected)
             });
             for (batch, wanted) in sources.iter().zip(&mut source_keys) {
                 if PartialOrder::less_equal(cut, batch.lower()) {
@@ -204,8 +209,8 @@ where
         for (batch, mut wanted) in sources.iter().zip(source_keys) {
             if !wanted.is_empty() {
                 wanted.sort_unstable();
-                since = since.join(batch.description().since());
-                chains.push(C::select_keys(&batch.chunks, &wanted));
+                since = since.join(batch.desc.since());
+                chains.push(C::select_keys(chunks(batch), &wanted));
             }
         }
 
@@ -228,11 +233,11 @@ where
         }
         // Selection also packs a chain, without invoking settle's spill policy.
         let chunks = C::select_keys(&chains.pop().unwrap_or_default(), &keys);
-        let batch = Rc::new(ChunkBatch::new(
-            chunks,
+        let batch = Rc::new(Span::new(
             Description::new(Antichain::from_elem(C::Time::minimum()), upper, since),
+            (!chunks.is_empty()).then(|| Rc::new(ChunkBatch::new(chunks))),
         ));
-        let charge = batch.len().saturating_add(keys.len()).saturating_add(1);
+        let charge = updates(&batch).saturating_add(keys.len()).saturating_add(1);
         if !keys.is_empty() && charge <= self.capacity {
             // Retire entries wholly subsumed in both keys and coverage.
             self.entries.retain(|entry| {
@@ -242,7 +247,7 @@ where
             self.charge = self
                 .entries
                 .iter()
-                .map(|e| e.batch.len() + e.keys.len() + 1)
+                .map(|e| updates(&e.batch) + e.keys.len() + 1)
                 .sum();
             if charge > self.capacity - self.charge {
                 self.clear();
@@ -265,8 +270,11 @@ where
     type Time = C::Time;
     type Batch = Rc<ChunkBatch<C>>;
 
-    fn batches_through(&mut self, upper: AntichainRef<C::Time>) -> Option<Vec<Self::Batch>> {
-        self.trace.batches_through(upper)
+    fn spans_through(
+        &mut self,
+        upper: AntichainRef<C::Time>,
+    ) -> Option<Vec<Span<C::Time, Self::Batch>>> {
+        self.trace.spans_through(upper)
     }
     fn set_logical_compaction(&mut self, frontier: AntichainRef<C::Time>) {
         self.trace.set_logical_compaction(frontier);
@@ -280,8 +288,8 @@ where
     fn get_physical_compaction(&mut self) -> AntichainRef<'_, C::Time> {
         self.trace.get_physical_compaction()
     }
-    fn map_batches<F: FnMut(&Self::Batch)>(&self, f: F) {
-        self.trace.map_batches(f);
+    fn map_spans<F: FnMut(&Span<C::Time, Self::Batch>)>(&self, f: F) {
+        self.trace.map_spans(f);
     }
     fn read_upper(&mut self, target: &mut Antichain<C::Time>) {
         self.trace.read_upper(target);
@@ -289,4 +297,13 @@ where
     fn advance_upper(&mut self, upper: &mut Antichain<C::Time>) {
         self.trace.advance_upper(upper);
     }
+}
+
+fn chunks<C: KeyedChunk>(span: &Span<C::Time, Rc<ChunkBatch<C>>>) -> &[C] {
+    span.inner
+        .as_ref()
+        .map_or(&[], |batch| batch.chunks.as_slice())
+}
+fn updates<C: KeyedChunk>(span: &Span<C::Time, Rc<ChunkBatch<C>>>) -> usize {
+    chunks(span).iter().map(C::len).sum()
 }
