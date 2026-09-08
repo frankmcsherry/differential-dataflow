@@ -1,6 +1,6 @@
 External-memory CHUNK traces need a read path that does not retain every decoded source chunk touched by a cursor. This draft checkpoints key-selected trace caching and an isolated file-backed experiment using a real DD join and count.
 
-Based directly on `master-next` at `75fba2b9`. The final code is ported to the current Span API, updated join tactic signature, and relocated merger traits. The original measured checkpoint remains on `frankmcsherry:file-chunk-spike`; its unrelated Corgi branch commits are not included here.
+Based on `master-next`, refreshed through `7576bfe3` (cursor cleanup #866). The final code is ported to the current Span API, updated join tactic signature, and relocated merger traits. The original measured checkpoint remains on `frankmcsherry:file-chunk-spike`; its unrelated Corgi branch commits are not included here.
 
 ### Changes
 

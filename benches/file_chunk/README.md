@@ -15,7 +15,8 @@ join, or a hard memory bound for arbitrary key histories.
 
 PR branch: `file-chunk-spike-master-next` in
 [`frankmcsherry/differential-dataflow`](https://github.com/frankmcsherry/differential-dataflow/tree/file-chunk-spike-master-next),
-based on `TimelyDataflow/differential-dataflow:master-next` at `75fba2b9`.
+based on `TimelyDataflow/differential-dataflow:master-next`, refreshed through
+`7576bfe3` (cursor cleanup #866).
 The local PR worktree is `/Users/mcsherry/Projects/dd-file-chunk-pr`.
 This is a research checkpoint, not a proposed production change.
 
@@ -260,3 +261,8 @@ The master-next port also adds a test for update-free span progress, canonical
 absent payloads, and extending a cached absence when a key first appears.
 Port verification is recorded separately in `tests-master-next.log` and
 `results-master-next`; the historical logs above are unchanged.
+
+Refresh through `7576bfe3` (cursor cleanup #866): the same test command passed
+58 tests with one existing library test ignored; see `tests-refresh.log`.
+The refresh preserves both the cursor module and the keyed-selection module.
+Historical performance measurements were not rerun.
