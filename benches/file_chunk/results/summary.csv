@@ -1,0 +1,14 @@
+case,verified,peak_rss_mib,file_mib,cold_ms,later_round_median_ms,cold_read_mib,later_read_mib,rounds_completed,stopped_by
+cursor_medium,False,131.938,392.438,,,,0.0,0,rss_watchdog
+cursor_small,True,27.266,24.527,76.942,0.168,24.527,0.0,3,
+giant_key_bypass,False,152.625,4805.664,127.526,,48.057,0.0,1,rss_watchdog
+large,True,86.156,1569.75,1851.452,33.111,1569.75,0.0,12,
+large_fixed_hot,True,4.969,1569.75,20.454,0.045,12.264,0.0,12,
+large_profile,True,86.172,1569.75,1837.004,34.074,1569.75,0.0,12,
+medium,True,24.969,392.438,447.339,7.563,392.438,0.0,12,
+medium_bypass,True,28.641,392.438,492.179,447.038,392.438,1962.188,6,
+medium_clustered,True,25.094,392.438,14.91,7.504,4.024,0.0,12,
+medium_clustered_moving,True,31.953,392.438,14.677,7.532,4.024,2.108,24,
+medium_moving,True,32.312,392.438,448.934,7.548,392.438,4316.812,24,
+medium_steady,True,24.922,392.438,446.049,7.643,392.438,0.0,200,
+small,True,6.578,24.527,32.769,0.458,24.527,0.0,12,

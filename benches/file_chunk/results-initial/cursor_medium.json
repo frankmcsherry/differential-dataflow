@@ -1,0 +1,21 @@
+{
+  "case": "cursor_medium",
+  "command": [
+    "/Users/mcsherry/Projects/dd-file-chunk-spike/target/release/examples/file_chunk_spike",
+    "1048576",
+    "16",
+    "3",
+    "10485",
+    "0",
+    "--cursor-control",
+    "--nocache"
+  ],
+  "exit_code": -9,
+  "stopped_by": "rss_watchdog",
+  "elapsed_s": 0.538,
+  "sampled_peak_rss_kib": 145936,
+  "kernel_peak_rss_kib": 146128.0,
+  "watchdog_mib": 128,
+  "verified": false,
+  "log": "benches/file_chunk/results/cursor_medium.log"
+}
