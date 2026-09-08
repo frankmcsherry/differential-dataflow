@@ -1,0 +1,11 @@
+storage,keys,queries,capacity,workload,round,mode,mean_us,p50_us,p95_us,reads_per_query,bytes_per_query,peak_charge,peak_entries
+resident,65536,256,65536,append_compact,0,cursor,19.620,19.042,27.167,0.000,0.0,0,0
+resident,65536,256,65536,append_compact,0,uncached,144.741,143.834,236.417,0.000,0.0,0,0
+resident,65536,256,65536,append_compact,0,cached,61.987,71.416,112.625,0.000,0.0,16913,1
+resident,65536,256,65536,append_compact,1,cached,61.814,72.042,113.167,0.000,0.0,16913,1
+resident,65536,256,65536,append_compact,1,uncached,145.582,146.875,243.125,0.000,0.0,0,0
+resident,65536,256,65536,append_compact,1,cursor,20.465,19.875,27.333,0.000,0.0,0,0
+paged,65536,256,65536,append_compact,0,uncached,1142.938,1030.334,1798.875,43.395,6309951.9,0,0
+paged,65536,256,65536,append_compact,0,cached,81.743,78.625,128.875,1.230,45444.1,16913,1
+paged,65536,256,65536,append_compact,1,cached,80.361,80.791,124.375,1.230,45444.1,16913,1
+paged,65536,256,65536,append_compact,1,uncached,1153.344,1028.916,1754.417,43.395,6309951.9,0,0

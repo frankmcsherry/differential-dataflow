@@ -29,7 +29,41 @@ use crate::trace::Navigable;
 use crate::trace::cursor::Cursor;
 use crate::trace::implementations::{BatchContainer, Layout, Vector, WithLayout};
 
-use super::Chunk;
+use super::{Chunk, KeyedChunk};
+
+impl<K, V, T, R> KeyedChunk for VecChunk<K, V, T, R>
+where
+    K: Ord + Clone + 'static,
+    V: Ord + Clone + 'static,
+    T: Lattice + Timestamp,
+    R: Ord + Semigroup + 'static,
+{
+    type Key = K;
+
+    fn select_keys(chunks: &[Self], keys: &[K]) -> Vec<Self> {
+        let mut result = Vec::new();
+        let mut buffer = Vec::new();
+        for chunk in chunks {
+            let rows = chunk.as_slice();
+            let Some(first) = rows.first() else { continue };
+            let mut key = keys.partition_point(|k| k < &first.0.0);
+            let mut pos = 0;
+            while key < keys.len() && pos < rows.len() {
+                pos = gallop(rows, pos, |r| r.0.0 < keys[key]);
+                while pos < rows.len() && rows[pos].0.0 == keys[key] {
+                    buffer.push(rows[pos].clone());
+                    if buffer.len() == TARGET {
+                        result.push(Self(Rc::new(std::mem::take(&mut buffer))));
+                    }
+                    pos += 1;
+                }
+                key += 1;
+            }
+        }
+        if !buffer.is_empty() { result.push(Self(Rc::new(buffer))); }
+        result
+    }
+}
 
 /// The chunk size: the [`Chunk::TARGET`] value, also used for buffer sizing.
 const TARGET: usize = 8192;
