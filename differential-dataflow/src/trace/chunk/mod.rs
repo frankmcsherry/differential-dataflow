@@ -63,6 +63,8 @@ use crate::trace::cursor::Cursor;
 use crate::trace::implementations::BatchContainer;
 
 pub mod vec;
+pub mod keyed;
+pub use keyed::KeyedChunk;
 
 /// A non-empty, bounded, consolidated, sorted sequence of `(data, time, diff)`.
 ///

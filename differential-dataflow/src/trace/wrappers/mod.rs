@@ -2,3 +2,4 @@
 
 pub mod enter;
 pub mod frontier;
+pub mod cached;
