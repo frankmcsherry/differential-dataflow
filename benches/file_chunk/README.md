@@ -23,7 +23,7 @@ This is a research checkpoint, not a proposed production change.
 The original measured checkpoint remains at
 [`file-chunk-spike` / `3fecff64`](https://github.com/frankmcsherry/differential-dataflow/tree/3fecff64),
 based on `c9824fb8`. The large-run numbers in this report and the
-`results` / `results-initial` folders come from that checkpoint, **not a new
+`results` folder come from that checkpoint, **not a new
 performance measurement of the master-next port**. The PR branch adapts the code
 to spans carrying descriptions separately from optional batch payloads, updated
 join tactic signatures, and relocated merger traits. The selected-read method
@@ -148,14 +148,12 @@ from a benchmark that only repeats an identical request.
 
 ## Iterations and boundaries found
 
-The [initial results](results-initial) retain the first version's measurements.
-It accumulated one tiny selected trie per source chunk before repacking and
-passed the full key request to every chunk's selector. The large 1% run hit
-the 128 MiB watchdog. A diagnostic run with a 192 MiB guard completed at about
-129 MiB peak, reporting 90 MiB immediately after selection. Incremental packing
-and limiting each chunk's key argument reduced final peak RSS to 86 MiB;
-the corresponding post-selection reading is 47 MiB. This is a concrete
-materialization cost, not evidence that the cold bodies stayed pinned.
+An early implementation accumulated one tiny selected trie per source chunk
+before repacking and passed the full key request to every chunk's selector.
+Its large 1% run reached about 129 MiB peak RSS. Incremental packing and limiting
+each chunk's key argument reduced the peak to 86 MiB. The intermediate debugging
+logs are omitted from this PR; the retained results exercise the corrected
+implementation at the original checkpoint.
 
 The existing `ColChunk` spill cursor, using the **same file backend**, pins
 decoded source chunks in its `OnceCell`. A dispersed 1% scan of the small

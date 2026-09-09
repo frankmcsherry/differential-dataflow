@@ -1,1 +1,0 @@
-build mode=cursor keys=1048576 fanout=16 records=16777216 hot=10485 nocache=true elapsed_ms=322 rss_kib=4032 file_bytes=411500544 writes=2048

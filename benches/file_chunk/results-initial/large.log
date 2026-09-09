@@ -1,2 +1,0 @@
-build keys=4194304 fanout=16 records=67108864 hot=41943 capacity=713032 nocache=true elapsed_ms=1276 rss_kib=3984 file_bytes=1646002176 writes=8192
-round=0 elapsed_us=2218840 rss_kib=132304 reads=8192 read_bytes=1646002176 writes=0 active_keys=41943 calls=1

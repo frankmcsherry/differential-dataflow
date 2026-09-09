@@ -1,5 +1,0 @@
-build mode=cursor keys=65536 fanout=16 records=1048576 hot=655 nocache=true elapsed_ms=21 rss_kib=3008 file_bytes=25718784 writes=128
-round=0 elapsed_us=34172 rss_kib=27888 reads=128 read_bytes=25718784
-round=1 elapsed_us=186 rss_kib=27888 reads=0 read_bytes=0
-round=2 elapsed_us=162 rss_kib=27888 reads=0 read_bytes=0
-verified mode=cursor rounds=3 rss_kib=27888
