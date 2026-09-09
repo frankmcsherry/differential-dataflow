@@ -19,7 +19,7 @@ use differential_dataflow::difference::Semigroup;
 use differential_dataflow::hashable::Hashable;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::operators::arrange::arrangement::arrange_core;
-use differential_dataflow::operators::int_proxy::reduce::ProxyReduceTactic;
+use differential_dataflow::operators::int_proxy::reduce::{ProxyReduceBackend, ProxyReduceTactic, ReduceInstance, ReduceWindow};
 use differential_dataflow::operators::int_proxy::vec_backend::VecReduceBackend;
 use differential_dataflow::operators::iterate::Iterate;
 use differential_dataflow::operators::reduce::{reduce_with_tactic, ReduceTactic};
@@ -311,7 +311,7 @@ fn reduce_collision_inside_iterate() {
             let result = input.iterate(|_scope, inner| {
                 let hashed = inner.map(|(k, v)| (k % 2, (k, v)));
                 let arr = arrange_core::<Pipeline, Vec<((u64, (u64, u64)), Product<u64, u64>, i64)>, _, VChunkSpine<u64, (u64, u64), Product<u64, u64>, i64>>(hashed.inner, Pipeline, "ArrCollide", VChunkBatcher::new);
-                reduce_with_tactic::<_, VChunkSpine<u64, (u64, u64), Product<u64, u64>, i64>, _>(arr, "CollideReduce", ProxyReduceTactic::new(VecReduceBackend::with_window(max_logic, 1)))
+                reduce_with_tactic::<_, VChunkSpine<u64, (u64, u64), Product<u64, u64>, i64>, _>(arr, "CollideReduce", ProxyReduceTactic::new(VecReduceBackend::with_window(max_logic, usize::MAX)).with_key_batch_size(1))
                     .as_collection(|_h, kw: &(u64, u64)| (kw.0, kw.1))
             });
             result.inspect(move |(d, t, r)| os.lock().unwrap().push((*d, *t, *r)));
@@ -448,4 +448,109 @@ fn reduce_seed_survives_cancellation() {
     );
     let out1: Vec<_> = p1.into_iter().filter_map(|b| b.inner).flat_map(|b| hread(&[b])).collect();
     assert_eq!(out1, vec![((7u64, 3u64), 1u64, -1i64)], "the stale output must be retracted");
+}
+
+/// Grouping sweeps must preserve incomparable times, carried corrections, and
+/// cancellations against prior history even when the backend presents everything.
+#[test]
+fn bounded_sweeps_match_partial_order_oracle() {
+    check_bounded_sweeps(false);
+}
+
+#[test]
+fn mixed_single_key_and_batched_corrections_match_partial_order_oracle() {
+    check_bounded_sweeps(true);
+}
+
+/// Exercise both correction paths within each presented window.
+struct MixedCorrections<B> {
+    inner: B,
+    single: Rc<std::cell::Cell<usize>>,
+    batched: Rc<std::cell::Cell<usize>>,
+}
+
+impl<T, B1, B2, B: ProxyReduceBackend<T, B1, B2>> ProxyReduceBackend<T, B1, B2> for MixedCorrections<B> {
+    type RIn = B::RIn;
+    type ROut = B::ROut;
+    fn begin(&mut self, desc: differential_dataflow::trace::Description<T>) { self.inner.begin(desc); }
+    fn next_window(&mut self, instance: &ReduceInstance<'_, T, B1, B2>, changed: &[u64], from: &mut Option<u64>, window: &mut ReduceWindow<T, Self::RIn, Self::ROut>) {
+        self.inner.next_window(instance, changed, from, window);
+    }
+    fn reduce_one(&mut self, key: u64, input: &[(u64, Self::RIn)], output: &[(u64, Self::ROut)], corrections: &mut Vec<(u64, Self::ROut)>) -> bool {
+        if key % 2 == 1 { return false; }
+        self.single.set(self.single.get() + 1);
+        let (updates, ends) = self.inner.reduce_corrections(&[key], &[input.len()], input, &[output.len()], output);
+        assert_eq!(ends.as_slice(), &[updates.len()]);
+        corrections.extend(updates);
+        true
+    }
+    fn reduce_corrections(&mut self, keys: &[u64], in_ends: &[usize], input: &[(u64, Self::RIn)], out_ends: &[usize], output: &[(u64, Self::ROut)]) -> (Vec<(u64, Self::ROut)>, Vec<usize>) {
+        self.batched.set(self.batched.get() + 1);
+        self.inner.reduce_corrections(keys, in_ends, input, out_ends, output)
+    }
+    fn emit(&mut self, records: &[((u64, u64), T, Self::ROut)]) { self.inner.emit(records); }
+    fn finish(&mut self) -> Option<B2> { self.inner.finish() }
+}
+
+fn check_bounded_sweeps(mixed: bool) {
+    type T = Product<u64, u64>;
+    type Batch = Span<u64, (u64, u64), T, i64>;
+    let time = |a, b| T::new(a, b);
+    let mut initial = Vec::new();
+    let mut novel = Vec::new();
+    let mut expected = Vec::new();
+    for key in 0..1031u64 {
+        let mut rows = vec![((key, 3), time(0, 0), 1i64),
+                            ((key, 7), time(1, 0), 1),
+                            ((key, 9), time(0, 1), 1)];
+        initial.extend(rows.iter().cloned());
+        if key % 2 == 0 { novel.push(((key, 9), time(1, 1), -1)); }
+        if key % 3 == 0 { novel.push(((key, 7), time(1, 1), -1)); }
+        rows.extend(novel.iter().rev().take_while(|r| r.0.0 == key).cloned());
+        let mut prior: Vec<((u64, u64), T, i64)> = Vec::new();
+        for at in [time(0, 0), time(0, 1), time(1, 0), time(1, 1)] {
+            let mut counts = std::collections::BTreeMap::new();
+            for ((_, value), t, diff) in &rows {
+                if timely::PartialOrder::less_equal(t, &at) {
+                    *counts.entry(*value).or_insert(0i64) += diff;
+                }
+            }
+            let desired = counts.iter().rev().find(|(_, d)| **d > 0).unwrap().0;
+            let mut correction = std::collections::BTreeMap::from([(*desired, 1i64)]);
+            for ((_, value), t, diff) in &prior {
+                if timely::PartialOrder::less_equal(t, &at) {
+                    *correction.entry(*value).or_default() -= diff;
+                }
+            }
+            prior.extend(correction.into_iter().filter(|(_, d)| *d != 0)
+                .map(|(value, diff)| ((key, value), at, diff)));
+        }
+        expected.extend(prior);
+    }
+    consolidate_updates(&mut expected);
+    for limit in [1, 7, 256, usize::MAX] {
+        let backend = VecReduceBackend::with_window(max_logic, usize::MAX);
+        let (single, batched) = (Rc::new(std::cell::Cell::new(0)), Rc::new(std::cell::Cell::new(0)));
+        let mut tactic: Box<dyn ReduceTactic<T, Batch, Batch>> = if mixed {
+            Box::new(ProxyReduceTactic::new(MixedCorrections { inner: backend, single: single.clone(), batched: batched.clone() }).with_key_batch_size(limit))
+        } else {
+            Box::new(ProxyReduceTactic::new(backend).with_key_batch_size(limit))
+        };
+        let source = hbatch(initial.clone(), time(0, 0), time(1, 1));
+        let lower = Antichain::from_elem(time(0, 0));
+        let middle = Antichain::from_elem(time(1, 1));
+        let upper = Antichain::from_elem(time(2, 2));
+        let (first, pending) = tactic.retire(vec![], vec![], vec![source.clone()], &lower, &middle, &lower);
+        assert_eq!(pending, middle, "limit {limit}: synthesized crossing must remain carried");
+        let first: Vec<_> = first.into_iter().filter_map(|s| s.inner).collect();
+        let input = hbatch(novel.clone(), time(1, 1), time(2, 2));
+        let (second, pending) = tactic.retire(vec![source], first.clone(), vec![input], &middle, &upper, &middle);
+        assert!(pending.is_empty(), "limit {limit}");
+        let mut all = first;
+        all.extend(second.into_iter().filter_map(|s| s.inner));
+        assert_eq!(hread(&all), expected, "limit {limit}");
+        if mixed {
+            assert!(single.get() > 0 && batched.get() > 0, "both correction paths must execute");
+        }
+    }
 }

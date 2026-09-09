@@ -44,7 +44,7 @@ impl<T: ColTime> CorgiReduceTactic<T> {
     fn general(reducer: Reducer) -> Box<dyn ReduceTactic<T, CBatch<T>, CBatch<T>>> {
         Box::new(ProxyReduceTactic::<T, _, u64, u64>::new(
             CorgiReduceBackend::new(reducer),
-        ))
+        ).with_key_batch_size(256))
     }
 }
 
@@ -86,12 +86,12 @@ impl<T: ColTime> ReduceTactic<T, CBatch<T>, CBatch<T>> for CorgiReduceTactic<T> 
                 (Some(depth), CValue::Unit(_)) if matches!(self.reducer, Reducer::Distinct) => {
                     Box::new(ProxyReduceTactic::<T, _, (), ()>::new(UnitDistinct::new(
                         depth, 0,
-                    )))
+                    )).with_key_batch_size(1))
                 }
                 (Some(key_depth), values) if matches!(self.reducer, Reducer::Min) && leaf_depth(values).is_some() => {
                     Box::new(ProxyReduceTactic::<T, _, u64, u64>::new(ScalarMin::new(
                         key_depth, leaf_depth(values).unwrap(),
-                    )))
+                    )).with_key_batch_size(1))
                 }
                 _ => Self::general(self.reducer.clone()),
             });
@@ -328,6 +328,18 @@ impl<T: ColTime, K: ScalarKernel> ProxyReduceBackend<T, CBatch<T>, CBatch<T>, K:
             os = oe;
         }
         (corrections, ends)
+    }
+
+    #[inline]
+    fn reduce_one(
+        &mut self,
+        _key: u64,
+        input: &[(K::Token, Diff)],
+        output: &[(K::Token, Diff)],
+        corrections: &mut Vec<(K::Token, Diff)>,
+    ) -> bool {
+        K::correct(input, output, corrections);
+        true
     }
 
     fn emit(&mut self, records: &[((u64, K::Token), T, Diff)]) {
