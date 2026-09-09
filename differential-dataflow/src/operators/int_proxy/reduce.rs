@@ -1,7 +1,8 @@
 //! The proxy reduce framework.
 //!
-//! A conventional differential reduce against `(u64, u64)`, where the backend supplies the
-//! implementation of the interpretation of the integers.
+//! A conventional differential reduce against `(u64, V)`, where the backend supplies the
+//! interpretation of the key hash and value tokens. Tokens default to `u64`;
+//! specialized backends can use other `Copy + Ord` types, including `()`.
 
 use std::collections::BTreeMap;
 
@@ -38,23 +39,23 @@ pub struct ReduceInstance<'a, T, B1, B2> {
 /// interesting time is lost to netting — the invariant that once forced the runs apart.
 ///
 /// Owned by the harness and refilled by [`ProxyReduceBackend::next_window`].
-pub struct ReduceWindow<T, RIn, ROut> {
+pub struct ReduceWindow<T, RIn, ROut, VIn = u64, VOut = u64> {
     /// The key's full input — novel and prior merged, netted — sorted & consolidated by
     /// `((key_hash, value_id), time)`. May be advanced to the compaction frontier.
-    pub input: ProxyBridge<T, RIn>,
+    pub input: ProxyBridge<T, RIn, VIn>,
     /// The RAW novel time support: `(key_hash, time)` pairs sorted by `(key_hash, time)` and
     /// deduplicated, recorded from the novel batches BEFORE any consolidation or advancement —
     /// a netted-away record's time must still appear here.
     pub seeds: Vec<(u64, T)>,
     /// Accumulated output preceding the retire's interval, same ordering as `input`.
-    pub output: ProxyBridge<T, ROut>,
+    pub output: ProxyBridge<T, ROut, VOut>,
 }
 
-impl<T, RIn, ROut> Default for ReduceWindow<T, RIn, ROut> {
+impl<T, RIn, ROut, VIn, VOut> Default for ReduceWindow<T, RIn, ROut, VIn, VOut> {
     fn default() -> Self { ReduceWindow { input: Vec::new(), seeds: Vec::new(), output: Vec::new() } }
 }
 
-impl<T, RIn, ROut> ReduceWindow<T, RIn, ROut> {
+impl<T, RIn, ROut, VIn, VOut> ReduceWindow<T, RIn, ROut, VIn, VOut> {
     /// Clear the presentations, keeping their allocations.
     pub fn clear(&mut self) {
         self.input.clear();
@@ -68,7 +69,11 @@ impl<T, RIn, ROut> ReduceWindow<T, RIn, ROut> {
 /// The protocol for each round of invocation is
 /// `begin [ next_window reduce_corrections* emit ]* finish`,
 /// where the window loop runs until `next_window` reports the key space exhausted.
-pub trait ProxyReduceBackend<T, B1, B2> {
+/// Input and output tokens may have different types. Within a window each must
+/// consistently identify its data, including real keys sharing a hash. Output
+/// tokens must remain resolvable until emission. The harness treats tokens as
+/// opaque ordered values; it never casts them to integers.
+pub trait ProxyReduceBackend<T, B1, B2, VIn = u64, VOut = u64> {
     /// Diff type presented for the input.
     type RIn: Semigroup;
     /// Diff type of the output.
@@ -106,7 +111,7 @@ pub trait ProxyReduceBackend<T, B1, B2> {
         instance: &ReduceInstance<'_, T, B1, B2>,
         changed: &[u64],
         from: &mut Option<u64>,
-        window: &mut ReduceWindow<T, Self::RIn, Self::ROut>,
+        window: &mut ReduceWindow<T, Self::RIn, Self::ROut, VIn, VOut>,
     );
 
     /// A wave of input-output reconciliation, in which the backend supplies necessary edits.
@@ -118,13 +123,13 @@ pub trait ProxyReduceBackend<T, B1, B2> {
         &mut self,
         keys: &[u64],
         in_ends: &[usize],
-        input: &[(u64, Self::RIn)],
+        input: &[(VIn, Self::RIn)],
         out_ends: &[usize],
-        output: &[(u64, Self::ROut)],
-    ) -> (Vec<(u64, Self::ROut)>, Vec<usize>);
+        output: &[(VOut, Self::ROut)],
+    ) -> (Vec<(VOut, Self::ROut)>, Vec<usize>);
 
     /// Commit a collection of updates to the batch in progress.
-    fn emit(&mut self, records: &[((u64, u64), T, Self::ROut)]);
+    fn emit(&mut self, records: &[((u64, VOut), T, Self::ROut)]);
 
     /// Complete the session matching `begin`, yielding the batch it described,
     /// or `None` when the span it described carries no updates.
@@ -132,16 +137,17 @@ pub trait ProxyReduceBackend<T, B1, B2> {
 }
 
 /// A proxy-space [`ReduceTactic`]: matches input and output records by `key_hash`.
-pub struct ProxyReduceTactic<T, Bk> {
+pub struct ProxyReduceTactic<T, Bk, VIn = u64, VOut = u64> {
     backend: Bk,
     /// Pending interesting times beyond the upper frontier, keyed by key hash.
     pending: BTreeMap<u64, Vec<T>>,
+    values: std::marker::PhantomData<(VIn, VOut)>,
 }
 
-impl<T, Bk> ProxyReduceTactic<T, Bk> {
+impl<T, Bk, VIn, VOut> ProxyReduceTactic<T, Bk, VIn, VOut> {
     /// A tactic deferring all value semantics to `backend`.
     pub fn new(backend: Bk) -> Self {
-        ProxyReduceTactic { backend, pending: BTreeMap::new() }
+        ProxyReduceTactic { backend, pending: BTreeMap::new(), values: std::marker::PhantomData }
     }
 }
 
@@ -154,10 +160,12 @@ fn debug_assert_pending_frontier<T: PartialOrder + Clone>(pending: &BTreeMap<u64
     }, "maintained pending frontier differs from pending times");
 }
 
-impl<T, B1, B2, Bk> ReduceTactic<T, B1, B2> for ProxyReduceTactic<T, Bk>
+impl<T, B1, B2, Bk, VIn, VOut> ReduceTactic<T, B1, B2> for ProxyReduceTactic<T, Bk, VIn, VOut>
 where
     T: Timestamp + Lattice,
-    Bk: ProxyReduceBackend<T, B1, B2>,
+    Bk: ProxyReduceBackend<T, B1, B2, VIn, VOut>,
+    VIn: Copy + Ord,
+    VOut: Copy + Ord,
 {
     fn retire(
         &mut self,
@@ -222,22 +230,22 @@ where
         // Progress through the key space: `Some(h)` for key hashes at or above `h` remaining, `None`
         // once the backend reports the space covered.
         let mut from = Some(0u64);
-        let mut window: ReduceWindow<T, Bk::RIn, Bk::ROut> = ReduceWindow::default();
+        let mut window: ReduceWindow<T, Bk::RIn, Bk::ROut, VIn, VOut> = ReduceWindow::default();
 
         // Retire-wide reusable scratch: cleared per window or wave, never reallocated. Fresh
         // per-key/per-wave `Vec`s were once the dominant cost here, which is why the slots and the
         // staging buffers are held across the whole retire rather than built where they are used.
-        let mut slots: Vec<KeySweep<T, Bk::RIn, Bk::ROut>> = Vec::new();
+        let mut slots: Vec<KeySweep<T, Bk::RIn, Bk::ROut, VIn, VOut>> = Vec::new();
         let mut live: Vec<usize> = Vec::new();
-        let mut deltas: Vec<((u64, u64), T, Bk::ROut)> = Vec::new();
+        let mut deltas: Vec<((u64, VOut), T, Bk::ROut)> = Vec::new();
         let mut batch_keys: Vec<u64> = Vec::new();
         let mut in_ends: Vec<usize> = Vec::new();
-        let mut in_all: Vec<(u64, Bk::RIn)> = Vec::new();
+        let mut in_all: Vec<(VIn, Bk::RIn)> = Vec::new();
         let mut out_ends: Vec<usize> = Vec::new();
-        let mut out_all: Vec<(u64, Bk::ROut)> = Vec::new();
+        let mut out_all: Vec<(VOut, Bk::ROut)> = Vec::new();
         let mut active: Vec<(usize, T)> = Vec::new();
-        let mut in_accum: Vec<(u64, Bk::RIn)> = Vec::new();
-        let mut cur_out: Vec<(u64, Bk::ROut)> = Vec::new();
+        let mut in_accum: Vec<(VIn, Bk::RIn)> = Vec::new();
+        let mut cur_out: Vec<(VOut, Bk::ROut)> = Vec::new();
 
         while from.is_some() {
             let before = from;
@@ -395,16 +403,16 @@ where
 /// One key's slot in a window: its [`Sweep`], the time it is suspended at, and the times it has
 /// pended so far. Slots are reused across windows, so a key costs no allocation of its own beyond
 /// the first window wide enough to need it.
-struct KeySweep<T, RIn, ROut> {
+struct KeySweep<T, RIn, ROut, VIn, VOut> {
     key: u64,
-    sweep: Sweep<T, RIn, ROut>,
+    sweep: Sweep<T, RIn, ROut, VIn, VOut>,
     /// Times at or beyond `upper` the sweep has reached; carried forward when the slot retires.
     pended: Vec<T>,
     /// The time the sweep last suspended at, or `None` once it is spent.
     at: Option<T>,
 }
 
-impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone> KeySweep<T, RIn, ROut> {
+impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone, VIn: Copy + Ord, VOut: Copy + Ord> KeySweep<T, RIn, ROut, VIn, VOut> {
     fn empty() -> Self {
         KeySweep { key: 0, sweep: Sweep::new(), pended: Vec::new(), at: None }
     }
@@ -443,12 +451,12 @@ fn update_meet<T: Lattice + Clone>(meet: &mut Option<T>, other: Option<&T>) {
 /// witness duty, which is what lets them net and advance. Coverage is invariant under that move:
 /// the witness clause reads only times, and consolidation cancels only equal-time pairs whose time
 /// the seed list retains.
-struct Sweep<T, RIn, ROut> {
+struct Sweep<T, RIn, ROut, VIn, VOut> {
     /// The accumulated input (novel and prior, merged and netted) and output: join partners, and
     /// the accumulations to evaluate over. Both may be advanced freely — witness duty lives in
     /// `seeds`, not in any record.
-    input: ValueHistory<u64, T, RIn>,
-    output: ValueHistory<u64, T, ROut>,
+    input: ValueHistory<VIn, T, RIn>,
+    output: ValueHistory<VOut, T, ROut>,
     /// The key's seed times — the harness's due (warned) times merged with the raw novel time
     /// support — ascending and deduplicated, with their suffix meets; `seed_pos` consumes them.
     /// These are the ONLY source of interest: the schedule is stated over them, so they are held
@@ -466,7 +474,7 @@ struct Sweep<T, RIn, ROut> {
     temporary: Vec<T>,
     /// Corrections emitted so far this sweep, meet-collapsed; both a join partner and part of the
     /// output accumulation.
-    produced: Vec<((u64, T), ROut)>,
+    produced: Vec<((VOut, T), ROut)>,
     /// The meet of every time still to come.
     meet: Option<T>,
     /// Whether the last `next_crossing` returned a time whose step is not yet settled.
@@ -485,7 +493,7 @@ enum Tick<T> {
     Done,
 }
 
-impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone> Sweep<T, RIn, ROut> {
+impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone, VIn: Copy + Ord, VOut: Copy + Ord> Sweep<T, RIn, ROut, VIn, VOut> {
     /// An empty sweep, to be `load`ed. Reuse one per key rather than allocating per key.
     fn new() -> Self {
         Sweep {
@@ -508,8 +516,8 @@ impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone> Sw
         &mut self,
         owed: &[T],
         novel_times: impl Iterator<Item = T>,
-        input: impl Iterator<Item = (u64, T, RIn)>,
-        output: impl Iterator<Item = (u64, T, ROut)>,
+        input: impl Iterator<Item = (VIn, T, RIn)>,
+        output: impl Iterator<Item = (VOut, T, ROut)>,
     ) {
         // Merge the two ascending seed sources, deduplicated.
         self.seeds.clear();
@@ -676,7 +684,7 @@ impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone> Sw
     }
 
     /// The input accumulation at the suspended time.
-    fn input_at(&self, at: &T, into: &mut Vec<(u64, RIn)>) {
+    fn input_at(&self, at: &T, into: &mut Vec<(VIn, RIn)>) {
         for ((id, time), diff) in self.input.buffer().iter() {
             if time.less_equal(at) { into.push((*id, diff.clone())); }
         }
@@ -684,7 +692,7 @@ impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone> Sw
     }
 
     /// The tentative output accumulation at the suspended time, including this sweep's corrections.
-    fn output_at(&self, at: &T, into: &mut Vec<(u64, ROut)>) {
+    fn output_at(&self, at: &T, into: &mut Vec<(VOut, ROut)>) {
         for ((id, time), diff) in self.output.buffer().iter().chain(self.produced.iter()) {
             if time.less_equal(at) { into.push((*id, diff.clone())); }
         }
@@ -692,7 +700,7 @@ impl<T: Timestamp + Lattice, RIn: Semigroup + Clone, ROut: Semigroup + Clone> Sw
     }
 
     /// Record the corrections evaluated at the suspended time, and collapse them by the meet.
-    fn commit(&mut self, at: &T, corrections: impl Iterator<Item = (u64, ROut)>) {
+    fn commit(&mut self, at: &T, corrections: impl Iterator<Item = (VOut, ROut)>) {
         let before = self.produced.len();
         for (id, diff) in corrections { self.produced.push(((id, at.clone()), diff)); }
         if self.produced.len() > before {

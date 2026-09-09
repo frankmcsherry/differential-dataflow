@@ -43,6 +43,9 @@ use crate::corgi::chunk::{columns_to_batch, key_ids, key_lane, CorgiChunk};
 use crate::ir::Diff;
 use crate::parse::Reducer;
 
+mod unit;
+pub use unit::CorgiReduceTactic;
+
 type CBatch<T> = Rc<ChunkBatch<CorgiChunk<T, Diff>>>;
 
 /// Build a sortable view matching DDIR's signed leaves and lexicographic lists.

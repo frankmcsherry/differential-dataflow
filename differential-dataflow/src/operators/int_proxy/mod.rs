@@ -48,17 +48,22 @@ pub mod join;
 pub mod reduce;
 pub mod vec_backend;
 
-/// Integer-only exchange medium: a consolidated collection of `[((hash, id), time, diff)]`.
+/// Proxy exchange medium: a consolidated collection of `[((hash, id), time, diff)]`.
+///
+/// The default value token is `u64`. Reduce may specialize the token, for example
+/// to `()` when the hash identifies the full key and there is only one value.
+/// Token equality must still distinguish data within each hash, including keys
+/// that collide; a unit token is unsuitable when such collisions are possible.
 ///
 /// The [`debug_assert_sorted_bridge`] method is (and can be) used to validate this property.
-pub type ProxyBridge<T, R> = Vec<((u64, u64), T, R)>;
+pub type ProxyBridge<T, R, V = u64> = Vec<((u64, V), T, R)>;
 
 /// Debug check that a presented [`ProxyBridge`] is consolidated.
 ///
 /// Operator harnesses use the test to flag backend implementations that do not uphold it.
-pub(crate) fn debug_assert_sorted_bridge<T: Ord, R>(bridge: &ProxyBridge<T, R>, who: &str) {
+pub(crate) fn debug_assert_sorted_bridge<T: Ord, R, V: Ord>(bridge: &ProxyBridge<T, R, V>, who: &str) {
     debug_assert!(
-        bridge.windows(2).all(|w| (w[0].0, &w[0].1) < (w[1].0, &w[1].1)),
+        bridge.windows(2).all(|w| (&w[0].0, &w[0].1) < (&w[1].0, &w[1].1)),
         "{}: a presented bridge must be sorted & consolidated by ((key_hash, value_id), time)",
         who,
     );
