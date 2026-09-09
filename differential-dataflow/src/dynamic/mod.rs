@@ -48,14 +48,10 @@ where
             let mut output = output.activate();
             input.for_each(|cap, data| {
                 let mut new_time = cap.time().clone();
-                let mut vec = std::mem::take(&mut new_time.inner).into_inner();
-                vec.truncate(level - 1);
-                new_time.inner = PointStamp::new(vec);
+                new_time.inner.truncate(level - 1);
                 let new_cap = cap.delayed(&new_time, 0);
                 for (_data, time, _diff) in data.iter_mut() {
-                    let mut vec = std::mem::take(&mut time.inner).into_inner();
-                    vec.truncate(level - 1);
-                    time.inner = PointStamp::new(vec);
+                    time.inner.truncate(level - 1);
                 }
                 output.session(&new_cap).give_container(data);
             });

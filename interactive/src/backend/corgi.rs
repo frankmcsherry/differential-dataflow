@@ -353,7 +353,7 @@ impl Backend for CorgiBackend {
         use timely::dataflow::operators::generic::{builder_rc::OperatorBuilder, OutputBuilder};
         use timely::order::Product;
         use timely::progress::Antichain;
-        use differential_dataflow::dynamic::pointstamp::{PointStamp, PointStampSummary};
+        use differential_dataflow::dynamic::pointstamp::PointStampSummary;
 
         let mut builder = OperatorBuilder::new("CorgiLeaveDynamic".to_string(), c.inner.scope());
         let (output, stream) = builder.new_output();
@@ -365,14 +365,10 @@ impl Backend for CorgiBackend {
             let mut output = output.activate();
             input.for_each(|cap, data| {
                 let mut new_time = cap.time().clone();
-                let mut v = std::mem::take(&mut new_time.inner).into_inner();
-                v.truncate(level - 1);
-                new_time.inner = PointStamp::new(v);
+                new_time.inner.truncate(level - 1);
                 let new_cap = cap.delayed(&new_time, 0);
                 for t in data.times.iter_mut() {
-                    let mut v = std::mem::take(&mut t.inner).into_inner();
-                    v.truncate(level - 1);
-                    t.inner = PointStamp::new(v);
+                    t.inner.truncate(level - 1);
                 }
                 output.session(&new_cap).give_container(data);
             });

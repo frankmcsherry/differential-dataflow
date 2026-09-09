@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 #[columnar(derive(Eq, PartialEq, Ord, PartialOrd))]
 pub struct PointStamp<T> {
     /// A sequence of timestamps corresponding to timestamps in a sequence of nested scopes.
-    vector: SmallVec<[T; 1]>,
+    vector: SmallVec<[T; 2]>,
 }
 
 impl<T: Timestamp> PartialEq<[T]> for PointStamp<T> {
@@ -66,15 +66,39 @@ impl<T: Timestamp> PointStamp<T> {
         while vector.last() == Some(&T::minimum()) {
             vector.pop();
         }
+        // Preserve the public constructor's input type. Longer vectors transfer
+        // their allocation; the two common iteration coordinates stay inline.
+        let vector = if vector.len() > 2 {
+            SmallVec::from_vec(vector.into_vec())
+        } else {
+            vector.into_iter().collect()
+        };
         PointStamp { vector }
     }
+
+    fn from_inline(mut vector: SmallVec<[T; 2]>) -> Self {
+        while vector.last() == Some(&T::minimum()) { vector.pop(); }
+        PointStamp { vector }
+    }
+    /// Retain at most `len` coordinates and remove trailing minimums in place.
+    /// This preserves the timestamp's canonical representation without converting
+    /// through the public one-coordinate small-vector representation.
+    pub fn truncate(&mut self, len: usize) {
+        self.vector.truncate(len);
+        while self.vector.last() == Some(&T::minimum()) { self.vector.pop(); }
+    }
+
     /// Returns the wrapped small vector.
     ///
-    /// This method is the support way to mutate the contents of `self`, by extracting
+    /// Contents can be changed by extracting
     /// the vector and then re-introducing it with `PointStamp::new` to re-establish
     /// the invariant that the vector not end with `T::minimum`.
     pub fn into_inner(self) -> SmallVec<[T; 1]> {
-        self.vector
+        if self.vector.len() > 2 {
+            SmallVec::from_vec(self.vector.into_vec())
+        } else {
+            self.vector.into_iter().collect()
+        }
     }
 }
 
@@ -82,6 +106,14 @@ impl<T> std::ops::Deref for PointStamp<T> {
     type Target = [T];
     fn deref(&self) -> &Self::Target {
         &self.vector
+    }
+}
+
+impl<T: Timestamp> FromIterator<T> for PointStamp<T> {
+    /// Collect coordinates directly into the inline representation and remove
+    /// trailing minimums, without passing through a smaller public small vector.
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from_inline(iter.into_iter().collect())
     }
 }
 
@@ -144,7 +176,7 @@ impl<T: Timestamp> PathSummary<PointStamp<T>> for PointStampSummary<T::Summary> 
             &timestamp.vector[..]
         };
 
-        let mut vector = Vec::with_capacity(std::cmp::max(timestamps.len(), self.actions.len()));
+        let mut vector = SmallVec::<[T; 2]>::with_capacity(std::cmp::max(timestamps.len(), self.actions.len()));
         // Introduce elements where both timestamp and action exist.
         let min_len = std::cmp::min(timestamps.len(), self.actions.len());
         for (action, timestamp) in self.actions.iter().zip(timestamps.iter()) {
@@ -159,7 +191,7 @@ impl<T: Timestamp> PathSummary<PointStamp<T>> for PointStampSummary<T::Summary> 
             vector.push(action.results_in(&T::minimum())?);
         }
 
-        Some(PointStamp::new(vector.into()))
+        Some(PointStamp::from_inline(vector))
     }
     fn followed_by(&self, other: &Self) -> Option<Self> {
         // The output `retain` will be the minimum of the two inputs.
@@ -241,7 +273,7 @@ impl<T: Lattice + Timestamp> Lattice for PointStamp<T> {
         for time in &other.vector[min_len..] {
             vector.push(time.clone());
         }
-        Self::new(vector)
+        Self::from_inline(vector)
     }
     #[inline]
     fn join_assign(&mut self, other: &Self) {
@@ -264,7 +296,7 @@ impl<T: Lattice + Timestamp> Lattice for PointStamp<T> {
             vector.push(self.vector[index].meet(&other.vector[index]));
         }
         // Remaining coordinates are `T::minimum()` in one input, and so in the output.
-        Self::new(vector)
+        Self::from_inline(vector)
     }
     #[inline]
     fn meet_assign(&mut self, other: &Self) {
@@ -274,6 +306,62 @@ impl<T: Lattice + Timestamp> Lattice for PointStamp<T> {
             this.meet_assign(that);
         }
         while self.vector.last() == Some(&T::minimum()) { self.vector.pop(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use columnar::{Borrow, Index};
+
+    #[test]
+    fn truncation_and_summaries_match_coordinate_reference() {
+        for length in 0..8 {
+            let stamp: PointStamp<u64> = (0..length).map(|i| if i % 2 == 0 { i + 1 } else { 0 }).collect();
+            for keep in 0..9 {
+                let mut truncated = stamp.clone();
+                truncated.truncate(keep);
+                let expected: PointStamp<u64> = stamp.iter().take(keep).copied().collect();
+                assert_eq!(truncated, expected);
+            }
+            for retain in std::iter::once(None).chain((0..9).map(Some)) {
+                for actions_len in 0..8 {
+                    let actions: Vec<u64> = (0..actions_len).collect();
+                    let summary = PointStampSummary { retain, actions: actions.clone() };
+                    let retained: Vec<_> = stamp.iter().take(retain.unwrap_or(usize::MAX)).copied().collect();
+                    let expected: PointStamp<u64> = (0..retained.len().max(actions.len()))
+                        .map(|i| retained.as_slice().get(i).copied().unwrap_or(0) + actions.as_slice().get(i).copied().unwrap_or(0))
+                        .collect();
+                    let actual = summary.results_in(&stamp).unwrap();
+                    assert_eq!(actual, expected);
+                    if retained.len().max(actions.len()) <= 2 { assert!(!actual.vector.spilled()); }
+                }
+            }
+        }
+        let overflow = PointStampSummary { retain: None, actions: vec![1u64] };
+        assert_eq!(overflow.results_in(&[u64::MAX].into_iter().collect()), None);
+    }
+
+    #[test]
+    fn public_and_columnar_roundtrips_across_inline_boundary() {
+        let mut reusable = PointStamp::<u64>::minimum();
+        for length in (0..8).chain((0..8).rev()) {
+            let input: SmallVec<[u64; 1]> = (1..=length).chain([0, 0]).collect();
+            let stamp = PointStamp::new(input);
+            let collected: PointStamp<u64> = (1..=length).chain([0, 0]).collect();
+            assert_eq!(collected, stamp);
+            assert_eq!(&*stamp, &(1..=length).collect::<Vec<_>>());
+            assert_eq!(&*stamp.clone().into_inner(), &*stamp);
+            let columns = PointStamp::as_columns([&stamp]);
+            assert_eq!(PointStamp::into_owned(columns.borrow().get(0)), stamp);
+            Columnar::copy_from(&mut reusable, columns.borrow().get(0));
+            assert_eq!(reusable, stamp);
+            assert_eq!(stamp.vector.spilled(), length > 2);
+        }
+        eprintln!("u64 layout: PointStamp={}, Product<u64,PointStamp>={}, SmallVec<[u64;1]>={}, SmallVec<[u64;2]>={}",
+            std::mem::size_of::<PointStamp<u64>>(),
+            std::mem::size_of::<timely::order::Product<u64, PointStamp<u64>>>(),
+            std::mem::size_of::<SmallVec<[u64; 1]>>(), std::mem::size_of::<SmallVec<[u64; 2]>>());
     }
 }
 
@@ -287,7 +375,7 @@ mod columnation {
     }
 
     /// Stack for PointStamp. Part of Columnation implementation.
-    pub struct PointStampStack<R: Region<Item: Columnation+Clone>>(<SmallVec<[R::Item; 1]> as Columnation>::InnerRegion);
+    pub struct PointStampStack<R: Region<Item: Columnation+Clone>>(<SmallVec<[R::Item; 2]> as Columnation>::InnerRegion);
 
     impl<R: Region<Item: Columnation+Clone>> Default for PointStampStack<R> {
         #[inline]
