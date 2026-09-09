@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 #[columnar(derive(Eq, PartialEq, Ord, PartialOrd))]
 pub struct PointStamp<T> {
     /// A sequence of timestamps corresponding to timestamps in a sequence of nested scopes.
-    vector: SmallVec<[T; 2]>,
+    vector: SmallVec<[T; 1]>,
 }
 
 impl<T: Timestamp> PartialEq<[T]> for PointStamp<T> {
@@ -66,17 +66,10 @@ impl<T: Timestamp> PointStamp<T> {
         while vector.last() == Some(&T::minimum()) {
             vector.pop();
         }
-        // Preserve the public constructor's input type. Longer vectors transfer
-        // their allocation; the two common iteration coordinates stay inline.
-        let vector = if vector.len() > 2 {
-            SmallVec::from_vec(vector.into_vec())
-        } else {
-            vector.into_iter().collect()
-        };
         PointStamp { vector }
     }
 
-    fn from_inline(mut vector: SmallVec<[T; 2]>) -> Self {
+    fn from_inline(mut vector: SmallVec<[T; 1]>) -> Self {
         while vector.last() == Some(&T::minimum()) { vector.pop(); }
         PointStamp { vector }
     }
@@ -94,11 +87,7 @@ impl<T: Timestamp> PointStamp<T> {
     /// the vector and then re-introducing it with `PointStamp::new` to re-establish
     /// the invariant that the vector not end with `T::minimum`.
     pub fn into_inner(self) -> SmallVec<[T; 1]> {
-        if self.vector.len() > 2 {
-            SmallVec::from_vec(self.vector.into_vec())
-        } else {
-            self.vector.into_iter().collect()
-        }
+        self.vector
     }
 }
 
@@ -176,7 +165,7 @@ impl<T: Timestamp> PathSummary<PointStamp<T>> for PointStampSummary<T::Summary> 
             &timestamp.vector[..]
         };
 
-        let mut vector = SmallVec::<[T; 2]>::with_capacity(std::cmp::max(timestamps.len(), self.actions.len()));
+        let mut vector = SmallVec::<[T; 1]>::with_capacity(std::cmp::max(timestamps.len(), self.actions.len()));
         // Introduce elements where both timestamp and action exist.
         let min_len = std::cmp::min(timestamps.len(), self.actions.len());
         for (action, timestamp) in self.actions.iter().zip(timestamps.iter()) {
@@ -334,7 +323,7 @@ mod tests {
                         .collect();
                     let actual = summary.results_in(&stamp).unwrap();
                     assert_eq!(actual, expected);
-                    if retained.len().max(actions.len()) <= 2 { assert!(!actual.vector.spilled()); }
+                    if retained.len().max(actions.len()) <= 1 { assert!(!actual.vector.spilled()); }
                 }
             }
         }
@@ -356,7 +345,9 @@ mod tests {
             assert_eq!(PointStamp::into_owned(columns.borrow().get(0)), stamp);
             Columnar::copy_from(&mut reusable, columns.borrow().get(0));
             assert_eq!(reusable, stamp);
-            assert_eq!(stamp.vector.spilled(), length > 2);
+            // The original constructor may retain a spill after trimming zeros.
+            let unpadded: PointStamp<u64> = (1..=length).collect();
+            assert_eq!(unpadded.vector.spilled(), length > 1);
         }
         eprintln!("u64 layout: PointStamp={}, Product<u64,PointStamp>={}, SmallVec<[u64;1]>={}, SmallVec<[u64;2]>={}",
             std::mem::size_of::<PointStamp<u64>>(),
@@ -375,7 +366,7 @@ mod columnation {
     }
 
     /// Stack for PointStamp. Part of Columnation implementation.
-    pub struct PointStampStack<R: Region<Item: Columnation+Clone>>(<SmallVec<[R::Item; 2]> as Columnation>::InnerRegion);
+    pub struct PointStampStack<R: Region<Item: Columnation+Clone>>(<SmallVec<[R::Item; 1]> as Columnation>::InnerRegion);
 
     impl<R: Region<Item: Columnation+Clone>> Default for PointStampStack<R> {
         #[inline]
