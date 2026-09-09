@@ -6,7 +6,7 @@
 //! All `Backend` methods are corgi-native: `linear` folds a `LinearOp` chain over each container
 //! ([`apply_ops`], columnar fast paths with row-wise fallbacks); `arrange` ingests columns without
 //! a row round-trip; `join`/`reduce` run through the int-proxy tactics ([`CorgiJoinBackend`],
-//! [`CorgiReduceBackend`]) over the columnar chunks.
+//! [`CorgiMinTactic`]) over the columnar chunks.
 
 use timely::dataflow::Scope;
 use timely::dataflow::channels::pact::Pipeline;
@@ -28,8 +28,8 @@ use crate::corgi::chunk::{recover_key, CorgiChunk, CorgiChunker};
 use crate::corgi::container::CorgiContainer;
 use crate::corgi::exchange::CorgiPact;
 use crate::corgi::join::CorgiJoinBackend;
-use crate::corgi::reduce::CorgiReduceBackend;
-use differential_dataflow::operators::int_proxy::{ProxyJoinTactic, ProxyReduceTactic};
+use crate::corgi::reduce::CorgiMinTactic;
+use differential_dataflow::operators::int_proxy::ProxyJoinTactic;
 use crate::corgi::logic::{compilable, compile_flatmap, compile_predicate, compile_projection, compile_scalar, shape_of_row};
 use corgi::{Graph, NumOp, Shape};
 use crate::ir::{Diff, LinearOp, Time, Value as DValue};
@@ -326,7 +326,7 @@ impl Backend for CorgiBackend {
     }
 
     fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer) -> Self::Arr<'s> {
-        reduce_with_tactic::<_, CTrace, _>(a, "CorgiReduce", ProxyReduceTactic::new(CorgiReduceBackend::new(reducer.clone())))
+        reduce_with_tactic::<_, CTrace, _>(a, "CorgiReduce", CorgiMinTactic::new(reducer.clone()))
     }
 
     fn inspect<'s>(c: Collection<'s, Time, CC>, label: String) -> Collection<'s, Time, CC> {
