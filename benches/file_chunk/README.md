@@ -257,8 +257,10 @@ limits, not reported as successful complete runs.
 
 The master-next port also adds a test for update-free span progress, canonical
 absent payloads, and extending a cached absence when a key first appears.
-Port verification is recorded separately in `tests-master-next.log` and
-`results-master-next`; the historical logs above are unchanged.
+Port verification passed 58 tests with one existing library test ignored.
+Small end-to-end checks covered the fixed and moving hot-key joins, suffix
+reads, eviction, and resident/paged checksum agreement. Their raw run artifacts
+are omitted; the historical measurements above are unchanged.
 
 Refresh through `7576bfe3` (cursor cleanup #866): the same test command passed
 58 tests with one existing library test ignored; see `tests-refresh.log`.

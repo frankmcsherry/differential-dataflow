@@ -28,6 +28,6 @@ The large source is static; query memberships change. COUNT only receives sparse
 - 58 tests passed: 42 library, 10 cache, and six file-wrapper tests; one existing library test ignored. Both additional example test targets compile.
 - A 1M-update file-backed join completed 12 checked rounds below 7 MiB peak RSS and did zero file I/O after warm-up.
 - Moving clustered-key join, suffix/eviction cache example, and small resident/paged benchmark checks passed.
-- New-port logs are in `benches/file_chunk/results-master-next` and `tests-master-next.log`; historical measurements remain separate.
+- Port validation is summarized in `benches/file_chunk/README.md`; historical measurements remain separate.
 
 This draft is a checkpoint for later work, not a production-ready change.

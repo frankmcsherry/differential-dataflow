@@ -1,4 +1,0 @@
-     cold: 4 file reads, 4 updates in 1 cached chunks, upper [2]
-   repeat: 0 file reads, 4 updates in 1 cached chunks, upper [2]
-new batch: 2 file reads, 6 updates in 1 cached chunks, upper [3]
-  evicted: 6 file reads, 6 updates in 1 cached chunks, upper [3]

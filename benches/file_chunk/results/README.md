@@ -2,7 +2,7 @@
 
 These runs used the corrected, incrementally packed selection implementation
 at the original `file-chunk-spike` checkpoint (`3fecff64`). They predate the
-master-next port. Small checks of that port are in `../results-master-next`.
+master-next port. Validation of that port is summarized in `../README.md`.
 
 - `summary.csv` collects source size, peak RSS, timings, I/O, completed rounds,
   and any watchdog stop. It is the starting point for comparing workloads.
