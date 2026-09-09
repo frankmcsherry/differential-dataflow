@@ -46,6 +46,10 @@ pub trait Backend {
     fn as_collection<'s>(a: Self::Arr<'s>) -> Collection<'s, Time, Self::Container>;
     fn join<'s>(l: Self::Arr<'s>, r: Self::Arr<'s>, projection: &Projection) -> Collection<'s, Time, Self::Container>;
     fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer) -> Self::Arr<'s>;
+    /// Reduce with the scope's known coordinate depth available for specialization.
+    fn reduce_at<'s>(a: Self::Arr<'s>, reducer: &Reducer, _depth: usize) -> Self::Arr<'s> {
+        Self::reduce(a, reducer)
+    }
     fn inspect<'s>(c: Collection<'s, Time, Self::Container>, label: String) -> Collection<'s, Time, Self::Container>;
     fn leave_dynamic<'s>(c: Collection<'s, Time, Self::Container>, depth: usize) -> Collection<'s, Time, Self::Container>;
 }
@@ -140,7 +144,7 @@ pub fn render_tree<'s, B: Backend>(
                     },
                     st::Node::Reduce { input, reducer } => {
                         let a = resolve(&items, &imports, &var_cols, input).arrange();
-                        Rendered::Arrangement(B::reduce(a, reducer))
+                        Rendered::Arrangement(B::reduce_at(a, reducer, depth))
                     },
                     st::Node::Inspect { input, label } => {
                         let c = resolve(&items, &imports, &var_cols, input).collection();

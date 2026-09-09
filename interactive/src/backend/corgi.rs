@@ -329,6 +329,10 @@ impl Backend for CorgiBackend {
         reduce_with_tactic::<_, CTrace, _>(a, "CorgiReduce", CorgiReduceTactic::new(reducer.clone()))
     }
 
+    fn reduce_at<'s>(a: Self::Arr<'s>, reducer: &Reducer, depth: usize) -> Self::Arr<'s> {
+        reduce_with_tactic::<_, CTrace, _>(a, "CorgiReduce", CorgiReduceTactic::with_depth(reducer.clone(), depth))
+    }
+
     fn inspect<'s>(c: Collection<'s, Time, CC>, label: String) -> Collection<'s, Time, CC> {
         c.inner
             .unary(Pipeline, "CorgiInspect", move |_, _| {

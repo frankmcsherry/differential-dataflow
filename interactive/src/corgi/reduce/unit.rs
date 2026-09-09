@@ -7,19 +7,22 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::rc::Rc;
 
-use corgi::arrange::leaf_slice;
 use corgi::Value as CValue;
+use corgi::arrange::leaf_slice;
+use differential_dataflow::operators::int_proxy::ProxyBridge;
 use differential_dataflow::operators::int_proxy::reduce::{
     ProxyReduceBackend, ProxyReduceTactic, ReduceInstance, ReduceWindow,
 };
-use differential_dataflow::operators::int_proxy::ProxyBridge;
 use differential_dataflow::operators::reduce::ReduceTactic;
 use differential_dataflow::trace::{Description, Span};
 use timely::progress::Antichain;
 
-use super::{chunks_of, CBatch, CorgiReduceBackend};
-use crate::corgi::chunk::{columns_to_batch, CorgiChunk};
+use super::{CBatch, CorgiReduceBackend, chunks_of};
+use crate::corgi::chunk::{CorgiChunk, columns_to_batch};
 use crate::corgi::col_times::ColTime;
+use crate::corgi::time_kernel::KernelTime as ProxyTime;
+
+mod fixed;
 use crate::corgi::search::MatchingRanges;
 use crate::ir::Diff;
 use crate::parse::Reducer;
@@ -28,6 +31,9 @@ use crate::parse::Reducer;
 /// Empty retires do not pin the choice, which matters on sparsely fed workers.
 pub struct CorgiReduceTactic<T: ColTime> {
     reducer: Reducer,
+    depth: usize,
+    select:
+        fn(&Reducer, &CorgiChunk<T, Diff>, usize) -> Box<dyn ReduceTactic<T, CBatch<T>, CBatch<T>>>,
     inner: Option<Box<dyn ReduceTactic<T, CBatch<T>, CBatch<T>>>>,
 }
 
@@ -38,13 +44,44 @@ impl<T: ColTime> CorgiReduceTactic<T> {
         } else {
             Some(Self::general(reducer.clone()))
         };
-        Self { reducer, inner }
+        Self {
+            reducer,
+            inner,
+            depth: 0,
+            select: Self::select,
+        }
+    }
+
+    fn select(
+        reducer: &Reducer,
+        first: &CorgiChunk<T, Diff>,
+        _depth: usize,
+    ) -> Box<dyn ReduceTactic<T, CBatch<T>, CBatch<T>>> {
+        match (leaf_depth(first.keys()), first.vals()) {
+            (Some(depth), CValue::Unit(_)) if matches!(*reducer, Reducer::Distinct) => Box::new(
+                ProxyReduceTactic::<T, _, (), ()>::new(UnitDistinct::new(depth, 0))
+                    .with_key_batch_size(1),
+            ),
+            (Some(key_depth), values)
+                if matches!(*reducer, Reducer::Min) && leaf_depth(values).is_some() =>
+            {
+                Box::new(
+                    ProxyReduceTactic::<T, _, u64, u64>::new(ScalarMin::new(
+                        key_depth,
+                        leaf_depth(values).unwrap(),
+                    ))
+                    .with_key_batch_size(1),
+                )
+            }
+            _ => Self::general(reducer.clone()),
+        }
     }
 
     fn general(reducer: Reducer) -> Box<dyn ReduceTactic<T, CBatch<T>, CBatch<T>>> {
-        Box::new(ProxyReduceTactic::<T, _, u64, u64>::new(
-            CorgiReduceBackend::new(reducer),
-        ).with_key_batch_size(256))
+        Box::new(
+            ProxyReduceTactic::<T, _, u64, u64>::new(CorgiReduceBackend::new(reducer))
+                .with_key_batch_size(256),
+        )
     }
 }
 
@@ -82,19 +119,7 @@ impl<T: ColTime> ReduceTactic<T, CBatch<T>, CBatch<T>> for CorgiReduceTactic<T> 
                     Antichain::new(),
                 );
             };
-            self.inner = Some(match (leaf_depth(first.keys()), first.vals()) {
-                (Some(depth), CValue::Unit(_)) if matches!(self.reducer, Reducer::Distinct) => {
-                    Box::new(ProxyReduceTactic::<T, _, (), ()>::new(UnitDistinct::new(
-                        depth, 0,
-                    )).with_key_batch_size(1))
-                }
-                (Some(key_depth), values) if matches!(self.reducer, Reducer::Min) && leaf_depth(values).is_some() => {
-                    Box::new(ProxyReduceTactic::<T, _, u64, u64>::new(ScalarMin::new(
-                        key_depth, leaf_depth(values).unwrap(),
-                    )).with_key_batch_size(1))
-                }
-                _ => Self::general(self.reducer.clone()),
-            });
+            self.inner = Some((self.select)(&self.reducer, first, self.depth));
         }
         self.inner
             .as_mut()
@@ -119,47 +144,71 @@ trait ScalarKernel {
     type Token: Copy + Ord;
     fn depth(values: &CValue) -> Option<usize>;
     fn token(values: Option<&[u64]>, index: usize) -> Self::Token;
-    fn correct(input: &[(Self::Token, Diff)], output: &[(Self::Token, Diff)], into: &mut Vec<(Self::Token, Diff)>);
+    fn correct(
+        input: &[(Self::Token, Diff)],
+        output: &[(Self::Token, Diff)],
+        into: &mut Vec<(Self::Token, Diff)>,
+    );
     fn column(values: Vec<Self::Token>, depth: usize) -> CValue;
 }
 
 struct UnitKernel;
 impl ScalarKernel for UnitKernel {
     type Token = ();
-    fn depth(values: &CValue) -> Option<usize> { matches!(values, CValue::Unit(_)).then_some(0) }
+    fn depth(values: &CValue) -> Option<usize> {
+        matches!(values, CValue::Unit(_)).then_some(0)
+    }
     fn token(_: Option<&[u64]>, _: usize) {}
     fn correct(input: &[((), Diff)], output: &[((), Diff)], into: &mut Vec<((), Diff)>) {
         let present = input.iter().any(|(_, d)| *d != 0);
         let current: Diff = output.iter().map(|(_, d)| *d).sum();
         let correction = Diff::from(present) - current;
-        if correction != 0 { into.push(((), correction)); }
+        if correction != 0 {
+            into.push(((), correction));
+        }
     }
-    fn column(values: Vec<()>, _: usize) -> CValue { CValue::Unit(values.len()) }
+    fn column(values: Vec<()>, _: usize) -> CValue {
+        CValue::Unit(values.len())
+    }
 }
 
 struct MinKernel;
 impl ScalarKernel for MinKernel {
     type Token = u64;
-    fn depth(values: &CValue) -> Option<usize> { leaf_depth(values) }
-    fn token(values: Option<&[u64]>, index: usize) -> u64 { values.unwrap()[index] }
+    fn depth(values: &CValue) -> Option<usize> {
+        leaf_depth(values)
+    }
+    fn token(values: Option<&[u64]>, index: usize) -> u64 {
+        values.unwrap()[index]
+    }
     fn correct(input: &[(u64, Diff)], output: &[(u64, Diff)], into: &mut Vec<(u64, Diff)>) {
         // Physical token order is unsigned; DDIR integer minimum is signed.
         // Negative multiplicities remain present, just as in the general reducer.
-        let desired = input.iter().filter(|(_, d)| *d != 0).map(|(v, _)| *v).min_by_key(|v| *v as i64);
+        let desired = input
+            .iter()
+            .filter(|(_, d)| *d != 0)
+            .map(|(v, _)| *v)
+            .min_by_key(|v| *v as i64);
         let mut inserted = false;
         for &(value, diff) in output {
             let keep = Some(value) == desired;
             inserted |= keep;
             let correction = Diff::from(keep) - diff;
-            if correction != 0 { into.push((value, correction)); }
+            if correction != 0 {
+                into.push((value, correction));
+            }
         }
         if !inserted {
-            if let Some(value) = desired { into.push((value, 1)); }
+            if let Some(value) = desired {
+                into.push((value, 1));
+            }
         }
     }
     fn column(values: Vec<u64>, depth: usize) -> CValue {
         let mut column = CValue::u64(values);
-        for _ in 0..depth { column = CValue::Prod(vec![column]); }
+        for _ in 0..depth {
+            column = CValue::Prod(vec![column]);
+        }
         column
     }
 }
@@ -167,18 +216,18 @@ impl ScalarKernel for MinKernel {
 type UnitDistinct<T> = IdentityReduce<T, UnitKernel>;
 type ScalarMin<T> = IdentityReduce<T, MinKernel>;
 
-struct IdentityReduce<T: ColTime, K: ScalarKernel> {
+struct IdentityReduce<T: ColTime, K: ScalarKernel, P: ProxyTime<T> = T> {
     key_depth: usize,
     value_depth: usize,
     values: Vec<K::Token>,
-    scratch: ProxyBridge<T, Diff, K::Token>,
+    scratch: ProxyBridge<P, Diff, K::Token>,
     run_ends: Vec<usize>,
     keys: Vec<u64>,
     times: Vec<T>,
     diffs: Vec<Diff>,
 }
 
-impl<T: ColTime, K: ScalarKernel> IdentityReduce<T, K> {
+impl<T: ColTime, K: ScalarKernel, P: ProxyTime<T>> IdentityReduce<T, K, P> {
     fn new(key_depth: usize, value_depth: usize) -> Self {
         Self {
             key_depth,
@@ -198,7 +247,7 @@ impl<T: ColTime, K: ScalarKernel> IdentityReduce<T, K> {
         &mut self,
         chunks: &[&CorgiChunk<T, Diff>],
         changed: &[u64],
-        into: &mut ProxyBridge<T, Diff, K::Token>,
+        into: &mut ProxyBridge<P, Diff, K::Token>,
     ) {
         self.scratch.clear();
         self.run_ends.clear();
@@ -209,14 +258,21 @@ impl<T: ColTime, K: ScalarKernel> IdentityReduce<T, K> {
                 Some(self.key_depth),
                 "identity reduce: key shape changed"
             );
-            assert_eq!(K::depth(chunk.vals()), Some(self.value_depth), "identity reduce: value shape changed");
+            assert_eq!(
+                K::depth(chunk.vals()),
+                Some(self.value_depth),
+                "identity reduce: value shape changed"
+            );
             let values = leaf_slice(chunk.vals());
             let keys = leaf_slice(chunk.keys()).unwrap();
             let before = self.scratch.len();
             for (j, range) in MatchingRanges::new(changed, keys) {
                 for i in range {
-                    self.scratch
-                        .push(((changed[j], K::token(values, i)), chunk.times().get(i), chunk.diffs()[i]));
+                    self.scratch.push((
+                        (changed[j], K::token(values, i)),
+                        P::read(chunk.times(), i),
+                        chunk.diffs()[i],
+                    ));
                 }
             }
             if self.scratch.len() > before {
@@ -239,7 +295,10 @@ impl<T: ColTime, K: ScalarKernel> IdentityReduce<T, K> {
         while let Some(mut head) = heap.peek_mut() {
             let Reverse((key, value, time, run, i)) = *head;
             let diff = self.scratch[i].2;
-            if let Some(last) = into.last_mut().filter(|r| r.0 == (key, value) && &r.1 == time) {
+            if let Some(last) = into
+                .last_mut()
+                .filter(|r| r.0 == (key, value) && &r.1 == time)
+            {
                 last.2 += diff;
             } else {
                 if into.last().is_some_and(|r| r.2 == 0) {
@@ -261,11 +320,13 @@ impl<T: ColTime, K: ScalarKernel> IdentityReduce<T, K> {
     }
 }
 
-impl<T: ColTime, K: ScalarKernel> ProxyReduceBackend<T, CBatch<T>, CBatch<T>, K::Token, K::Token> for IdentityReduce<T, K> {
+impl<T: ColTime, K: ScalarKernel, P: ProxyTime<T>>
+    ProxyReduceBackend<P, CBatch<T>, CBatch<T>, K::Token, K::Token> for IdentityReduce<T, K, P>
+{
     type RIn = Diff;
     type ROut = Diff;
 
-    fn begin(&mut self, _: Description<T>) {
+    fn begin(&mut self, _: Description<P>) {
         self.keys.clear();
         self.values.clear();
         self.times.clear();
@@ -274,10 +335,10 @@ impl<T: ColTime, K: ScalarKernel> ProxyReduceBackend<T, CBatch<T>, CBatch<T>, K:
 
     fn next_window(
         &mut self,
-        instance: &ReduceInstance<'_, T, CBatch<T>, CBatch<T>>,
+        instance: &ReduceInstance<'_, P, CBatch<T>, CBatch<T>>,
         changed: &[u64],
         from: &mut Option<u64>,
-        window: &mut ReduceWindow<T, Diff, Diff, K::Token, K::Token>,
+        window: &mut ReduceWindow<P, Diff, Diff, K::Token, K::Token>,
     ) {
         if from.take().is_none() {
             return;
@@ -293,7 +354,7 @@ impl<T: ColTime, K: ScalarKernel> ProxyReduceBackend<T, CBatch<T>, CBatch<T>, K:
             let ids = leaf_slice(chunk.keys()).expect("identity reduce: identity keys");
             for (i, &key) in ids.iter().enumerate() {
                 keys.push(key);
-                window.seeds.push((key, chunk.times().get(i)));
+                window.seeds.push((key, P::read(chunk.times(), i)));
             }
         }
         keys.sort_unstable();
@@ -342,11 +403,11 @@ impl<T: ColTime, K: ScalarKernel> ProxyReduceBackend<T, CBatch<T>, CBatch<T>, K:
         true
     }
 
-    fn emit(&mut self, records: &[((u64, K::Token), T, Diff)]) {
+    fn emit(&mut self, records: &[((u64, K::Token), P, Diff)]) {
         for ((key, value), time, diff) in records {
             self.keys.push(*key);
             self.values.push(*value);
-            self.times.push(time.clone());
+            self.times.push(time.clone().into_time());
             self.diffs.push(*diff);
         }
     }
@@ -372,8 +433,8 @@ impl<T: ColTime, K: ScalarKernel> ProxyReduceBackend<T, CBatch<T>, CBatch<T>, K:
 mod tests {
     use super::*;
     use differential_dataflow::consolidation::consolidate_updates;
-    use timely::order::Product;
     use timely::PartialOrder;
+    use timely::order::Product;
 
     fn scalar_records<T: ColTime>(batches: &[CBatch<T>]) -> ProxyBridge<T, Diff> {
         let mut result = Vec::new();
@@ -392,35 +453,67 @@ mod tests {
     fn scalar_min_preserves_signed_order_wrapping_and_pending_corrections() {
         type T = Product<u64, u64>;
         let t = T::new;
-        let initial = vec![((7, 0), t(0, 0), 1),
-            ((7, i64::MIN as u64), t(1, 0), 1), ((7, -1i64 as u64), t(0, 1), 1),
-            ((8, i64::MAX as u64), t(0, 0), -3), ((8, i64::MIN as u64), t(0, 1), 2)];
-        let novel = vec![((7, i64::MIN as u64), t(1, 1), -1),
-            ((8, i64::MIN as u64), t(1, 1), -2)];
+        let initial = vec![
+            ((7, 0), t(0, 0), 1),
+            ((7, i64::MIN as u64), t(1, 0), 1),
+            ((7, -1i64 as u64), t(0, 1), 1),
+            ((8, i64::MAX as u64), t(0, 0), -3),
+            ((8, i64::MIN as u64), t(0, 1), 2),
+        ];
+        let novel = vec![
+            ((7, i64::MIN as u64), t(1, 1), -1),
+            ((8, i64::MIN as u64), t(1, 1), -2),
+        ];
         for key_depth in 0..=2 {
             for value_depth in 0..=2 {
                 let wrap = |values: Vec<u64>, depth| {
                     let mut column = CValue::u64(values);
-                    for _ in 0..depth { column = CValue::Prod(vec![column]); }
+                    for _ in 0..depth {
+                        column = CValue::Prod(vec![column]);
+                    }
                     column
                 };
-                let batch = |rows: &[((u64, u64), T, Diff)]| Rc::new(columns_to_batch(
-                    wrap(rows.iter().map(|r| r.0.0).collect(), key_depth),
-                    wrap(rows.iter().map(|r| r.0.1).collect(), value_depth),
-                    rows.iter().map(|r| r.1).collect(), rows.iter().map(|r| r.2).collect()));
+                let batch = |rows: &[((u64, u64), T, Diff)]| {
+                    Rc::new(columns_to_batch(
+                        wrap(rows.iter().map(|r| r.0.0).collect(), key_depth),
+                        wrap(rows.iter().map(|r| r.0.1).collect(), value_depth),
+                        rows.iter().map(|r| r.1).collect(),
+                        rows.iter().map(|r| r.2).collect(),
+                    ))
+                };
                 let mut specialized = CorgiReduceTactic::new(Reducer::Min);
                 let mut general = CorgiReduceTactic::general(Reducer::Min);
                 let mut source = Vec::new();
                 let (mut sout, mut gout) = (Vec::new(), Vec::new());
-                for (rows, lower, upper) in [(&initial, t(0, 0), t(1, 1)), (&novel, t(1, 1), t(2, 2))] {
+                for (rows, lower, upper) in
+                    [(&initial, t(0, 0), t(1, 1)), (&novel, t(1, 1), t(2, 2))]
+                {
                     let input = vec![batch(rows)];
                     let lower = Antichain::from_elem(lower);
                     let upper = Antichain::from_elem(upper);
-                    let (s, sp) = specialized.retire(source.clone(), sout.clone(), input.clone(), &lower, &upper, &lower);
-                    let (g, gp) = general.retire(source.clone(), gout.clone(), input.clone(), &lower, &upper, &lower);
+                    let (s, sp) = specialized.retire(
+                        source.clone(),
+                        sout.clone(),
+                        input.clone(),
+                        &lower,
+                        &upper,
+                        &lower,
+                    );
+                    let (g, gp) = general.retire(
+                        source.clone(),
+                        gout.clone(),
+                        input.clone(),
+                        &lower,
+                        &upper,
+                        &lower,
+                    );
                     assert_eq!(sp, gp);
-                    if let Some(batch) = s.and_then(|s| s.inner) { sout.push(batch); }
-                    if let Some(batch) = g.and_then(|s| s.inner) { gout.push(batch); }
+                    if let Some(batch) = s.and_then(|s| s.inner) {
+                        sout.push(batch);
+                    }
+                    if let Some(batch) = g.and_then(|s| s.inner) {
+                        gout.push(batch);
+                    }
                     source.extend(input);
                     assert_eq!(scalar_records(&sout), scalar_records(&gout));
                 }
@@ -431,14 +524,22 @@ mod tests {
                         let mut input = std::collections::BTreeMap::new();
                         let mut output = std::collections::BTreeMap::new();
                         for ((k, value), at, diff) in &original {
-                            if *k == key && at.less_equal(&time) { *input.entry(*value as i64).or_insert(0) += diff; }
+                            if *k == key && at.less_equal(&time) {
+                                *input.entry(*value as i64).or_insert(0) += diff;
+                            }
                         }
                         for ((k, value), at, diff) in &actual {
-                            if *k == key && at.less_equal(&time) { *output.entry(*value as i64).or_insert(0) += diff; }
+                            if *k == key && at.less_equal(&time) {
+                                *output.entry(*value as i64).or_insert(0) += diff;
+                            }
                         }
                         output.retain(|_, diff| *diff != 0);
-                        let expected: std::collections::BTreeMap<_, _> = input.into_iter()
-                            .filter(|(_, diff)| *diff != 0).take(1).map(|(value, _)| (value, 1)).collect();
+                        let expected: std::collections::BTreeMap<_, _> = input
+                            .into_iter()
+                            .filter(|(_, diff)| *diff != 0)
+                            .take(1)
+                            .map(|(value, _)| (value, 1))
+                            .collect();
                         assert_eq!(output, expected, "key {key} at {time:?}");
                     }
                 }
@@ -481,7 +582,7 @@ mod tests {
             let batches = [batch(&b, depth), batch(&[], depth), batch(&a, depth)];
             for changed in [vec![1, 777], (0..1000).collect()] {
                 let mut expected = records(&batches);
-                expected.retain(|r| changed.binary_search(&r.0 .0).is_ok());
+                expected.retain(|r| changed.binary_search(&r.0.0).is_ok());
                 let mut actual = Vec::new();
                 UnitDistinct::new(depth, 0).present(&chunks_of(&batches), &changed, &mut actual);
                 assert_eq!(actual, expected);
@@ -569,12 +670,12 @@ mod tests {
                             let time = t(x, y);
                             let count: Diff = original
                                 .iter()
-                                .filter(|r| r.0 .0 == key && r.1.less_equal(&time))
+                                .filter(|r| r.0.0 == key && r.1.less_equal(&time))
                                 .map(|r| r.2)
                                 .sum();
                             let distinct: Diff = actual
                                 .iter()
-                                .filter(|r| r.0 .0 == key && r.1.less_equal(&time))
+                                .filter(|r| r.0.0 == key && r.1.less_equal(&time))
                                 .map(|r| r.2)
                                 .sum();
                             assert_eq!(

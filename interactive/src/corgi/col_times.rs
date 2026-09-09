@@ -1,16 +1,12 @@
 //! Columnar per-tuple times for `CorgiChunk`.
 //!
-//! `Inner.times` was `Vec<T>` — one heap-ish `PointStamp` (`SmallVec`) per row, the dominant SCC
-//! allocation (~40% of the profile). Since our `T = Product<u64, PointStamp<u64>>` already derives
-//! `columnar::Columnar` (Product, PointStamp, and u64 all do), the same times live in SoA form in
-//! `<T as Columnar>::Container` — one pair of allocations (offsets + values) for the whole column
-//! instead of `n` `SmallVec`s.
+//! The derived columnar container keeps primitive timestamp coordinates and vector
+//! offsets in separate arrays, rather than storing an owned `PointStamp` per row.
 //!
-//! Times are compared IN PLACE via the container's derived `Ord` on `Ref` (both `Product` and
-//! `PointStamp` carry `#[columnar(derive(Ord, PartialOrd))]`), so merge/sort never materialize a
-//! `T`. An owned `T` is reconstructed (`get`) only where a `Lattice` op is unavoidable — `join` in
-//! the join cross-product, `advance_by` in compaction — or at the emit boundary handing `T` back to
-//! DD. Range copies (`emit`/`concat`) push `Ref`s straight across (`push_ref`), also no `T`.
+//! Times compare in place through the container's ordered references. Generic
+//! lattice operations reconstruct an owned timestamp; shallow runtime kernels can
+//! read scalar/product coordinates directly through `get_ref`. Bulk range copies
+//! extend primitive lanes and rebase vector offsets without per-row owned times.
 //!
 //! This is the O(data) time store; DD's `Chunk` boundary only ever sees whole chunks + frontier
 //! antichains (control complexity), so this stays entirely inside the backend — no DD change.
@@ -96,6 +92,12 @@ impl<T: Columnar> ColTimes<T> {
     #[inline]
     pub fn get(&self, i: usize) -> T {
         <T as Columnar>::into_owned(self.store.borrow().get(i))
+    }
+
+    /// Borrow one timestamp for a compiled kernel that reads its coordinates.
+    #[inline]
+    pub(crate) fn get_ref(&self, i: usize) -> columnar::Ref<'_, T> {
+        self.store.borrow().get(i)
     }
 
     /// Append rows `[s, e)` of `other` using the container's bulk range copy.
