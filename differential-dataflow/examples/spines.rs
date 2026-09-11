@@ -1,10 +1,11 @@
-//! End-to-end spines benchmark over `key`, `val`, `vec`, and `col` arrangements
-//! — an `arrange` + `join` of `String` keys, loaded then queried round by round:
+//! End-to-end spines benchmark over `key`, `val`, `vec`, `trie`, and `col`
+//! arrangements — an `arrange` + `join` of `String` keys, loaded then queried
+//! round by round:
 //!
 //! * `key` / `val` — the ord-neu `OrdKeySpine` / `OrdValSpine` traces.
-//! * `vec` / `col` — the `Vec`- and columnar-trie-backed `Chunk` traces
-//!   (`VecChunk` / `ColChunk`), both arranged through the generic `Chunk`
-//!   harness via a `ContainerChunker`.
+//! * `vec` / `trie` / `col` — the `Vec`-, trie-, and columnar-trie-backed
+//!   `Chunk` traces (`VecChunk` / `TrieChunk` / `ColChunk`), all arranged
+//!   through the generic `Chunk` harness via a `ContainerChunker`.
 //!
 //! Run as `cargo run --release --example spines -- <keys> <size> <mode>`.
 //!
@@ -124,8 +125,31 @@ fn main() {
                         .probe_with(&mut probe);
                     Workload { data_input, keys_input }
                 },
+                "trie" => {
+                    // The trie-layered `Chunk` trace (the ord-neu replacement), fed like
+                    // the row modes but arranged through the `Chunk` harness via a
+                    // `ContainerChunker<TrieChunk>`.
+                    use differential_dataflow::Hashable;
+                    use differential_dataflow::trace::chunk::trie::{OrdKeyBatcher, OrdKeySpine};
+                    use differential_dataflow::operators::arrange::arrangement::arrange_core;
+                    use timely::dataflow::channels::pact::Exchange;
+
+                    let (data_input, data) = scope.new_collection::<String, isize>();
+                    let (keys_input, keys) = scope.new_collection::<String, isize>();
+                    let data = data.map(|x| (x, ()));
+                    let keys = keys.map(|x| (x, ()));
+
+                    type Ba = OrdKeyBatcher<String, u64, isize>;
+                    type Sp = OrdKeySpine<String, u64, isize>;
+                    let exchange = || Exchange::new(|u: &((String, ()), u64, isize)| (u.0).0.hashed().into());
+                    let data = arrange_core::<_, _, Ba, Sp>(data.inner, exchange(), "DataArrange", Ba::new);
+                    let keys = arrange_core::<_, _, Ba, Sp>(keys.inner, exchange(), "KeysArrange", Ba::new);
+                    keys.join_core(data, |_k, &(), &()| Option::<()>::None)
+                        .probe_with(&mut probe);
+                    Workload { data_input, keys_input }
+                },
                 _ => {
-                    panic!("unrecognized mode: {:?} (expected `key`, `val`, `vec`, or `col`)", mode);
+                    panic!("unrecognized mode: {:?} (expected `key`, `val`, `vec`, `trie`, or `col`)", mode);
                 }
             }
         });
