@@ -36,6 +36,234 @@ use super::Chunk;
 /// The chunk size: the [`Chunk::TARGET`] grading value.
 const TARGET: usize = 8192;
 
+/// Cumulative group bounds: a sequence starting at zero, compressed while strided.
+///
+/// The dominant shapes — one val per key (key-only arrangements), one update per
+/// val (snapshot data) — make the bounds `0, s, 2s, ..`, which this stores in O(1)
+/// instead of a word per group. Bounds beyond a break in the stride spill into an
+/// explicit vector, and the final bound is held separately (`tail`) because it is
+/// the one the writers mutate: a fresh group opens with its end equal to the
+/// previous bound and grows leaf by leaf, and only on the next group's arrival is
+/// it folded into the compressed form.
+///
+/// The represented sequence is `[0]`, then `i * stride` for `i in 1 ..= strided`,
+/// then `spill`, then `tail` when present.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Offsets {
+    /// The stride of the leading compressed bounds; `0` until the first fold.
+    stride: usize,
+    /// The number of leading bounds (beyond the implicit zero) equal to `i * stride`.
+    strided: usize,
+    /// Explicit bounds after the stride broke.
+    spill: Vec<usize>,
+    /// The final bound, when it has not been folded.
+    tail: Option<usize>,
+}
+
+impl Offsets {
+    /// The number of bounds, including the implicit leading zero.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn count(&self) -> usize {
+        1 + self.strided + self.spill.len() + (self.tail.is_some() as usize)
+    }
+
+    /// The `i`th bound; `bound(0) == 0`.
+    #[inline]
+    fn bound(&self, i: usize) -> usize {
+        if i <= self.strided { i * self.stride }
+        else if i <= self.strided + self.spill.len() { self.spill[i - self.strided - 1] }
+        else { self.tail.unwrap() }
+    }
+
+    /// The final bound.
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn last(&self) -> usize { self.bound(self.count() - 1) }
+
+    /// Fold the tail into the compressed form (called as the next group opens).
+    fn close(&mut self) {
+        if let Some(t) = self.tail.take() {
+            if self.spill.is_empty() && self.strided == 0 && self.stride == 0 {
+                // First closed bound decides the stride.
+                self.stride = t;
+                self.strided = 1;
+            } else if self.spill.is_empty() && t == (self.strided + 1) * self.stride {
+                self.strided += 1;
+            } else {
+                self.spill.push(t);
+            }
+        }
+    }
+
+    /// Append a bound (opening a new group whose end it is).
+    fn push(&mut self, x: usize) {
+        self.close();
+        self.tail = Some(x);
+    }
+
+    /// Overwrite the final bound (the open group's end grew).
+    fn set_last(&mut self, x: usize) {
+        if self.tail.is_none() {
+            // Reopen the last folded bound.
+            if !self.spill.is_empty() { self.spill.pop(); }
+            else if self.strided > 0 { self.strided -= 1; }
+        }
+        self.tail = Some(x);
+    }
+
+    /// Remove the final bound.
+    fn pop(&mut self) {
+        if self.tail.take().is_none() {
+            if !self.spill.is_empty() { self.spill.pop(); }
+            else { self.strided -= 1; if self.strided == 0 { self.stride = 0; } }
+        }
+    }
+
+    /// Append `other`'s bounds at indices `range`, each shifted by `delta`.
+    fn extend_shifted(&mut self, other: &Offsets, range: std::ops::Range<usize>, delta: isize) {
+        for i in range {
+            self.push(((other.bound(i) as isize) + delta) as usize);
+        }
+    }
+
+    /// The largest group index `g` with `bound(g) <= x`, for strictly increasing
+    /// bounds (a formed trie's shape).
+    fn group_containing(&self, x: usize) -> usize {
+        let mut g = if self.stride > 0 { (x / self.stride).min(self.strided) } else { 0 };
+        if g == self.strided {
+            g += self.spill.partition_point(|&b| b <= x);
+            if g == self.strided + self.spill.len() {
+                if let Some(t) = self.tail { if t <= x { g += 1; } }
+            }
+        }
+        g
+    }
+
+    /// Release excess capacity.
+    fn shrink_to_fit(&mut self) { self.spill.shrink_to_fit(); }
+
+    /// Clear to the empty sequence, keeping allocations.
+    fn clear(&mut self) {
+        self.stride = 0;
+        self.strided = 0;
+        self.spill.clear();
+        self.tail = None;
+    }
+}
+
+/// A column of values, compressed while every value is the same.
+///
+/// Times and diffs are heavily repetitive in practice — a chunk of snapshot data
+/// carries one time and one diff — so the column starts as a repetition and
+/// materializes only when a differing value arrives.
+#[derive(Clone, Debug)]
+pub(crate) enum Column<T> {
+    /// `count` copies of `item` (zero copies of nothing when empty).
+    Repeat { item: Option<T>, count: usize },
+    /// One value per entry.
+    Explicit(Vec<T>),
+}
+
+impl<T> Default for Column<T> {
+    fn default() -> Self { Column::Repeat { item: None, count: 0 } }
+}
+
+impl<T> Column<T> {
+    fn len(&self) -> usize {
+        match self {
+            Column::Repeat { count, .. } => *count,
+            Column::Explicit(v) => v.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool { self.len() == 0 }
+
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        match self {
+            Column::Repeat { item, count } => { debug_assert!(i < *count); item.as_ref().unwrap() }
+            Column::Explicit(v) => &v[i],
+        }
+    }
+
+    fn last(&self) -> Option<&T> {
+        if self.is_empty() { None } else { Some(self.index(self.len() - 1)) }
+    }
+
+    /// Iterate the column's values.
+    fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        (0 .. self.len()).map(move |i| self.index(i))
+    }
+
+    fn pop(&mut self) {
+        match self {
+            Column::Repeat { item, count } => {
+                *count -= 1;
+                if *count == 0 { *item = None; }
+            }
+            Column::Explicit(v) => { v.pop(); }
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        if let Column::Explicit(v) = self { v.shrink_to_fit(); }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Column::Repeat { item, count } => { *item = None; *count = 0; }
+            Column::Explicit(v) => v.clear(),
+        }
+    }
+}
+
+impl<T: Clone + PartialEq> Column<T> {
+    /// Convert to the explicit form, cloning out the repetitions.
+    fn materialize(&mut self) -> &mut Vec<T> {
+        if let Column::Repeat { item, count } = self {
+            let mut v = Vec::with_capacity(*count + 1);
+            if let Some(item) = item.take() {
+                v.resize(*count, item);
+            }
+            *self = Column::Explicit(v);
+        }
+        match self { Column::Explicit(v) => v, _ => unreachable!() }
+    }
+
+    fn push(&mut self, x: T) {
+        match self {
+            Column::Repeat { item: None, count } => { debug_assert_eq!(*count, 0); *self = Column::Repeat { item: Some(x), count: 1 }; }
+            Column::Repeat { item: Some(item), count } => {
+                if *item == x { *count += 1; }
+                else { self.materialize().push(x); }
+            }
+            Column::Explicit(v) => v.push(x),
+        }
+    }
+
+    /// Append `other[range]`, preserving compression when both sides repeat the
+    /// same value.
+    fn extend_from(&mut self, other: &Self, range: std::ops::Range<usize>) {
+        if range.is_empty() { return; }
+        match (&mut *self, other) {
+            (Column::Repeat { item, count }, Column::Repeat { item: Some(o), .. }) => {
+                match item {
+                    None => { *item = Some(o.clone()); *count = range.len(); }
+                    Some(item) if item == o => { *count += range.len(); }
+                    Some(_) => { self.materialize().extend(std::iter::repeat_with(|| o.clone()).take(range.len())); }
+                }
+            }
+            (_, Column::Repeat { item: Some(o), .. }) => {
+                self.materialize().extend(std::iter::repeat_with(|| o.clone()).take(range.len()));
+            }
+            (_, Column::Explicit(ov)) => {
+                self.materialize().extend_from_slice(&ov[range]);
+            }
+            (_, Column::Repeat { item: None, .. }) => unreachable!("non-empty range of an empty column"),
+        }
+    }
+}
+
 /// Trie-layered storage for sorted, consolidated `((key, val), time, diff)` updates.
 ///
 /// Three levels: `keys`, each with a run of `vals`, each with a parallel run of
@@ -49,17 +277,17 @@ const TARGET: usize = 8192;
 /// empty stage.
 pub struct TrieStorage<K, V, T, R> {
     /// Ordered, deduplicated keys.
-    pub keys: Vec<K>,
-    /// `keys.len() + 1` offsets into `vals`; starts with `0`.
-    pub key_offs: Vec<usize>,
+    pub(crate) keys: Vec<K>,
+    /// `keys.len() + 1` cumulative bounds into `vals` (compressed while strided).
+    pub(crate) key_offs: Offsets,
     /// Ordered vals, deduplicated within each key's run.
-    pub vals: Vec<V>,
-    /// `vals.len() + 1` offsets into `times` / `diffs`; starts with `0`.
-    pub val_offs: Vec<usize>,
-    /// Ordered times, deduplicated within each val's run.
-    pub times: Vec<T>,
-    /// Diffs, parallel to `times`; none are zero.
-    pub diffs: Vec<R>,
+    pub(crate) vals: Vec<V>,
+    /// `vals.len() + 1` cumulative bounds into `times` / `diffs`.
+    pub(crate) val_offs: Offsets,
+    /// Ordered times, deduplicated within each val's run (compressed while constant).
+    pub(crate) times: Column<T>,
+    /// Diffs, parallel to `times`; none are zero (compressed while constant).
+    pub(crate) diffs: Column<R>,
     /// Unordered staged rows (batcher side); empty once the trie is formed.
     stage: Vec<((K, V), T, R)>,
 }
@@ -68,11 +296,11 @@ impl<K, V, T, R> Default for TrieStorage<K, V, T, R> {
     fn default() -> Self {
         Self {
             keys: Vec::new(),
-            key_offs: vec![0],
+            key_offs: Offsets::default(),
             vals: Vec::new(),
-            val_offs: vec![0],
-            times: Vec::new(),
-            diffs: Vec::new(),
+            val_offs: Offsets::default(),
+            times: Column::default(),
+            diffs: Column::default(),
             stage: Vec::new(),
         }
     }
@@ -109,8 +337,8 @@ impl Pos {
     /// The position at the start of key `k` (or the end position, past the last key).
     fn at_key<K, V, T, R>(s: &TrieStorage<K, V, T, R>, k: usize) -> Pos {
         if k < s.keys.len() {
-            let v = s.key_offs[k];
-            Pos { k, v, t: s.val_offs[v] }
+            let v = s.key_offs.bound(k);
+            Pos { k, v, t: s.val_offs.bound(v) }
         } else {
             Pos { k: s.keys.len(), v: s.vals.len(), t: s.times.len() }
         }
@@ -119,20 +347,14 @@ impl Pos {
     /// Step past the current val, normalizing the key and update indices.
     fn step_val<K, V, T, R>(&mut self, s: &TrieStorage<K, V, T, R>) {
         self.v += 1;
-        if self.v >= s.key_offs[self.k + 1] {
+        if self.v >= s.key_offs.bound(self.k + 1) {
             self.k += 1;
         }
-        self.t = if self.v < s.vals.len() { s.val_offs[self.v] } else { s.times.len() };
+        self.t = if self.v < s.vals.len() { s.val_offs.bound(self.v) } else { s.times.len() };
     }
 }
 
-impl<K, V, T, R> TrieStorage<K, V, T, R>
-where
-    K: Ord + Clone,
-    V: Ord + Clone,
-    T: Ord + Clone,
-    R: Semigroup,
-{
+impl<K, V, T, R> TrieStorage<K, V, T, R> {
     /// The number of formed updates (excluding staged rows).
     fn formed_len(&self) -> usize { self.times.len() }
 
@@ -143,47 +365,67 @@ where
     fn clear(&mut self) {
         self.keys.clear();
         self.key_offs.clear();
-        self.key_offs.push(0);
         self.vals.clear();
         self.val_offs.clear();
-        self.val_offs.push(0);
         self.times.clear();
         self.diffs.clear();
         self.stage.clear();
     }
 
+    /// Release excess capacity on every column.
+    ///
+    /// Chunks are built by extending fresh vectors, whose geometric growth can
+    /// leave up to another length's worth of capacity. Committed chunks are
+    /// immutable, so [`Chunk::settle`] passes them through here (a no-op once
+    /// capacities are exact).
+    fn shrink_to_fit(&mut self) {
+        self.keys.shrink_to_fit();
+        self.key_offs.shrink_to_fit();
+        self.vals.shrink_to_fit();
+        self.val_offs.shrink_to_fit();
+        self.times.shrink_to_fit();
+        self.diffs.shrink_to_fit();
+        self.stage.shrink_to_fit();
+    }
+}
+
+impl<K, V, T, R> TrieStorage<K, V, T, R>
+where
+    K: Ord + Clone,
+    V: Ord + Clone,
+    T: Ord + Clone,
+    R: Semigroup + PartialEq,
+{
     /// Whether the open (last) key's val run is non-empty and ends with `v`.
     fn open_val_is(&self, v: &V) -> bool {
         let nk = self.keys.len();
-        nk > 0 && self.key_offs[nk - 1] < self.vals.len() && self.vals.last() == Some(v)
+        nk > 0 && self.key_offs.bound(nk - 1) < self.vals.len() && self.vals.last() == Some(v)
     }
 
     /// Open a new val under the open key.
     fn push_val(&mut self, v: &V) {
         self.vals.push(v.clone());
         self.val_offs.push(self.times.len());
-        *self.key_offs.last_mut().unwrap() = self.vals.len();
+        self.key_offs.set_last(self.vals.len());
     }
 
     /// Append one `(time, diff)` to the open val's run.
     fn push_leaf(&mut self, t: &T, r: &R) {
         self.times.push(t.clone());
         self.diffs.push(r.clone());
-        *self.val_offs.last_mut().unwrap() = self.times.len();
+        self.val_offs.set_last(self.times.len());
     }
 
-    /// Remove the trailing `(time, diff)`, and the open val / key if that empties them.
-    fn pop_leaf(&mut self) {
-        self.times.pop();
-        self.diffs.pop();
-        *self.val_offs.last_mut().unwrap() = self.times.len();
+    /// After removing a trailing leaf, drop the open val / key if now empty.
+    fn pop_empty_groups(&mut self) {
+        self.val_offs.set_last(self.times.len());
         let nv = self.vals.len();
-        if self.val_offs[nv] == self.val_offs[nv - 1] {
+        if self.val_offs.bound(nv) == self.val_offs.bound(nv - 1) {
             self.vals.pop();
             self.val_offs.pop();
-            *self.key_offs.last_mut().unwrap() = self.vals.len();
+            self.key_offs.set_last(self.vals.len());
             let nk = self.keys.len();
-            if self.key_offs[nk] == self.key_offs[nk - 1] {
+            if self.key_offs.bound(nk) == self.key_offs.bound(nk - 1) {
                 self.keys.pop();
                 self.key_offs.pop();
             }
@@ -215,9 +457,7 @@ where
     fn push_update(&mut self, k: &K, v: &V, t: &T, r: &R) {
         if self.keys.last() == Some(k) && self.open_val_is(v) {
             if self.times.last() == Some(t) {
-                let d = self.diffs.last_mut().unwrap();
-                d.plus_equals(r);
-                if d.is_zero() { self.pop_leaf(); }
+                self.accumulate_last(r);
                 return;
             }
         } else {
@@ -226,14 +466,25 @@ where
         self.push_leaf(t, r);
     }
 
+    /// Fold `r` into the trailing diff, removing the leaf if it cancels.
+    fn accumulate_last(&mut self, r: &R) {
+        let mut d = self.diffs.last().unwrap().clone();
+        d.plus_equals(r);
+        self.diffs.pop();
+        if d.is_zero() {
+            self.times.pop();
+            self.pop_empty_groups();
+        } else {
+            self.diffs.push(d);
+        }
+    }
+
     /// As [`Self::push_update`], but moving the components rather than cloning them.
     /// The hot path for chunk formation, where the rows are owned anyway.
     fn push_update_owned(&mut self, k: K, v: V, t: T, r: R) {
         if self.keys.last() == Some(&k) && self.open_val_is(&v) {
             if self.times.last() == Some(&t) {
-                let d = self.diffs.last_mut().unwrap();
-                d.plus_equals(&r);
-                if d.is_zero() { self.pop_leaf(); }
+                self.accumulate_last(&r);
                 return;
             }
         } else {
@@ -243,48 +494,48 @@ where
             }
             self.vals.push(v);
             self.val_offs.push(self.times.len());
-            *self.key_offs.last_mut().unwrap() = self.vals.len();
+            self.key_offs.set_last(self.vals.len());
         }
         self.times.push(t);
         self.diffs.push(r);
-        *self.val_offs.last_mut().unwrap() = self.times.len();
+        self.val_offs.set_last(self.times.len());
     }
 
     /// Extend the open val's run with `other.times[range]` (all strictly greater).
     fn extend_leaves(&mut self, other: &Self, range: std::ops::Range<usize>) {
-        self.times.extend_from_slice(&other.times[range.clone()]);
-        self.diffs.extend_from_slice(&other.diffs[range]);
-        *self.val_offs.last_mut().unwrap() = self.times.len();
+        self.times.extend_from(&other.times, range.clone());
+        self.diffs.extend_from(&other.diffs, range);
+        self.val_offs.set_last(self.times.len());
     }
 
     /// Append whole vals `range` of `other`, with their update runs, into the open key.
     fn extend_vals(&mut self, other: &Self, range: std::ops::Range<usize>) {
         if range.is_empty() { return; }
-        let t_lo = other.val_offs[range.start];
-        let t_hi = other.val_offs[range.end];
+        let t_lo = other.val_offs.bound(range.start);
+        let t_hi = other.val_offs.bound(range.end);
         let t_base = self.times.len();
         self.vals.extend_from_slice(&other.vals[range.clone()]);
-        self.val_offs.extend(other.val_offs[range.start + 1 ..= range.end].iter().map(|&o| o - t_lo + t_base));
-        self.times.extend_from_slice(&other.times[t_lo .. t_hi]);
-        self.diffs.extend_from_slice(&other.diffs[t_lo .. t_hi]);
-        *self.key_offs.last_mut().unwrap() = self.vals.len();
+        self.val_offs.extend_shifted(&other.val_offs, range.start + 1 .. range.end + 1, t_base as isize - t_lo as isize);
+        self.times.extend_from(&other.times, t_lo .. t_hi);
+        self.diffs.extend_from(&other.diffs, t_lo .. t_hi);
+        self.key_offs.set_last(self.vals.len());
     }
 
     /// Append whole keys `range` of `other`, with their val and update runs.
     fn extend_keys(&mut self, other: &Self, range: std::ops::Range<usize>) {
         if range.is_empty() { return; }
-        let v_lo = other.key_offs[range.start];
-        let v_hi = other.key_offs[range.end];
+        let v_lo = other.key_offs.bound(range.start);
+        let v_hi = other.key_offs.bound(range.end);
         let v_base = self.vals.len();
-        let t_lo = other.val_offs[v_lo];
-        let t_hi = other.val_offs[v_hi];
+        let t_lo = other.val_offs.bound(v_lo);
+        let t_hi = other.val_offs.bound(v_hi);
         let t_base = self.times.len();
         self.keys.extend_from_slice(&other.keys[range.clone()]);
-        self.key_offs.extend(other.key_offs[range.start + 1 ..= range.end].iter().map(|&o| o - v_lo + v_base));
+        self.key_offs.extend_shifted(&other.key_offs, range.start + 1 .. range.end + 1, v_base as isize - v_lo as isize);
         self.vals.extend_from_slice(&other.vals[v_lo .. v_hi]);
-        self.val_offs.extend(other.val_offs[v_lo + 1 ..= v_hi].iter().map(|&o| o - t_lo + t_base));
-        self.times.extend_from_slice(&other.times[t_lo .. t_hi]);
-        self.diffs.extend_from_slice(&other.diffs[t_lo .. t_hi]);
+        self.val_offs.extend_shifted(&other.val_offs, v_lo + 1 .. v_hi + 1, t_base as isize - t_lo as isize);
+        self.times.extend_from(&other.times, t_lo .. t_hi);
+        self.diffs.extend_from(&other.diffs, t_lo .. t_hi);
     }
 
     /// Append `other`'s vals `[v0, val_end)` under `key`, the first val possibly
@@ -299,12 +550,12 @@ where
         }
         if self.open_val_is(&other.vals[v]) {
             // The open val continues: extend its run with the remaining updates.
-            self.extend_leaves(other, t0 .. other.val_offs[v + 1]);
+            self.extend_leaves(other, t0 .. other.val_offs.bound(v + 1));
             v += 1;
-        } else if t0 > other.val_offs[v] {
+        } else if t0 > other.val_offs.bound(v) {
             // A fresh val entered mid-run: open it and copy the remaining updates.
             self.push_val(&other.vals[v]);
-            self.extend_leaves(other, t0 .. other.val_offs[v + 1]);
+            self.extend_leaves(other, t0 .. other.val_offs.bound(v + 1));
             v += 1;
         }
         self.extend_vals(other, v .. val_end);
@@ -315,7 +566,7 @@ where
     /// greater than `self`'s last.
     fn append_range(&mut self, other: &Self, pos: Pos, key_end: usize) {
         if pos.k >= key_end { return; }
-        self.append_vals_from(other, &other.keys[pos.k], pos.v, pos.t, other.key_offs[pos.k + 1]);
+        self.append_vals_from(other, &other.keys[pos.k], pos.v, pos.t, other.key_offs.bound(pos.k + 1));
         self.extend_keys(other, pos.k + 1 .. key_end);
     }
 
@@ -334,18 +585,18 @@ where
         if n >= total { return (self, Self::default()); }
 
         // The val and key containing update `n` (offsets are strictly increasing).
-        let v = match self.val_offs.binary_search(&n) { Ok(i) => i, Err(i) => i - 1 };
-        let k = match self.key_offs.binary_search(&v) { Ok(i) => i, Err(i) => i - 1 };
+        let v = self.val_offs.group_containing(n);
+        let k = self.key_offs.group_containing(v);
 
         let mut first = Self::default();
         first.extend_keys(&self, 0 .. k);
-        if v > self.key_offs[k] || n > self.val_offs[v] {
+        if v > self.key_offs.bound(k) || n > self.val_offs.bound(v) {
             first.keys.push(self.keys[k].clone());
             first.key_offs.push(first.vals.len());
-            first.extend_vals(&self, self.key_offs[k] .. v);
-            if n > self.val_offs[v] {
+            first.extend_vals(&self, self.key_offs.bound(k) .. v);
+            if n > self.val_offs.bound(v) {
                 first.push_val(&self.vals[v]);
-                first.extend_leaves(&self, self.val_offs[v] .. n);
+                first.extend_leaves(&self, self.val_offs.bound(v) .. n);
             }
         }
         let second = Self::suffix(&self, Pos { k, v, t: n });
@@ -385,7 +636,7 @@ where
     fn merge_key(a: &Self, b: &Self, pa: &mut Pos, pb: &mut Pos, out: &mut Self) {
         use std::cmp::Ordering;
         let (ka, kb) = (pa.k, pb.k);
-        let (va_end, vb_end) = (a.key_offs[ka + 1], b.key_offs[kb + 1]);
+        let (va_end, vb_end) = (a.key_offs.bound(ka + 1), b.key_offs.bound(kb + 1));
         while pa.v < va_end && pb.v < vb_end {
             match a.vals[pa.v].cmp(&b.vals[pb.v]) {
                 Ordering::Less => {
@@ -393,13 +644,13 @@ where
                     let hi = gallop(&a.vals, pa.v + 1, va_end, |x| x < &b.vals[pb.v]);
                     out.append_vals_from(a, &a.keys[ka], pa.v, pa.t, hi);
                     pa.v = hi;
-                    pa.t = if hi < a.vals.len() { a.val_offs[hi] } else { a.times.len() };
+                    pa.t = if hi < a.vals.len() { a.val_offs.bound(hi) } else { a.times.len() };
                 }
                 Ordering::Greater => {
                     let hi = gallop(&b.vals, pb.v + 1, vb_end, |x| x < &a.vals[pa.v]);
                     out.append_vals_from(b, &b.keys[kb], pb.v, pb.t, hi);
                     pb.v = hi;
-                    pb.t = if hi < b.vals.len() { b.val_offs[hi] } else { b.times.len() };
+                    pb.t = if hi < b.vals.len() { b.val_offs.bound(hi) } else { b.times.len() };
                 }
                 Ordering::Equal => {
                     Self::merge_times(a, b, pa, pb, out);
@@ -416,27 +667,27 @@ where
         use std::cmp::Ordering;
         let key = &a.keys[pa.k];
         let val = &a.vals[pa.v];
-        let (ta_end, tb_end) = (a.val_offs[pa.v + 1], b.val_offs[pb.v + 1]);
+        let (ta_end, tb_end) = (a.val_offs.bound(pa.v + 1), b.val_offs.bound(pb.v + 1));
         while pa.t < ta_end && pb.t < tb_end {
-            match a.times[pa.t].cmp(&b.times[pb.t]) {
+            match a.times.index(pa.t).cmp(b.times.index(pb.t)) {
                 Ordering::Less => {
-                    let hi = gallop(&a.times, pa.t + 1, ta_end, |x| x < &b.times[pb.t]);
+                    let hi = gallop_idx(pa.t + 1, ta_end, |i| a.times.index(i) < b.times.index(pb.t));
                     out.ensure_kv(key, val);
                     out.extend_leaves(a, pa.t .. hi);
                     pa.t = hi;
                 }
                 Ordering::Greater => {
-                    let hi = gallop(&b.times, pb.t + 1, tb_end, |x| x < &a.times[pa.t]);
+                    let hi = gallop_idx(pb.t + 1, tb_end, |i| b.times.index(i) < a.times.index(pa.t));
                     out.ensure_kv(key, val);
                     out.extend_leaves(b, pb.t .. hi);
                     pb.t = hi;
                 }
                 Ordering::Equal => {
-                    let mut d = a.diffs[pa.t].clone();
-                    d.plus_equals(&b.diffs[pb.t]);
+                    let mut d = a.diffs.index(pa.t).clone();
+                    d.plus_equals(b.diffs.index(pb.t));
                     if !d.is_zero() {
                         out.ensure_kv(key, val);
-                        out.push_leaf(&a.times[pa.t], &d);
+                        out.push_leaf(a.times.index(pa.t), &d);
                     }
                     pa.t += 1;
                     pb.t += 1;
@@ -458,12 +709,12 @@ where
         let mut out = Self::default();
         let mut run: Vec<(T, R)> = Vec::new();
         for k in 0 .. self.keys.len() {
-            for v in self.key_offs[k] .. self.key_offs[k + 1] {
+            for v in self.key_offs.bound(k) .. self.key_offs.bound(k + 1) {
                 run.clear();
-                for t in self.val_offs[v] .. self.val_offs[v + 1] {
-                    let mut time = self.times[t].clone();
+                for t in self.val_offs.bound(v) .. self.val_offs.bound(v + 1) {
+                    let mut time = self.times.index(t).clone();
                     time.advance_by(frontier);
-                    run.push((time, self.diffs[t].clone()));
+                    run.push((time, self.diffs.index(t).clone()));
                 }
                 consolidate(&mut run);
                 for (t, d) in run.iter() {
@@ -479,13 +730,18 @@ where
 /// First index in `[start, end)` at which `pred` turns false, by galloping
 /// (exponential) search. `pred` must hold for a prefix then not — i.e. `|x| x < target`.
 fn gallop<U>(s: &[U], start: usize, end: usize, pred: impl Fn(&U) -> bool) -> usize {
+    gallop_idx(start, end, |i| pred(&s[i]))
+}
+
+/// As [`gallop`], but over indices, for columns that are not slices.
+fn gallop_idx(start: usize, end: usize, pred: impl Fn(usize) -> bool) -> usize {
     let mut pos = start;
-    if pos < end && pred(&s[pos]) {
+    if pos < end && pred(pos) {
         let mut step = 1;
-        while pos + step < end && pred(&s[pos + step]) { pos += step; step <<= 1; }
+        while pos + step < end && pred(pos + step) { pos += step; step <<= 1; }
         step >>= 1;
         while step > 0 {
-            if pos + step < end && pred(&s[pos + step]) { pos += step; }
+            if pos + step < end && pred(pos + step) { pos += step; }
             step >>= 1;
         }
         pos += 1;
@@ -543,9 +799,9 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Ord + Clone + 'stat
         let mut rows = std::mem::take(&mut this.stage);
         // Fold in any formed content (cold: the chunker consolidates staged rows only).
         for k in 0 .. this.keys.len() {
-            for v in this.key_offs[k] .. this.key_offs[k + 1] {
-                for t in this.val_offs[v] .. this.val_offs[v + 1] {
-                    rows.push(((this.keys[k].clone(), this.vals[v].clone()), this.times[t].clone(), this.diffs[t].clone()));
+            for v in this.key_offs.bound(k) .. this.key_offs.bound(k + 1) {
+                for t in this.val_offs.bound(v) .. this.val_offs.bound(v + 1) {
+                    rows.push(((this.keys[k].clone(), this.vals[v].clone()), this.times.index(t).clone(), this.diffs.index(t).clone()));
                 }
             }
         }
@@ -553,8 +809,6 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Ord + Clone + 'stat
         consolidate_updates(&mut rows);
         let out = Rc::make_mut(&mut target.0);
         out.clear();
-        out.times.reserve(rows.len());
-        out.diffs.reserve(rows.len());
         for ((k, v), t, r) in rows.drain(..) {
             out.push_update_owned(k, v, t, r);
         }
@@ -571,7 +825,7 @@ where K: Clone + 'static, V: Clone + 'static, T: Clone + 'static, R: Clone + 'st
 // --- The Chunk transducers (trace side) ---
 
 impl<K, V, T, R> Chunk for TrieChunk<K, V, T, R>
-where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp, R: Semigroup + 'static {
+where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp, R: Semigroup + PartialEq + 'static {
     type Time = T;
 
     const TARGET: usize = TARGET;
@@ -636,16 +890,16 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp
             let mut kept = TrieStorage::default();
             let mut shipped = TrieStorage::default();
             for k in 0 .. s.keys.len() {
-                for v in s.key_offs[k] .. s.key_offs[k + 1] {
-                    for t in s.val_offs[v] .. s.val_offs[v + 1] {
-                        let target = if frontier.less_equal(&s.times[t]) {
-                            residual.insert_ref(&s.times[t]);
+                for v in s.key_offs.bound(k) .. s.key_offs.bound(k + 1) {
+                    for t in s.val_offs.bound(v) .. s.val_offs.bound(v + 1) {
+                        let target = if frontier.less_equal(s.times.index(t)) {
+                            residual.insert_ref(s.times.index(t));
                             &mut kept
                         } else {
                             &mut shipped
                         };
                         target.ensure_kv(&s.keys[k], &s.vals[v]);
-                        target.push_leaf(&s.times[t], &s.diffs[t]);
+                        target.push_leaf(s.times.index(t), s.diffs.index(t));
                     }
                 }
             }
@@ -680,7 +934,7 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp
 
             // The trailing `(key, val)` group is the last val's run; it may continue
             // in the next chunk, so it is withheld as the carry.
-            let tail = combined.times.len() - combined.val_offs[combined.vals.len() - 1];
+            let tail = combined.times.len() - combined.val_offs.bound(combined.vals.len() - 1);
             if tail == combined.times.len() {
                 // A single `(key, val)` spans the chunk; hold it all as the carry.
                 carry = Some(combined);
@@ -699,7 +953,9 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp
 
     /// Maximal packing via the harness [`pack`](super::pack): coalesce by appending
     /// the next trie onto the carry (adjacent chunks of one sorted, consolidated
-    /// chain), split with [`TrieStorage::split_at`], and seal as a no-op.
+    /// chain), split with [`TrieStorage::split_at`], and seal by releasing excess
+    /// capacity (committed chunks are immutable; a shared or exact chunk passes
+    /// through untouched).
     fn settle(input: &mut VecDeque<Self>, done: bool, out: &mut VecDeque<Self>) {
         super::pack(
             input, done, out,
@@ -711,7 +967,10 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp
                 let (first, rest) = take(chunk).split_at(n);
                 (TrieChunk(Rc::new(first)), TrieChunk(Rc::new(rest)))
             },
-            |chunk| chunk,
+            |mut chunk| {
+                if let Some(storage) = Rc::get_mut(&mut chunk.0) { storage.shrink_to_fit(); }
+                chunk
+            },
         );
     }
 }
@@ -758,7 +1017,7 @@ pub mod cursor {
 
         fn key_valid(&self, s: &Self::Storage) -> bool { self.key_cursor < s.0.keys.len() }
         fn val_valid(&self, s: &Self::Storage) -> bool {
-            self.key_cursor < s.0.keys.len() && self.val_cursor < s.0.key_offs[self.key_cursor + 1]
+            self.key_cursor < s.0.keys.len() && self.val_cursor < s.0.key_offs.bound(self.key_cursor + 1)
         }
         fn key<'a>(&self, s: &'a Self::Storage) -> &'a K { &s.0.keys[self.key_cursor] }
         fn val<'a>(&self, s: &'a Self::Storage) -> &'a V { &s.0.vals[self.val_cursor] }
@@ -770,8 +1029,8 @@ pub mod cursor {
         }
         fn map_times<L: FnMut(&T, &R)>(&mut self, s: &Self::Storage, mut logic: L) {
             if !self.val_valid(s) { return; }
-            for i in s.0.val_offs[self.val_cursor] .. s.0.val_offs[self.val_cursor + 1] {
-                logic(&s.0.times[i], &s.0.diffs[i]);
+            for i in s.0.val_offs.bound(self.val_cursor) .. s.0.val_offs.bound(self.val_cursor + 1) {
+                logic(s.0.times.index(i), s.0.diffs.index(i));
             }
         }
         fn step_key(&mut self, s: &Self::Storage) {
@@ -786,12 +1045,12 @@ pub mod cursor {
         fn step_val(&mut self, s: &Self::Storage) {
             self.val_cursor += 1;
             if !self.val_valid(s) {
-                self.val_cursor = s.0.key_offs[self.key_cursor + 1];
+                self.val_cursor = s.0.key_offs.bound(self.key_cursor + 1);
             }
         }
         fn seek_val(&mut self, s: &Self::Storage, val: &V) {
             if !self.key_valid(s) { return; }
-            let upper = s.0.key_offs[self.key_cursor + 1];
+            let upper = s.0.key_offs.bound(self.key_cursor + 1);
             self.val_cursor = gallop(&s.0.vals, self.val_cursor, upper, |x| x < val);
         }
         fn rewind_keys(&mut self, s: &Self::Storage) {
@@ -799,7 +1058,7 @@ pub mod cursor {
             if self.key_valid(s) { self.rewind_vals(s); }
         }
         fn rewind_vals(&mut self, s: &Self::Storage) {
-            self.val_cursor = s.0.key_offs[self.key_cursor];
+            self.val_cursor = s.0.key_offs.bound(self.key_cursor);
         }
     }
 
@@ -816,7 +1075,7 @@ pub mod cursor {
     where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp, R: Ord + Semigroup + 'static {
         fn bounds(&self) -> ((&K, &V, &T), (&K, &V, &T)) {
             let s = &self.0;
-            ((&s.keys[0], &s.vals[0], &s.times[0]),
+            ((&s.keys[0], &s.vals[0], s.times.index(0)),
              (s.keys.last().unwrap(), s.vals.last().unwrap(), s.times.last().unwrap()))
         }
     }
@@ -844,7 +1103,7 @@ impl<K, V, T, R> Default for TrieBuilder<K, V, T, R> {
 }
 
 impl<K, V, T, R> crate::trace::Builder for TrieBuilder<K, V, T, R>
-where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp, R: Semigroup + 'static {
+where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp, R: Semigroup + PartialEq + 'static {
     type Input = Vec<((K, V), T, R)>;
     type Time = T;
     type Output = super::ChunkBatch<TrieChunk<K, V, T, R>>;
@@ -853,13 +1112,16 @@ where K: Ord + Clone + 'static, V: Ord + Clone + 'static, T: Lattice + Timestamp
         for ((k, v), t, r) in chunk.drain(..) {
             self.current.push_update_owned(k, v, t, r);
             if self.current.formed_len() >= TARGET {
-                self.chunks.push(TrieChunk(Rc::new(std::mem::take(&mut self.current))));
+                let mut sealed = std::mem::take(&mut self.current);
+                sealed.shrink_to_fit();
+                self.chunks.push(TrieChunk(Rc::new(sealed)));
             }
         }
     }
 
     fn done(mut self) -> Option<Self::Output> {
         if self.current.formed_len() > 0 {
+            self.current.shrink_to_fit();
             self.chunks.push(TrieChunk(Rc::new(self.current)));
         }
         (!self.chunks.is_empty()).then(|| super::ChunkBatch::new(self.chunks))
@@ -910,9 +1172,9 @@ mod test {
         for c in chunks {
             let s = c.storage();
             for k in 0 .. s.keys.len() {
-                for v in s.key_offs[k] .. s.key_offs[k + 1] {
-                    for t in s.val_offs[v] .. s.val_offs[v + 1] {
-                        out.push(((s.keys[k], s.vals[v]), s.times[t], s.diffs[t]));
+                for v in s.key_offs.bound(k) .. s.key_offs.bound(k + 1) {
+                    for t in s.val_offs.bound(v) .. s.val_offs.bound(v + 1) {
+                        out.push(((s.keys[k], s.vals[v]), *s.times.index(t), *s.diffs.index(t)));
                     }
                 }
             }
@@ -922,23 +1184,28 @@ mod test {
 
     // Structural invariants of a formed trie.
     fn check_invariants(s: &TrieStorage<u64, u64, u64, i64>) {
-        assert_eq!(s.key_offs.len(), s.keys.len() + 1);
-        assert_eq!(s.val_offs.len(), s.vals.len() + 1);
-        assert_eq!(s.key_offs[0], 0);
-        assert_eq!(s.val_offs[0], 0);
-        assert_eq!(*s.key_offs.last().unwrap(), s.vals.len());
-        assert_eq!(*s.val_offs.last().unwrap(), s.times.len());
+        assert_eq!(s.key_offs.count(), s.keys.len() + 1);
+        assert_eq!(s.val_offs.count(), s.vals.len() + 1);
+        assert_eq!(s.key_offs.bound(0), 0);
+        assert_eq!(s.val_offs.bound(0), 0);
+        assert_eq!(s.key_offs.last(), s.vals.len());
+        assert_eq!(s.val_offs.last(), s.times.len());
         assert_eq!(s.times.len(), s.diffs.len());
-        assert!(s.key_offs.windows(2).all(|w| w[0] < w[1]), "empty key group");
-        assert!(s.val_offs.windows(2).all(|w| w[0] < w[1]), "empty val group");
+        for k in 0 .. s.keys.len() {
+            assert!(s.key_offs.bound(k) < s.key_offs.bound(k + 1), "empty key group");
+        }
+        for v in 0 .. s.vals.len() {
+            assert!(s.val_offs.bound(v) < s.val_offs.bound(v + 1), "empty val group");
+        }
         assert!(s.keys.windows(2).all(|w| w[0] < w[1]), "keys not strictly sorted");
         for k in 0 .. s.keys.len() {
-            let vs = &s.vals[s.key_offs[k] .. s.key_offs[k + 1]];
+            let vs = &s.vals[s.key_offs.bound(k) .. s.key_offs.bound(k + 1)];
             assert!(vs.windows(2).all(|w| w[0] < w[1]), "vals not strictly sorted within key");
         }
         for v in 0 .. s.vals.len() {
-            let ts = &s.times[s.val_offs[v] .. s.val_offs[v + 1]];
-            assert!(ts.windows(2).all(|w| w[0] < w[1]), "times not strictly sorted within val");
+            for t in s.val_offs.bound(v) + 1 .. s.val_offs.bound(v + 1) {
+                assert!(s.times.index(t - 1) < s.times.index(t), "times not strictly sorted within val");
+            }
         }
         assert!(s.diffs.iter().all(|d| *d != 0), "zero diff retained");
     }
@@ -1231,6 +1498,48 @@ mod test {
             consolidate_updates(&mut want);
             assert_eq!(result.is_none(), want.is_empty(), "absence must track emptiness\n  u1={u1:?}\n  u2={u2:?}\n  f={f}");
             assert_eq!(got, want, "fuel-driven merge mismatch\n  u1={u1:?}\n  u2={u2:?}\n  f={f}");
+        }
+    }
+
+    // Snapshot-shaped data — one update per val, one shared time, diff +1 — must
+    // stay compressed: strided offsets and constant time / diff columns, so the
+    // chunk's storage beyond the keys and vals is O(1). Merging two snapshot
+    // chunks and settling must preserve the compression.
+    #[test]
+    fn snapshot_chunks_stay_compressed() {
+        use super::{Column, Offsets};
+
+        fn assert_compressed(s: &TrieStorage<u64, u64, u64, i64>) {
+            assert!(matches!(s.key_offs, Offsets { ref spill, .. } if spill.is_empty()), "key_offs spilled");
+            assert!(matches!(s.val_offs, Offsets { ref spill, .. } if spill.is_empty()), "val_offs spilled");
+            assert!(matches!(s.times, Column::Repeat { .. }), "times materialized");
+            assert!(matches!(s.diffs, Column::Repeat { .. }), "diffs materialized");
+        }
+
+        // Formed directly (the builder path).
+        let evens = chunk((0..1000u64).map(|k| ((2 * k, 0), 7, 1)).collect());
+        let odds = chunk((0..1000u64).map(|k| ((2 * k + 1, 0), 7, 1)).collect());
+        assert_compressed(evens.storage());
+
+        // Merged (the trace maintenance path), then settled.
+        let mut out = VecDeque::new();
+        merge_chains(vec![evens.clone()], vec![odds], &mut out);
+        let mut settled = VecDeque::new();
+        TrieChunk::settle(&mut out, true, &mut settled);
+        assert!(!settled.is_empty());
+        for c in settled.iter() {
+            check_invariants(c.storage());
+            assert_compressed(c.storage());
+        }
+
+        // Advanced (compaction), which rewrites times to the frontier.
+        let frontier = Antichain::from_elem(100u64);
+        let mut q = VecDeque::from([evens]);
+        let mut adv = VecDeque::new();
+        TrieChunk::advance(&mut q, frontier.borrow(), true, &mut adv);
+        for c in adv.iter() {
+            check_invariants(c.storage());
+            assert_compressed(c.storage());
         }
     }
 
