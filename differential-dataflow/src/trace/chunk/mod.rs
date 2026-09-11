@@ -19,6 +19,8 @@
 //! forms `C` from the input stream — typically [`ContainerChunker<C>`](crate::batcher::merge::chunker::ContainerChunker).
 //! These aliases use [`ChunkBatch`], [`ChunkMerger`], [`ChunkBatchMerger`], and [`ChunkBatchBuilder`] for batch formation and trace maintenance.
 //! The [`vec`](mod@vec) module provides a worked implementation and specializes the aliases for its chunk type.
+//! The [`trie`](mod@trie) module provides the trie-layered implementation behind the crate's
+//! default spines (the `ord_neu` replacement).
 //! The `chunks` example builds an arrangement from it.
 //!
 //! Reading chunks through cursors is an optional capability provided by the [`cursor`] module.
@@ -44,6 +46,7 @@ use crate::lattice::Lattice;
 use crate::trace::implementations::spine_fueled::SpineBatch;
 
 pub mod vec;
+pub mod trie;
 pub mod cursor;
 
 pub use cursor::{ChunkBatchCursor, NavigableChunk};

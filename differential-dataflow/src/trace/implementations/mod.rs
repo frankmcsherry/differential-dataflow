@@ -43,14 +43,15 @@ pub mod spine_fueled;
 pub mod merge_batcher;
 pub mod ord_neu;
 
-// Opinionated takes on default spines.
+// Opinionated takes on default spines: the trie-chunk implementations
+// (see [`crate::trace::chunk::trie`]), which replace the `ord_neu` types.
 pub use crate::batcher::merge::chunker::ContainerChunker;
-pub use self::ord_neu::OrdValSpine as ValSpine;
-pub use self::ord_neu::OrdValBatcher as ValBatcher;
-pub use self::ord_neu::VecOrdValBuilder as ValBuilder;
-pub use self::ord_neu::OrdKeySpine as KeySpine;
-pub use self::ord_neu::OrdKeyBatcher as KeyBatcher;
-pub use self::ord_neu::VecOrdKeyBuilder as KeyBuilder;
+pub use crate::trace::chunk::trie::OrdValSpine as ValSpine;
+pub use crate::trace::chunk::trie::OrdValBatcher as ValBatcher;
+pub use crate::trace::chunk::trie::OrdValBuilder as ValBuilder;
+pub use crate::trace::chunk::trie::OrdKeySpine as KeySpine;
+pub use crate::trace::chunk::trie::OrdKeyBatcher as KeyBatcher;
+pub use crate::trace::chunk::trie::OrdKeyBuilder as KeyBuilder;
 
 use std::convert::TryInto;
 
