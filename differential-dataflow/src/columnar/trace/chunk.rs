@@ -321,6 +321,7 @@ where U::Time: 'static {
 impl<U: ColumnarUpdate> Chunk for ColChunk<U>
 where U::Time: 'static {
     type Time = U::Time;
+    type Residual = Antichain<U::Time>;
 
     const TARGET: usize = TARGET;
 

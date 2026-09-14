@@ -1,7 +1,6 @@
 //! Flat pending time/key runs. Activation touches key associations only when due.
-use super::time_container::{Binary, Operand, Rows, TimeContainer};
-use super::updates::{adjacent, beyond, Scratch, Updates};
-use timely::progress::Antichain;
+use super::time_container::{extend_antichain, Binary, Operand, Rows, TimeContainer};
+use super::updates::{adjacent, beyond, Keyed, Scratch};
 
 struct Run<C: TimeContainer> {
     times: C,
@@ -12,7 +11,7 @@ struct Run<C: TimeContainer> {
     minimum: C,
 }
 impl<C: TimeContainer> Run<C> {
-    fn new(updates: Updates<C, i64>, scratch: &mut Scratch<C, ()>) -> Self {
+    fn new(updates: Keyed<C>, scratch: &mut Scratch<C, ()>) -> Self {
         scratch.index.clear();
         scratch.index.extend(0..updates.len());
         scratch.index.sort_by_key(|&r| updates.keys[r]);
@@ -42,10 +41,10 @@ impl<C: TimeContainer> Run<C> {
             ends.push(keys.len());
         }
         let mut times = C::default();
-        times.copy(Operand::Rows(&updates.times, Rows::Indices(&scratch.keep)));
+        times.copy(Operand(&updates.times, Rows::Indices(&scratch.keep)));
         let live = (0..times.len()).collect::<Vec<_>>();
         let mut minimum = C::default();
-        extend_minimum(&mut minimum, &times, &live);
+        extend_antichain(&mut minimum, &times, &live);
         Self {
             times,
             live_keys: keys.len(),
@@ -62,7 +61,7 @@ impl<C: TimeContainer> Run<C> {
             self.ends[row - 1]..self.ends[row]
         }
     }
-    fn append(&self, groups: &[usize], into: &mut Updates<C, i64>) {
+    fn append(&self, groups: &[usize], into: &mut Keyed<C>) {
         // A selection only for the associations being moved, not retained keys.
         let mut rows = Vec::new();
         for &r in groups {
@@ -71,57 +70,7 @@ impl<C: TimeContainer> Run<C> {
             rows.resize(rows.len() + range.len(), r);
         }
         into.times
-            .copy(Operand::Rows(&self.times, Rows::Indices(&rows)));
-        into.ids.resize(into.keys.len(), 0);
-        into.diffs.resize(into.keys.len(), 1);
-    }
-}
-
-/// Extend an antichain entirely in collection storage. Materialize only the final
-/// minimal times when handing a capability frontier back to the driver.
-fn extend_minimum<C: TimeContainer>(minimum: &mut C, times: &C, rows: &[usize]) {
-    let mut mask = Vec::new();
-    let mut keep = Vec::new();
-    let mut scratch = C::default();
-    for &row in rows {
-        mask.resize(minimum.len(), false);
-        C::less_equal(
-            &[Binary {
-                left: Operand::Rows(minimum, Rows::Range(0..minimum.len())),
-                right: Operand::Rows(
-                    times,
-                    Rows::Repeat {
-                        row,
-                        count: minimum.len(),
-                    },
-                ),
-            }],
-            &mut mask,
-        );
-        if mask.iter().any(|&v| v) {
-            continue;
-        }
-        C::less_equal(
-            &[Binary {
-                left: Operand::Rows(
-                    times,
-                    Rows::Repeat {
-                        row,
-                        count: minimum.len(),
-                    },
-                ),
-                right: Operand::Rows(minimum, Rows::Range(0..minimum.len())),
-            }],
-            &mut mask,
-        );
-        keep.clear();
-        keep.extend((0..minimum.len()).filter(|&r| !mask[r]));
-        if keep.len() != minimum.len() {
-            scratch.clear();
-            scratch.copy(Operand::Rows(minimum, Rows::Indices(&keep)));
-            std::mem::swap(minimum, &mut scratch);
-        }
-        minimum.copy(Operand::Rows(times, Rows::Range(row..row + 1)));
+            .copy(Operand(&self.times, Rows::Indices(&rows)));
     }
 }
 
@@ -142,7 +91,7 @@ impl<C: TimeContainer> Default for Pending<C> {
     }
 }
 impl<C: TimeContainer> Pending<C> {
-    pub fn insert(&mut self, mut updates: Updates<C, i64>) {
+    pub fn insert(&mut self, mut updates: Keyed<C>) {
         if updates.is_empty() {
             return;
         }
@@ -152,7 +101,7 @@ impl<C: TimeContainer> Pending<C> {
             self.runs
                 .resize_with(self.runs.len().max(level + 1), || None);
             if let Some(old) = self.runs[level].take() {
-                updates = Updates::default();
+                updates = Keyed::default();
                 run.append(&run.live, &mut updates);
                 old.append(&old.live, &mut updates);
             } else {
@@ -161,15 +110,15 @@ impl<C: TimeContainer> Pending<C> {
             }
         }
     }
-    pub fn activate(&mut self, upper: &Antichain<C::Time>) -> Updates<C, i64> {
-        let mut due: Updates<C, i64> = Updates::default();
+    pub fn activate(&mut self, upper: &C) -> Keyed<C> {
+        let mut due: Keyed<C> = Keyed::default();
         for bin in &mut self.runs {
             let Some(run) = bin else {
                 continue;
             };
             beyond(
                 &run.minimum,
-                upper.elements(),
+                upper,
                 &mut self.mask,
                 &mut self.scratch,
             );
@@ -179,11 +128,11 @@ impl<C: TimeContainer> Pending<C> {
             self.mask.clear();
             self.mask.resize(run.live.len(), false);
             self.scratch.resize(run.live.len(), false);
-            for f in upper.elements() {
+            for f in 0..upper.len() {
                 C::less_equal(
                     &[Binary {
-                        left: Operand::Repeat(f, run.live.len()),
-                        right: Operand::Rows(&run.times, Rows::Indices(&run.live)),
+                        left: Operand::repeat_row(upper, f, run.live.len()),
+                        right: Operand(&run.times, Rows::Indices(&run.live)),
                     }],
                     &mut self.scratch,
                 );
@@ -212,24 +161,24 @@ impl<C: TimeContainer> Pending<C> {
                 continue;
             }
             if run.live.len() * 2 <= run.times.len() && run.live_keys * 2 <= run.keys.len() {
-                let mut compacted = Updates::default();
+                let mut compacted = Keyed::default();
                 run.append(&run.live, &mut compacted);
                 *run = Run::new(compacted, &mut self.order);
             } else {
                 run.minimum.clear();
-                extend_minimum(&mut run.minimum, &run.times, &run.live);
+                extend_antichain(&mut run.minimum, &run.times, &run.live);
             }
         }
-        due.consolidate();
+        due.normalize(&mut self.order);
         due
     }
-    pub fn frontier(&self) -> Antichain<C::Time> {
+    pub fn frontier(&self) -> C {
         let mut minimum = C::default();
         for run in self.runs.iter().flatten() {
             let rows: Vec<_> = (0..run.minimum.len()).collect();
-            extend_minimum(&mut minimum, &run.minimum, &rows);
+            extend_antichain(&mut minimum, &run.minimum, &rows);
         }
-        (0..minimum.len()).map(|r| minimum.time_at(r)).collect()
+        minimum
     }
 }
 
@@ -240,13 +189,11 @@ mod tests {
     #[test]
     fn activation_is_not_a_lexicographic_prefix() {
         let mut pending = Pending::<Vec<Product<u64, u64>>>::default();
-        let mut updates: Updates<Vec<Product<u64, u64>>, i64> = Updates::default();
+        let mut updates: Keyed<Vec<Product<u64, u64>>> = Keyed::default();
         for k in 0..100 {
             for t in [Product::new(0, 4), Product::new(1, 0), Product::new(2, 2)] {
                 updates.keys.push(k);
-                updates.ids.push(0);
                 updates.times.push(t);
-                updates.diffs.push(1);
             }
         }
         pending.insert(updates);
@@ -259,13 +206,13 @@ mod tests {
                 .sum::<usize>(),
             3
         );
-        let due = pending.activate(&Antichain::from(vec![
+        let due = pending.activate(&vec![
             Product::new(0, 3),
             Product::new(2, 0),
-        ]));
+        ]);
         assert_eq!(due.len(), 100);
         assert!(due.times.iter().all(|t| *t == Product::new(1, 0)));
-        assert_eq!(pending.activate(&Antichain::new()).len(), 200);
+        assert_eq!(pending.activate(&vec![]).len(), 200);
         assert!(pending.frontier().is_empty());
     }
 }

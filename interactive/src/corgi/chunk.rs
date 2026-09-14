@@ -22,6 +22,7 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+#[cfg(test)]
 use timely::progress::Antichain;
 use timely::progress::frontier::AntichainRef;
 
@@ -30,8 +31,6 @@ use differential_dataflow::trace::chunk::{pack, Chunk, ChunkBatch};
 
 use corgi::arrange::{compare_adjacent, gather, gather_lanes, group_bounds, sort_perm, survey_groups, GroupRun};
 use corgi::Value as CValue;
-
-
 
 use crate::corgi::col_times::{ColTime, ColTimes};
 
@@ -162,6 +161,7 @@ where
     R: Semigroup + Clone + 'static,
 {
     type Time = T;
+    type Residual = ColTimes<T>;
     const TARGET: usize = TARGET;
 
     fn len(&self) -> usize { self.0.times.len() }
@@ -256,7 +256,7 @@ where
     fn extract(
         input: &mut VecDeque<Self>,
         frontier: AntichainRef<T>,
-        residual: &mut Antichain<T>,
+        residual: &mut ColTimes<T>,
         keep: &mut VecDeque<Self>,
         ship: &mut VecDeque<Self>,
     ) {
@@ -266,16 +266,13 @@ where
         let (times, diffs) = (chunk.times(), chunk.diffs());
         let (mut ki, mut si) = (Vec::new(), Vec::new());
         for (i, carried) in times.beyond(frontier).into_iter().enumerate() {
-            if carried {
-                // Materialize only a prospective frontier member, never an owned time per row.
-                if !residual.elements().iter().any(|t| (0..times.width().max(t.width()))
-                    .all(|j| t.coordinate(j) <= times.coordinate(j, i))) {
-                    residual.insert(times.get(i));
-                }
-                ki.push(i);
-            } else { si.push(i); }
+            if carried { ki.push(i); } else { si.push(i); }
         }
         if ki.is_empty() { ship.push_back(chunk); return; }
+        // Retain the frontier columnarly across chunks; the harness exports once.
+        differential_dataflow::operators::int_proxy::time_container::extend_antichain(
+            residual, times, &ki,
+        );
         if si.is_empty() { keep.push_back(chunk); return; }
         if !ki.is_empty() {
             let t = times.gather(&ki);

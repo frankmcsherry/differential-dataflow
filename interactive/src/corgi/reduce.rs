@@ -30,6 +30,7 @@ use std::rc::Rc;
 use differential_dataflow::trace::Description;
 use differential_dataflow::trace::chunk::ChunkBatch;
 use differential_dataflow::operators::int_proxy::reduce::{ProxyReduceBackend, ReduceInstance};
+use differential_dataflow::operators::int_proxy::updates::Keyed;
 
 use corgi::arrange::{gather, gather_lanes, sort_blocks};
 use corgi::{ArithOp, Bounds, NumOp, OpLike, Value as CValue};
@@ -482,13 +483,11 @@ impl<T: ColTime> CorgiReduceBackend<T> {
         // The seeds are the novel batches' RAW (key_hash, time) support, recorded here — before the
         // merged presentation below, whose consolidation may net a novel record away entirely. The
         // key hashes come from the scan the key list needs anyway.
-        let mut seeds = Updates::default();
+        let mut seeds = Keyed::<ColTimes<T>>::default();
         for ch in novel_chunks.iter() {
             let khs = key_ids(ch.keys());
             let times = ch.times();
             seeds.keys.extend_from_slice(&khs);
-            seeds.ids.resize(seeds.keys.len(), 0);
-            seeds.diffs.resize(seeds.keys.len(), 1);
             seeds.times.push_range(times, 0, times.len());
             keys.extend(khs);
         }

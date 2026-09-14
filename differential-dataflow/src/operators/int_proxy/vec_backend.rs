@@ -173,8 +173,6 @@ where
             seed_scratch.sort();
             seed_scratch.dedup();
             window.seeds.keys.resize(window.seeds.keys.len() + seed_scratch.len(), key);
-            window.seeds.ids.resize(window.seeds.keys.len(), 0);
-            window.seeds.diffs.resize(window.seeds.keys.len(), 1);
             window.seeds.times.append(&mut seed_scratch);
             self.reps.push(single.map(|_| rep));
             if collides { self.collisions.push(key); }

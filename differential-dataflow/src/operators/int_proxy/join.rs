@@ -2,7 +2,7 @@
 use super::{
     time_container::{Binary, Operand, Operation, Rows, TimeContainer},
 };
-use super::{history::Replay, updates::Updates};
+use super::{history::{compare_heads, Replay}, updates::Updates};
 use crate::difference::{Multiply, Semigroup};
 use std::{marker::PhantomData, ops::Range};
 
@@ -81,8 +81,7 @@ pub struct Walk<C: TimeContainer, R0: Semigroup, R1: Semigroup> {
     direct: Option<(usize, usize, usize, usize, usize)>,
     // Replay cursor: active side, its run end/current row, opposite buffer row.
     crossing: Option<(bool, usize, usize, usize)>,
-    a_rows: Vec<usize>,
-    b_rows: Vec<usize>,
+    meet: C,
 }
 impl<C: TimeContainer, R0: Semigroup, R1: Semigroup> Default for Walk<C, R0, R1> {
     fn default() -> Self {
@@ -91,8 +90,7 @@ impl<C: TimeContainer, R0: Semigroup, R1: Semigroup> Default for Walk<C, R0, R1>
             right: Replay::default(),
             direct: None,
             crossing: None,
-            a_rows: vec![],
-            b_rows: vec![],
+            meet: C::default(),
         }
     }
 }
@@ -130,18 +128,22 @@ impl<C: TimeContainer, R0: Semigroup, R1: Semigroup> Walk<C, R0, R1> {
     {
         assert!(limit > out.ids.len());
         if let Some((mut row, end, mut column, start1, end1)) = self.direct {
-            self.a_rows.clear();
-            self.b_rows.clear();
-            while row < end && out.ids.len() + self.a_rows.len() < limit {
-                self.a_rows.push(row);
-                self.b_rows.push(column);
-                column += 1;
+            while row < end && out.ids.len() < limit {
+                let count = (limit - out.ids.len()).min(end1 - column);
+                append_pairs(
+                    key,
+                    left,
+                    Rows::Repeat { row, count },
+                    right,
+                    Rows::Range(column..column + count),
+                    out,
+                );
+                column += count;
                 if column == end1 {
                     column = start1;
                     row += 1;
                 }
             }
-            append_pairs(key, left, &self.a_rows, right, &self.b_rows, out);
             self.direct = Some((row, end, column, start1, end1));
             return row < end;
         }
@@ -151,18 +153,21 @@ impl<C: TimeContainer, R0: Semigroup, R1: Semigroup> Walk<C, R0, R1> {
                 if a.is_none() && b.is_none() {
                     return false;
                 }
-                let take_left = a.is_some() && (b.is_none() || a < b);
+                let take_left =
+                    a.is_some() && (b.is_none() || compare_heads(a.unwrap(), b.unwrap()).is_lt());
                 if take_left {
-                    let meet = self.left.meet();
-                    self.right.buffer.prepare(meet.as_ref());
+                    self.meet.clear();
+                    self.left.meet_into(&mut self.meet);
+                    self.right.buffer.prepare(Some((&self.meet, 0)));
                     if self.right.buffer.data.is_empty() {
                         self.left.step();
                         continue;
                     }
                     self.crossing = Some((true, self.left.end(), self.left.pos, 0));
                 } else {
-                    let meet = self.right.meet();
-                    self.left.buffer.prepare(meet.as_ref());
+                    self.meet.clear();
+                    self.right.meet_into(&mut self.meet);
+                    self.left.buffer.prepare(Some((&self.meet, 0)));
                     if self.left.buffer.data.is_empty() {
                         self.right.step();
                         continue;
@@ -176,35 +181,32 @@ impl<C: TimeContainer, R0: Semigroup, R1: Semigroup> Walk<C, R0, R1> {
             } else {
                 self.left.buffer.data.len()
             };
-            self.a_rows.clear();
-            self.b_rows.clear();
-            while row < end && out.ids.len() + self.a_rows.len() < limit {
-                self.a_rows.push(row);
-                self.b_rows.push(column);
-                column += 1;
+            while row < end && out.ids.len() < limit {
+                let count = (limit - out.ids.len()).min(n - column);
+                if take_left {
+                    append_pairs(
+                        key,
+                        &self.left.data,
+                        Rows::Repeat { row, count },
+                        &self.right.buffer.data,
+                        Rows::Range(column..column + count),
+                        out,
+                    );
+                } else {
+                    append_pairs(
+                        key,
+                        &self.left.buffer.data,
+                        Rows::Range(column..column + count),
+                        &self.right.data,
+                        Rows::Repeat { row, count },
+                        out,
+                    );
+                }
+                column += count;
                 if column == n {
                     column = 0;
                     row += 1;
                 }
-            }
-            if take_left {
-                append_pairs(
-                    key,
-                    &self.left.data,
-                    &self.a_rows,
-                    &self.right.buffer.data,
-                    &self.b_rows,
-                    out,
-                );
-            } else {
-                append_pairs(
-                    key,
-                    &self.left.buffer.data,
-                    &self.b_rows,
-                    &self.right.data,
-                    &self.a_rows,
-                    out,
-                );
             }
             if row == end {
                 if take_left {
@@ -229,19 +231,20 @@ fn append_pairs<
 >(
     key: u64,
     a: &Updates<C, R0>,
-    ar: &[usize],
+    ar: Rows<'_>,
     b: &Updates<C, R1>,
-    br: &[usize],
+    br: Rows<'_>,
     out: &mut JoinMatches<C, ROut>,
 ) {
     out.times.map(
         Operation::Join,
         &[Binary {
-            left: Operand::Rows(&a.times, Rows::Indices(ar)),
-            right: Operand::Rows(&b.times, Rows::Indices(br)),
+            left: Operand(&a.times, ar.clone()),
+            right: Operand(&b.times, br.clone()),
         }],
     );
-    for (&i, &j) in ar.iter().zip(br) {
+    for r in 0..ar.len() {
+        let (i, j) = (ar.at(r), br.at(r));
         out.ids.push((key, (a.ids[i], b.ids[j])));
         out.diffs.push(a.diffs[i].clone().multiply(&b.diffs[j]));
     }

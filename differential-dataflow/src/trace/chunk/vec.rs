@@ -90,6 +90,7 @@ fn take<K: Clone, V: Clone, T: Clone, R: Clone>(chunk: VecChunk<K, V, T, R>) -> 
 impl<K, V, T, R> Chunk for VecChunk<K, V, T, R>
 where K: Ord+Clone+'static, V: Ord+Clone+'static, T: Lattice+Timestamp, R: Semigroup+'static {
     type Time = T;
+    type Residual = Antichain<T>;
 
     const TARGET: usize = TARGET;
 

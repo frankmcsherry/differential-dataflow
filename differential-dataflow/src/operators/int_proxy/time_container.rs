@@ -1,12 +1,12 @@
 //! Bulk timestamp algebra, independent of keys, differences, and operator scheduling.
 //!
-//! Requests describe selected rows or broadcast control times. Implementations may loop
-//! over primitive lanes before requests/rows. Only `time_at` and suffix-summary queries
-//! materialize individual control times; data-sized work uses the bulk methods.
+//! Requests select collection rows. Implementations may loop over primitive lanes
+//! before requests/rows. Scalar import and export belong to the driver boundary;
+//! suffix-summary queries append to reusable container storage.
 
 use crate::lattice::Lattice;
 use std::{cmp::Ordering, ops::Range};
-use timely::progress::{frontier::AntichainRef, Timestamp};
+use timely::progress::Timestamp;
 
 /// Rows to read, in output order. Indices may repeat (for example in a join).
 #[derive(Clone, Debug)]
@@ -47,20 +47,21 @@ impl Rows<'_> {
     }
 }
 
-/// A collection selection or a repeated control time.
-pub enum Operand<'a, C: TimeContainer> {
-    /// Selected collection rows.
-    Rows(&'a C, Rows<'a>),
-    /// Repeat a single time a specified number of times.
-    Repeat(&'a C::Time, usize),
-}
-impl<C: TimeContainer> Operand<'_, C> {
+/// Selected collection rows, including repeated rows.
+pub struct Operand<'a, C: TimeContainer>(
+    /// Source collection.
+    pub &'a C,
+    /// Rows to select.
+    pub Rows<'a>,
+);
+impl<'a, C: TimeContainer> Operand<'a, C> {
+    /// Broadcast a collection row without constructing an owned timestamp.
+    pub fn repeat_row(times: &'a C, row: usize, count: usize) -> Self {
+        Self(times, Rows::Repeat { row, count })
+    }
     /// Number of operand rows.
     pub fn len(&self) -> usize {
-        match self {
-            Self::Rows(_, r) => r.len(),
-            Self::Repeat(_, n) => *n,
-        }
+        self.1.len()
     }
     /// Whether no rows are selected.
     pub fn is_empty(&self) -> bool {
@@ -98,9 +99,9 @@ pub enum Operation {
 
 /// A timestamp collection. Mutating operations retain capacity where practical.
 ///
-/// `map`, `copy`, and `meet_reduce` append; comparisons overwrite their output
-/// slices, whose lengths equal the sum of request lengths. `apply` and
-/// `advance_by` modify only disjoint destination ranges. `order` stably sorts
+/// `map`, `copy`, `meet_reduce`, and `suffix_meet` append; comparisons overwrite their output
+/// slices, whose lengths equal the sum of request lengths. `apply` modifies
+/// only disjoint destination ranges. `order` stably sorts
 /// index segments, without moving timestamp or payload columns. Its equality
 /// must agree with timestamp equality and its total order extend the partial order.
 pub trait TimeContainer: Default + 'static {
@@ -119,20 +120,20 @@ pub trait TimeContainer: Default + 'static {
     }
     /// Remove all rows, retaining storage.
     fn clear(&mut self);
-    /// Read a control time, not an ingestion/iteration interface.
-    fn time_at(&self, row: usize) -> Self::Time;
-    /// Append selected rows or repeated control times.
-    fn copy(&mut self, source: Operand<'_, Self>)
-    where
-        Self: Sized;
+    /// Append selected collection rows.
+    fn copy(&mut self, source: Operand<'_, Self>) where Self: Sized {
+        self.copy_many(&[source]);
+    }
+    /// Append selections in request order, allowing implementations to scan lane first.
+    fn copy_many(&mut self, sources: &[Operand<'_, Self>]) where Self: Sized;
     /// Append pointwise results, in request order.
     fn map(&mut self, op: Operation, requests: &[Binary<'_, Self>])
     where
         Self: Sized;
-    /// Apply an operation with a broadcast time to each disjoint range.
-    fn apply(&mut self, op: Operation, requests: &[(Range<usize>, Self::Time)]);
-    /// Advance selected disjoint ranges by a frontier (empty frontier is identity).
-    fn advance_by(&mut self, ranges: &[Range<usize>], frontier: AntichainRef<'_, Self::Time>);
+    /// Apply a pointwise operation to disjoint ranges; each operand has its range's length.
+    /// Broadcast bounds are repeated rows of another container.
+    fn apply(&mut self, op: Operation, requests: &[(Range<usize>, Operand<'_, Self>)])
+    where Self: Sized;
     /// Bulk partial-order comparison.
     fn less_equal(requests: &[Binary<'_, Self>], output: &mut [bool])
     where
@@ -152,18 +153,66 @@ pub trait TimeContainer: Default + 'static {
     fn meet_reduce(&self, ranges: &[Range<usize>], output: &mut Self);
     /// Build summaries for this collection in its current row order.
     fn suffix_meets(&self, summaries: &mut Self::Suffix);
-    /// Meet of the unconsumed suffix, or None if empty.
-    fn suffix_meet(&self, summaries: &Self::Suffix, position: usize) -> Option<Self::Time>;
+    /// Append the meet of the unconsumed suffix; append nothing if it is empty.
+    /// The caller owns the destination and can reuse it across summary queries.
+    fn suffix_meet(&self, summaries: &Self::Suffix, position: usize, output: &mut Self);
+}
+
+/// Extend an antichain entirely in collection storage. Materialize only the final
+/// minimal times when handing a capability frontier back to the driver.
+pub fn extend_antichain<C: TimeContainer>(minimum: &mut C, times: &C, rows: &[usize]) {
+    if rows.is_empty() { return; }
+    let rows = if minimum.is_empty() {
+        minimum.copy(Operand(times, Rows::Range(rows[0]..rows[0] + 1)));
+        &rows[1..]
+    } else { rows };
+    // Discard already-covered candidates lane by lane before the incremental walk.
+    // Most trace rows are above the retained frontier, so this avoids a call per row.
+    let mut covered = vec![false; rows.len()];
+    let mut mask = vec![false; rows.len()];
+    for row in 0..minimum.len() {
+        C::less_equal(&[Binary {
+            left: Operand::repeat_row(minimum, row, rows.len()),
+            right: Operand(times, Rows::Indices(rows)),
+        }], &mut mask);
+        for (covered, &hit) in covered.iter_mut().zip(&mask) { *covered |= hit; }
+    }
+    if covered.iter().all(|&c| c) { return; }
+    let mut keep = Vec::new();
+    let mut scratch = C::default();
+    for (&row, covered) in rows.iter().zip(covered) {
+        if covered { continue; }
+        mask.resize(minimum.len(), false);
+        C::less_equal(
+            &[Binary {
+                left: Operand(minimum, Rows::Range(0..minimum.len())),
+                right: Operand::repeat_row(times, row, minimum.len()),
+            }],
+            &mut mask,
+        );
+        if mask.iter().any(|&v| v) {
+            continue;
+        }
+        C::less_equal(
+            &[Binary {
+                left: Operand::repeat_row(times, row, minimum.len()),
+                right: Operand(minimum, Rows::Range(0..minimum.len())),
+            }],
+            &mut mask,
+        );
+        keep.clear();
+        keep.extend((0..minimum.len()).filter(|&r| !mask[r]));
+        if keep.len() != minimum.len() {
+            scratch.clear();
+            scratch.copy(Operand(minimum, Rows::Indices(&keep)));
+            std::mem::swap(minimum, &mut scratch);
+        }
+        minimum.copy(Operand(times, Rows::Range(row..row + 1)));
+    }
 }
 
 fn value<'a, T: Timestamp + Lattice>(operand: &'a Operand<'_, Vec<T>>, i: usize) -> &'a T {
-    match operand {
-        Operand::Rows(c, r) => &c[r.at(i)],
-        Operand::Repeat(t, n) => {
-            assert!(i < *n);
-            t
-        }
-    }
+    &operand.0[operand.1.at(i)]
 }
 
 impl<T: Timestamp + Lattice> TimeContainer for Vec<T> {
@@ -176,13 +225,17 @@ impl<T: Timestamp + Lattice> TimeContainer for Vec<T> {
     fn clear(&mut self) {
         self.clear();
     }
-    fn time_at(&self, row: usize) -> T {
-        self[row].clone()
-    }
-    fn copy(&mut self, source: Operand<'_, Self>) {
-        for i in 0..source.len() {
-            self.push(value(&source, i).clone());
-        }
+    fn copy_many(&mut self, sources: &[Operand<'_, Self>]) {
+        self.reserve(sources.iter().map(Operand::len).sum());
+        for source in sources.iter().filter(|s| !s.is_empty()) { match source {
+            Operand(c, Rows::Range(r)) => self.extend_from_slice(&c[r.clone()]),
+            Operand(c, Rows::Indices(rows)) => {
+                self.extend(rows.iter().map(|&r| c[r].clone()))
+            }
+            Operand(c, Rows::Repeat { row, count }) => {
+                self.resize_with(self.len() + count, || c[*row].clone())
+            }
+        } }
     }
     fn map(&mut self, op: Operation, requests: &[Binary<'_, Self>]) {
         for r in requests {
@@ -195,9 +248,11 @@ impl<T: Timestamp + Lattice> TimeContainer for Vec<T> {
             }
         }
     }
-    fn apply(&mut self, op: Operation, requests: &[(Range<usize>, T)]) {
-        for (range, t) in requests {
-            for row in &mut self[range.clone()] {
+    fn apply(&mut self, op: Operation, requests: &[(Range<usize>, Operand<'_, Self>)]) {
+        for (range, source) in requests {
+            assert_eq!(range.len(), source.len());
+            for (i, row) in self[range.clone()].iter_mut().enumerate() {
+                let t = value(source, i);
                 match op {
                     Operation::Join => row.join_assign(t),
                     Operation::Meet => row.meet_assign(t),
@@ -205,15 +260,11 @@ impl<T: Timestamp + Lattice> TimeContainer for Vec<T> {
             }
         }
     }
-    fn advance_by(&mut self, ranges: &[Range<usize>], frontier: AntichainRef<'_, T>) {
-        for range in ranges {
-            for t in &mut self[range.clone()] {
-                t.advance_by(frontier);
-            }
-        }
-    }
     fn less_equal(requests: &[Binary<'_, Self>], output: &mut [bool]) {
-        assert_eq!(output.len(), requests.iter().map(Binary::len).sum());
+        assert_eq!(
+            output.len(),
+            requests.iter().map(Binary::len).sum::<usize>()
+        );
         let mut offset = 0;
         for r in requests {
             for i in 0..r.len() {
@@ -223,7 +274,10 @@ impl<T: Timestamp + Lattice> TimeContainer for Vec<T> {
         }
     }
     fn compare(requests: &[Binary<'_, Self>], output: &mut [Ordering]) {
-        assert_eq!(output.len(), requests.iter().map(Binary::len).sum());
+        assert_eq!(
+            output.len(),
+            requests.iter().map(Binary::len).sum::<usize>()
+        );
         let mut offset = 0;
         for r in requests {
             for i in 0..r.len() {
@@ -254,7 +308,9 @@ impl<T: Timestamp + Lattice> TimeContainer for Vec<T> {
             a[i - 1].meet_assign(&b[0]);
         }
     }
-    fn suffix_meet(&self, summaries: &Self::Suffix, position: usize) -> Option<T> {
-        summaries.as_slice().get(position).cloned()
+    fn suffix_meet(&self, summaries: &Self::Suffix, position: usize, output: &mut Self) {
+        if let Some(t) = summaries.get(position) {
+            output.push(t.clone());
+        }
     }
 }

@@ -4,7 +4,8 @@
 //! the non-trivial and often non-obvious time-based logic that supports them.
 //!
 //! The tactics run DD's operator logic over aligned key, identity, time and diff
-//! columns (see [`updates::Updates`]), the first integer a hash of the "key" and granule of independence, the second an
+//! columns (see [`updates::Updates`]). The first integer is a hash of the "key" and
+//! granule of independence, the second an
 //! ephemeral data identifier understood by the backend but opaque to the operator harness.
 //! The tactics first elicit proxy identifiers from the backends, perform their necessary time
 //! and difference based computations to stage integer collections, and then re-invoke the

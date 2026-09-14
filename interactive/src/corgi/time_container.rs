@@ -1,24 +1,32 @@
 //! Primitive-lane implementation of DD's bulk time algebra. No operator scheduling.
 use super::col_times::{radix_sort_with, ColTime, ColTimes, RadixScratch};
 use differential_dataflow::operators::int_proxy::time_container::{
-    Binary, Operand, Operation, TimeContainer,
+    Binary, Operand, Operation, Rows, TimeContainer,
 };
 use std::{cmp::Ordering, ops::Range, sync::Arc};
-use timely::progress::frontier::AntichainRef;
 
-fn width<T: ColTime>(operand: &Operand<'_, ColTimes<T>>) -> usize {
-    match operand {
-        Operand::Rows(c, _) => c.width(),
-        Operand::Repeat(t, _) => t.width(),
+// Resolve selections once per lane. Inner loops see only primitive slices or a scalar.
+enum Lane<'a> {
+    Slice(&'a [u64]),
+    Gather(&'a [u64], &'a [usize]),
+    Repeat(u64),
+}
+impl Lane<'_> {
+    fn at(&self, i: usize) -> u64 {
+        match self {
+            Self::Slice(values) => values[i],
+            Self::Gather(values, rows) => values[rows[i]],
+            Self::Repeat(value) => *value,
+        }
     }
 }
-fn coordinate<T: ColTime>(operand: &Operand<'_, ColTimes<T>>, lane: usize, row: usize) -> u64 {
-    match operand {
-        Operand::Rows(c, r) => c.coordinate(lane, r.at(row)),
-        Operand::Repeat(t, n) => {
-            assert!(row < *n);
-            t.coordinate(lane)
-        }
+fn read_lane<'a, T: ColTime>(operand: &'a Operand<'_, ColTimes<T>>, j: usize) -> Lane<'a> {
+    let Operand(c, rows) = operand;
+    let Some(lane) = c.lane(j) else { return Lane::Repeat(0); };
+    match rows {
+        Rows::Range(r) => Lane::Slice(&lane[r.clone()]),
+        Rows::Indices(rows) => Lane::Gather(lane, rows),
+        Rows::Repeat { row, .. } => Lane::Repeat(lane[*row]),
     }
 }
 
@@ -39,30 +47,40 @@ impl<T: ColTime> TimeContainer for ColTimes<T> {
     fn clear(&mut self) {
         self.clear();
     }
-    fn time_at(&self, row: usize) -> T {
-        self.get(row)
-    }
-    fn copy(&mut self, source: Operand<'_, Self>) {
-        self.ensure_width(width(&source));
+    fn copy_many(&mut self, sources: &[Operand<'_, Self>]) {
+        let rows: usize = sources.iter().map(Operand::len).sum();
+        if rows == 0 { return; }
+        self.ensure_width(sources.iter().map(|s| s.0.width()).max().unwrap_or(0));
         for (j, lane) in self.lanes.iter_mut().enumerate() {
-            Arc::make_mut(lane).extend((0..source.len()).map(|i| coordinate(&source, j, i)));
+            let lane = Arc::make_mut(lane);
+            lane.reserve(rows);
+            for source in sources.iter().filter(|s| !s.is_empty()) {
+                match (source.0.lane(j), &source.1) {
+                    (None, _) => lane.resize(lane.len() + source.len(), 0),
+                    (Some(values), Rows::Range(r)) => lane.extend_from_slice(&values[r.clone()]),
+                    (Some(values), Rows::Indices(rows)) => lane.extend(rows.iter().map(|&r| values[r])),
+                    (Some(values), Rows::Repeat { row, count }) => lane.resize(lane.len() + count, values[*row]),
+                }
+            }
         }
-        self.rows += source.len();
+        self.rows += rows;
     }
     fn map(&mut self, op: Operation, requests: &[Binary<'_, Self>]) {
-        let rows: usize = requests.iter().map(Binary::len).sum();
+        let rows: usize = requests.iter().map(Binary::len).sum::<usize>();
+        if rows == 0 { return; }
         self.ensure_width(
             requests
                 .iter()
-                .map(|r| width(&r.left).max(width(&r.right)))
+                .map(|r| r.left.0.width().max(r.right.0.width()))
                 .max()
                 .unwrap_or(0),
         );
         for (j, lane) in self.lanes.iter_mut().enumerate() {
             let lane = Arc::make_mut(lane);
             for r in requests {
+                let (a, b) = (read_lane(&r.left, j), read_lane(&r.right, j));
                 lane.extend((0..r.len()).map(|i| {
-                    let (a, b) = (coordinate(&r.left, j, i), coordinate(&r.right, j, i));
+                    let (a, b) = (a.at(i), b.at(i));
                     match op {
                         Operation::Join => a.max(b),
                         Operation::Meet => a.min(b),
@@ -72,72 +90,67 @@ impl<T: ColTime> TimeContainer for ColTimes<T> {
         }
         self.rows += rows;
     }
-    fn apply(&mut self, op: Operation, requests: &[(Range<usize>, T)]) {
-        self.ensure_width(requests.iter().map(|(_, t)| t.width()).max().unwrap_or(0));
+    fn apply(&mut self, op: Operation, requests: &[(Range<usize>, Operand<'_, Self>)]) {
+        assert!(requests.iter().all(|(r, source)| r.len() == source.len()));
+        self.ensure_width(requests.iter().map(|(_, source)| source.0.width()).max().unwrap_or(0));
         for (j, lane) in self.lanes.iter_mut().enumerate() {
             let lane = Arc::make_mut(lane);
-            for (range, t) in requests {
-                let bound = t.coordinate(j);
-                for value in &mut lane[range.clone()] {
-                    *value = match op {
-                        Operation::Join => (*value).max(bound),
-                        Operation::Meet => (*value).min(bound),
-                    };
-                }
-            }
-        }
-    }
-    fn advance_by(&mut self, ranges: &[Range<usize>], frontier: AntichainRef<'_, T>) {
-        if frontier.is_empty() {
-            return;
-        }
-        self.ensure_width(frontier.iter().map(ColTime::width).max().unwrap_or(0));
-        for (j, lane) in self.lanes.iter_mut().enumerate() {
-            let floor = frontier.iter().map(|f| f.coordinate(j)).min().unwrap();
-            if floor == 0 {
-                continue;
-            }
-            let lane = Arc::make_mut(lane);
-            for range in ranges {
-                for value in &mut lane[range.clone()] {
-                    *value = (*value).max(floor);
+            for (range, source) in requests {
+                let apply = |value: &mut u64, bound| *value = match op {
+                    Operation::Join => (*value).max(bound),
+                    Operation::Meet => (*value).min(bound),
+                };
+                let source = read_lane(source, j);
+                if let Lane::Repeat(bound) = source {
+                    for value in &mut lane[range.clone()] { apply(value, bound); }
+                } else {
+                    for (i, value) in lane[range.clone()].iter_mut().enumerate() {
+                        apply(value, source.at(i));
+                    }
                 }
             }
         }
     }
     fn less_equal(requests: &[Binary<'_, Self>], output: &mut [bool]) {
-        assert_eq!(output.len(), requests.iter().map(Binary::len).sum());
+        assert_eq!(
+            output.len(),
+            requests.iter().map(Binary::len).sum::<usize>()
+        );
         output.fill(true);
         let lanes = requests
             .iter()
-            .map(|r| width(&r.left).max(width(&r.right)))
+            .map(|r| r.left.0.width().max(r.right.0.width()))
             .max()
             .unwrap_or(0);
         for j in 0..lanes {
             let mut offset = 0;
             for r in requests {
+                let (a, b) = (read_lane(&r.left, j), read_lane(&r.right, j));
                 for i in 0..r.len() {
-                    output[offset + i] &= coordinate(&r.left, j, i) <= coordinate(&r.right, j, i);
+                    output[offset + i] &= a.at(i) <= b.at(i);
                 }
                 offset += r.len();
             }
         }
     }
     fn compare(requests: &[Binary<'_, Self>], output: &mut [Ordering]) {
-        assert_eq!(output.len(), requests.iter().map(Binary::len).sum());
+        assert_eq!(
+            output.len(),
+            requests.iter().map(Binary::len).sum::<usize>()
+        );
         output.fill(Ordering::Equal);
         let lanes = requests
             .iter()
-            .map(|r| width(&r.left).max(width(&r.right)))
+            .map(|r| r.left.0.width().max(r.right.0.width()))
             .max()
             .unwrap_or(0);
         for j in 0..lanes {
             let mut offset = 0;
             for r in requests {
+                let (a, b) = (read_lane(&r.left, j), read_lane(&r.right, j));
                 for i in 0..r.len() {
                     if output[offset + i] == Ordering::Equal {
-                        output[offset + i] =
-                            coordinate(&r.left, j, i).cmp(&coordinate(&r.right, j, i));
+                        output[offset + i] = a.at(i).cmp(&b.at(i));
                     }
                 }
                 offset += r.len();
@@ -185,13 +198,18 @@ impl<T: ColTime> TimeContainer for ColTimes<T> {
             }
         }
     }
-    fn suffix_meet(&self, summaries: &Self::Suffix, position: usize) -> Option<T> {
-        (position < self.len()).then(|| {
-            T::from_coordinates(self.width(), |j| {
-                let changes = &summaries[j];
+    fn suffix_meet(&self, summaries: &Self::Suffix, position: usize, output: &mut Self) {
+        if position >= self.len() {
+            return;
+        }
+        output.ensure_width(self.width());
+        for (j, lane) in output.lanes.iter_mut().enumerate() {
+            let value = summaries.get(j).map_or(0, |changes| {
                 changes[changes.partition_point(|&(end, _)| end >= position) - 1].1
-            })
-        })
+            });
+            Arc::make_mut(lane).push(value);
+        }
+        output.rows += 1;
     }
 }
 
@@ -200,7 +218,7 @@ mod tests {
     use super::*;
     use differential_dataflow::operators::int_proxy::{
         join::{JoinMatches as Matches, Walk},
-        updates::Updates,
+        updates::{Keyed, Updates},
         time_container::Rows,
     };
     use differential_dataflow::{dynamic::pointstamp::PointStamp, lattice::Lattice};
@@ -216,15 +234,11 @@ mod tests {
         *state ^= *state << 17;
         *state
     }
-    fn times<C: TimeContainer<Time = T>>(rows: &[T]) -> C {
-        let mut out = C::default();
-        for t in rows {
-            out.copy(Operand::Repeat(t, 1));
-        }
-        out
+    fn times<C: TimeContainer<Time = T> + FromIterator<T> + IntoIterator<Item = T> + Clone>(rows: &[T]) -> C {
+        rows.iter().cloned().collect()
     }
-    fn values<C: TimeContainer<Time = T>>(c: &C) -> Vec<T> {
-        (0..c.len()).map(|r| c.time_at(r)).collect()
+    fn values<C: TimeContainer<Time = T> + FromIterator<T> + IntoIterator<Item = T> + Clone>(c: &C) -> Vec<T> {
+        c.clone().into_iter().collect()
     }
 
     #[test]
@@ -239,25 +253,26 @@ mod tests {
                 .collect();
             let (ca, cb) = (times::<ColTimes<T>>(&a), times::<ColTimes<T>>(&b));
             let gather = [7, 1, 7, 3, 0];
-            let broadcast = point([2, 5, 1]);
+            let broadcast = vec![point([2, 5, 1])];
+            let cbroadcast = times::<ColTimes<T>>(&broadcast);
             let row_requests = [
                 Binary {
-                    left: Operand::Rows(&a, Rows::Range(3..12)),
-                    right: Operand::Rows(&b, Rows::Range(20..29)),
+                    left: Operand(&a, Rows::Range(3..12)),
+                    right: Operand(&b, Rows::Range(20..29)),
                 },
                 Binary {
-                    left: Operand::Repeat(&broadcast, 5),
-                    right: Operand::Rows(&a, Rows::Indices(&gather)),
+                    left: Operand::repeat_row(&broadcast, 0, 5),
+                    right: Operand(&a, Rows::Indices(&gather)),
                 },
             ];
             let column_requests = [
                 Binary {
-                    left: Operand::Rows(&ca, Rows::Range(3..12)),
-                    right: Operand::Rows(&cb, Rows::Range(20..29)),
+                    left: Operand(&ca, Rows::Range(3..12)),
+                    right: Operand(&cb, Rows::Range(20..29)),
                 },
                 Binary {
-                    left: Operand::Repeat(&broadcast, 5),
-                    right: Operand::Rows(&ca, Rows::Indices(&gather)),
+                    left: Operand::repeat_row(&cbroadcast, 0, 5),
+                    right: Operand(&ca, Rows::Indices(&gather)),
                 },
             ];
             for op in [Operation::Join, Operation::Meet] {
@@ -266,9 +281,22 @@ mod tests {
                 expected.map(op, &row_requests);
                 actual.map(op, &column_requests);
                 assert_eq!(values(&actual), expected);
-                let changes = [(1..5, broadcast.clone()), (15..20, point([4]))];
-                expected.apply(op, &changes);
-                actual.apply(op, &changes);
+                let other = vec![point([4])];
+                let cother = times::<ColTimes<T>>(&other);
+                expected.apply(op, &[
+                    (1..5, Operand::repeat_row(&broadcast, 0, 4)),
+                    (5..10, Operand::repeat_row(&b, 7, 5)),
+                    (10..15, Operand(&b, Rows::Indices(&gather))),
+                    (15..20, Operand::repeat_row(&other, 0, 5)),
+                    (25..28, Operand(&b, Rows::Range(3..6))),
+                ]);
+                actual.apply(op, &[
+                    (1..5, Operand::repeat_row(&cbroadcast, 0, 4)),
+                    (5..10, Operand::repeat_row(&cb, 7, 5)),
+                    (10..15, Operand(&cb, Rows::Indices(&gather))),
+                    (15..20, Operand::repeat_row(&cother, 0, 5)),
+                    (25..28, Operand(&cb, Rows::Range(3..6))),
+                ]);
                 assert_eq!(values(&actual), expected);
             }
             let (mut expected, mut actual) = (vec![false; 14], vec![false; 14]);
@@ -279,49 +307,59 @@ mod tests {
             Vec::<T>::compare(&row_requests, &mut expected);
             ColTimes::<T>::compare(&column_requests, &mut actual);
             assert_eq!(actual, expected);
-            for upper in [
-                Antichain::new(),
-                Antichain::from(vec![point([1, 4]), point([3, 1])]),
-            ] {
-                let mut expected = a.clone();
-                let mut actual = times::<ColTimes<T>>(&a);
-                TimeContainer::advance_by(&mut expected, &[0..7, 11..24], upper.borrow());
-                TimeContainer::advance_by(&mut actual, &[0..7, 11..24], upper.borrow());
-                assert_eq!(values(&actual), expected);
+            let mut minima = ColTimes::<T>::default();
+            for source in [&ca, &cb] {
+                differential_dataflow::operators::int_proxy::time_container::extend_antichain(
+                    &mut minima, source, &gather,
+                );
             }
+            let expected: Antichain<_> = [&a, &b].into_iter()
+                .flat_map(|src| gather.iter().map(|&r| src[r].clone())).collect();
+            assert_eq!(minima.len(), expected.len());
+            assert!(values(&minima).iter().all(|t| expected.elements().contains(t)));
             let (mut rows, mut columns) = (Vec::new(), ColTimes::<T>::default());
             a.meet_reduce(&[0..5, 7..30], &mut rows);
             ca.meet_reduce(&[0..5, 7..30], &mut columns);
             assert_eq!(values(&columns), rows);
             let mut summary = Default::default();
             ca.suffix_meets(&mut summary);
+            // Append into retained storage, including lanes absent from the source.
+            let mut expected = vec![point([9, 8, 7, 6, 5])];
+            let mut suffix = times::<ColTimes<T>>(&expected);
             for pos in 0..=a.len() {
-                assert_eq!(
-                    ca.suffix_meet(&summary, pos),
-                    a[pos..].iter().cloned().reduce(|x, y| x.meet(&y))
-                );
+                ca.suffix_meet(&summary, pos, &mut suffix);
+                expected.extend(a[pos..].iter().cloned().reduce(|x, y| x.meet(&y)));
+                assert_eq!(values(&suffix), expected);
             }
             let mut expected: Vec<_> = (0..a.len()).rev().collect();
             let mut actual = expected.clone();
             a.order(&mut expected, &[0..13, 13..31], &mut ());
             ca.order(&mut actual, &[0..13, 13..31], &mut Default::default());
             assert_eq!(actual, expected, "stable segmented order");
+            let mut empty = cb.clone(); empty.clear();
+            let mut copied = ColTimes::<T>::default();
+            copied.copy_many(&[Operand(&ca, Rows::Range(2..5)), Operand::repeat_row(&cb, 7, 3),
+                Operand(&cb, Rows::Range(0..0)), Operand::repeat_row(&empty, 0, 0),
+                Operand(&ca, Rows::Indices(&gather))]);
+            let expected: Vec<_> = a[2..5].iter().cloned().chain(std::iter::repeat_n(b[7].clone(), 3))
+                .chain(gather.iter().map(|&r| a[r].clone())).collect();
+            assert_eq!(values(&copied), expected);
             // Shared source lanes remain intact after maps and in-place destination changes.
             assert_eq!(values(&ca), a);
         }
     }
 
-    fn check_join<C: TimeContainer<Time = T>>(
+    fn check_join<C: TimeContainer<Time = T> + FromIterator<T> + IntoIterator<Item = T> + Clone>(
         a: &[(u64, T, i64)],
         b: &[(u64, T, i64)],
         limit: usize,
     ) {
         let make = |rows: &[(u64, T, i64)]| {
             let mut out: Updates<C, i64> = Updates::default();
-            for (id, t, d) in rows {
+            out.times = rows.iter().map(|r| r.1.clone()).collect();
+            for (id, _, d) in rows {
                 out.keys.push(1);
                 out.ids.push(*id);
-                out.times.copy(Operand::Repeat(t, 1));
                 out.diffs.push(*d);
             }
             out.consolidate();
@@ -342,9 +380,9 @@ mod tests {
             let mut out = Matches::default();
             let more = walk.fill(1, &left, &right, limit, &mut out);
             assert!(out.ids.len() <= limit);
-            for r in 0..out.ids.len() {
+            for (r, t) in out.times.into_iter().enumerate() {
                 let (_, (i, j)) = out.ids[r];
-                *actual.entry((i, j, out.times.time_at(r))).or_insert(0) += out.diffs[r];
+                *actual.entry((i, j, t)).or_insert(0) += out.diffs[r];
             }
             if !more {
                 break;
@@ -383,8 +421,8 @@ mod tests {
 
     #[test]
     fn shared_reduce_cancels_clamped_runs_before_scheduling() {
-        use differential_dataflow::operators::int_proxy::reduce::Sweep;
-        fn check<C: TimeContainer<Time = T>>() {
+        use differential_dataflow::operators::int_proxy::reduce::{Sweep, ReduceWindow};
+        fn check<C: TimeContainer<Time = T> + FromIterator<T> + IntoIterator<Item = T> + Clone>() {
             let input = Updates {
                 keys: vec![0, 0],
                 ids: vec![1, 1],
@@ -394,17 +432,15 @@ mod tests {
             let output = Updates::<C, i64>::default();
             let seeds = times::<C>(&[point([2, 0])]);
             let mut sweep = Sweep::<C, i64, i64>::default();
-            sweep.load(&input, 0..2, &output, 0..0, &seeds, 0..1);
-            let (mut inputs, mut outputs) = (Vec::new(), Vec::new());
-            assert_eq!(
-                sweep.next(&Antichain::new(), &mut inputs, &mut outputs),
-                Some(point([2, 0]))
-            );
-            assert!(inputs.is_empty() && outputs.is_empty());
-            sweep.commit(&[]);
-            assert!(sweep
-                .next(&Antichain::new(), &mut inputs, &mut outputs)
-                .is_none());
+            let window = ReduceWindow { input, output, seeds: Keyed {
+                keys: vec![0], times: seeds,
+            } };
+            sweep.load(&window, &[0], &C::default());
+            assert!(sweep.next(&C::default()));
+            assert_eq!(values(&sweep.times), vec![point([2, 0])]);
+            assert!(sweep.input.is_empty() && sweep.output.is_empty());
+            sweep.commit(&[], &[0], &mut Updates::default());
+            assert!(!sweep.next(&C::default()));
         }
         check::<Vec<T>>();
         check::<ColTimes<T>>();
@@ -412,57 +448,81 @@ mod tests {
 
     #[test]
     fn reduce_matches_snapshots_on_a_product_grid() {
-        use differential_dataflow::operators::int_proxy::reduce::Sweep;
+        use differential_dataflow::operators::int_proxy::reduce::{Sweep, ReduceWindow};
         use timely::PartialOrder;
-        fn check<C: TimeContainer<Time = T>>() {
+        fn append<C: TimeContainer>(into: &mut Updates<C, i64>, from: &Updates<C, i64>) {
+            into.keys.extend_from_slice(&from.keys); into.ids.extend_from_slice(&from.ids);
+            into.diffs.extend_from_slice(&from.diffs);
+            into.times.copy(Operand(&from.times, Rows::Range(0..from.len())));
+        }
+        fn check<C: TimeContainer<Time = T> + FromIterator<T> + IntoIterator<Item = T> + Clone>() {
             let mut state = 1234567;
             let mut sweep = Sweep::<C, i64, i64>::default();
             for width in 0..=3 {
                 let grid: Vec<_> = (0..4usize.pow(width))
-                    .map(|i| point((0..width).map(|j| (i / 4usize.pow(j) % 4) as u64)))
-                    .collect();
-                for _ in 0..20 {
-                    let raw: Vec<_> = (0..30).map(|_| (
-                        random(&mut state) % 4,
-                        grid[random(&mut state) as usize % grid.len()].clone(),
-                        (random(&mut state) % 3) as i64 - 1,
-                    )).collect();
-                    let seeds = times::<C>(&raw.iter().map(|r| r.1.clone()).collect::<Vec<_>>());
-                    let mut input = Updates {
-                        keys: vec![0; raw.len()],
-                        ids: raw.iter().map(|r| r.0).collect(),
-                        times: times::<C>(&raw.iter().map(|r| r.1.clone()).collect::<Vec<_>>()),
-                        diffs: raw.iter().map(|r| r.2).collect(),
-                    };
-                    input.consolidate();
-                    sweep.load(&input, 0..input.len(), &Updates::default(), 0..0, &seeds, 0..seeds.len());
-                    let (mut ins, mut outs, mut emitted) = (Vec::new(), Vec::new(), Vec::new());
-                    let mut steps = 0;
-                    while let Some(at) = sweep.next(&Antichain::new(), &mut ins, &mut outs) {
-                        let at = at.clone();
-                        steps += 1;
-                        assert!(steps <= grid.len());
-                        let mut corrections: Vec<_> = ins.iter().filter(|r| r.1 > 0).map(|r| (r.0, 1)).collect();
-                        corrections.extend(outs.iter().map(|r| (r.0, -r.1)));
-                        differential_dataflow::consolidation::consolidate(&mut corrections);
-                        emitted.extend(corrections.iter().map(|&(id, d)| (id, at.clone(), d)));
-                        sweep.commit(&corrections);
-                        ins.clear(); outs.clear();
-                    }
-                    // Evaluate snapshots directly, independently of the tactic's time walk.
-                    for at in &grid {
-                        let mut expected = [0i64; 4];
-                        let mut actual = [0i64; 4];
-                        for (id, t, d) in &raw {
-                            if t.less_equal(at) { expected[*id as usize] += d; }
+                    .map(|i| point((0..width).map(|j| (i / 4usize.pow(j) % 4) as u64))).collect();
+                for _ in 0..10 {
+                    // Mix single-seed keys with incomparable histories; slot reuse must
+                    // tolerate different subsets finishing or deferring in each wave.
+                    let raw: Vec<_> = (0..40).map(|_| {
+                        let key = random(&mut state) % 4;
+                        let t = match key { 0 => grid[0].clone(), 2 => grid.last().unwrap().clone(),
+                            _ => grid[random(&mut state) as usize % grid.len()].clone() };
+                        (key, random(&mut state) % 4, t, (random(&mut state) % 3) as i64 - 1)
+                    }).collect();
+                    for limit in [1, 3, 32] {
+                        let mut window = ReduceWindow {
+                            input: Updates { keys: raw.iter().map(|r| r.0).collect(), ids: raw.iter().map(|r| r.1).collect(),
+                                times: times::<C>(&raw.iter().map(|r| r.2.clone()).collect::<Vec<_>>()), diffs: raw.iter().map(|r| r.3).collect() },
+                            output: Updates::default(),
+                            seeds: Keyed { keys: raw.iter().map(|r| r.0).collect(),
+                                times: times::<C>(&raw.iter().map(|r| r.2.clone()).collect::<Vec<_>>()) },
+                        };
+                        window.input.consolidate(); window.seeds.consolidate();
+                        for frontier in [Antichain::from_elem(point(vec![2; width as usize])), Antichain::new()] {
+                            let upper = times::<C>(frontier.elements());
+                            let mut keys = window.seeds.keys.clone(); keys.dedup();
+                            let mut deferred = Keyed::default();
+                            let mut deltas = Updates::default();
+                            let mut steps = 0;
+                            for group in keys.chunks(limit) {
+                                sweep.load(&window, group, &upper);
+                                while sweep.next(&upper) {
+                                    steps += sweep.keys.len();
+                                    assert!(steps <= grid.len() * 4);
+                                    let (mut corrections, mut ends) = (Vec::new(), Vec::new());
+                                    let (mut a, mut b) = (0, 0);
+                                    for (&ae, &be) in sweep.input_ends.iter().zip(&sweep.output_ends) {
+                                        let start = corrections.len();
+                                        corrections.extend(sweep.input[a..ae].iter().filter(|r| r.1 > 0).map(|r| (r.0, 1)));
+                                        corrections.extend(sweep.output[b..be].iter().map(|r| (r.0, -r.1)));
+                                        differential_dataflow::consolidation::consolidate_from(&mut corrections, start);
+                                        ends.push(corrections.len()); (a, b) = (ae, be);
+                                    }
+                                    sweep.commit(&corrections, &ends, &mut deltas);
+                                }
+                                deferred.append_range(sweep.pending(), 0..sweep.pending().len());
+                            }
+                            append(&mut window.output, &deltas);
+                            window.output.consolidate();
+                            // Independently evaluate every completed snapshot, including keys
+                            // not revisited in this retirement. No time-walk machinery in the oracle.
+                            let output_times = values(&window.output.times);
+                            for at in grid.iter().filter(|t| !frontier.less_equal(t)) {
+                                let (mut expected, mut actual) = ([[0i64; 4]; 4], [[0i64; 4]; 4]);
+                                for (k, id, t, d) in &raw {
+                                    if t.less_equal(at) { expected[*k as usize][*id as usize] += d; }
+                                }
+                                for counts in &mut expected { for count in counts { *count = i64::from(*count > 0); } }
+                                for (r, t) in output_times.iter().enumerate() {
+                                    if t.less_equal(at) { actual[window.output.keys[r] as usize][window.output.ids[r] as usize] += window.output.diffs[r]; }
+                                }
+                                assert_eq!(actual, expected, "limit={limit}, snapshot={at:?}, frontier={frontier:?}");
+                            }
+                            if frontier.is_empty() { assert!(deferred.is_empty()); }
+                            window.seeds = deferred; window.seeds.consolidate();
                         }
-                        for count in &mut expected { *count = i64::from(*count > 0); }
-                        for (id, t, d) in &emitted {
-                            if t.less_equal(at) { actual[*id as usize] += d; }
-                        }
-                        assert_eq!(actual, expected, "snapshot at {at:?}");
                     }
-                    assert!(sweep.pending().is_empty());
                 }
             }
         }

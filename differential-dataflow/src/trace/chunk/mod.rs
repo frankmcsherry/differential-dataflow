@@ -66,6 +66,9 @@ pub trait Chunk: Sized + Clone {
     /// Trace maintenance uses time to describe intervals and to advance and compact updates.
     type Time: Lattice + timely::progress::Timestamp;
 
+    /// Frontier storage retained across a complete extraction pass.
+    type Residual: FromIterator<Self::Time> + IntoIterator<Item = Self::Time>;
+
     /// The intended maximum chunk size.
     const TARGET: usize;
 
@@ -96,7 +99,7 @@ pub trait Chunk: Sized + Clone {
     fn extract(
         input: &mut VecDeque<Self>,
         frontier: AntichainRef<Self::Time>,
-        residual: &mut Antichain<Self::Time>,
+        residual: &mut Self::Residual,
         keep: &mut VecDeque<Self>,
         ship: &mut VecDeque<Self>,
     );
@@ -300,16 +303,18 @@ where
         // neither `keep` (retained across yields) nor `ship` (handed to the builder)
         // builds up unsettled in core. `settle` may withhold a sub-`TARGET` carry
         // between calls; the final `settle(done)` flushes it.
+        let mut residual: C::Residual = std::mem::take(frontier).into_iter().collect();
         let mut input: VecDeque<C> = merged.into();
         let (mut keep, mut shipped) = (VecDeque::new(), VecDeque::new());
         let (mut kept_q, mut shipped_q) = (VecDeque::new(), VecDeque::new());
         while !input.is_empty() {
-            C::extract(&mut input, upper, frontier, &mut keep, &mut shipped);
+            C::extract(&mut input, upper, &mut residual, &mut keep, &mut shipped);
             C::settle(&mut keep, false, &mut kept_q);
             C::settle(&mut shipped, false, &mut shipped_q);
         }
         C::settle(&mut keep, true, &mut kept_q);
         C::settle(&mut shipped, true, &mut shipped_q);
+        *frontier = residual.into_iter().collect();
         kept.extend(kept_q);
         ship.extend(shipped_q);
     }

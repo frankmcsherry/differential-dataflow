@@ -1,18 +1,16 @@
 //! One reduce sweep and callback harness for any bulk timestamp container.
-use super::{
-    time_container::{Binary, Operand, Operation, Rows, TimeContainer},
-};
+use super::time_container::{Binary, Operand, Operation, Rows, TimeContainer};
 use super::pending::Pending;
 use super::{
-    history::{include, Buffer, Replay},
-    updates::{beyond, unique, visible, Scratch, Updates},
+    history::{Buffer, Replay},
+    updates::{beyond, unique, visible, Keyed, Scratch, Updates},
 };
 use crate::{
     difference::Semigroup,
     operators::reduce::ReduceTactic,
     trace::{Description, Span},
 };
-use std::ops::Range;
+use std::{cmp::Ordering, ops::Range};
 use timely::progress::{Antichain, frontier::AntichainRef};
 
 /// A unit of proxied reduce work, presented to the backend.
@@ -27,12 +25,12 @@ pub struct ReduceInstance<'a, T, B1, B2> {
     pub lower: AntichainRef<'a, T>,
 }
 
-/// A presentation window; seed differences/identities are ignored.
+/// A presentation window preserving raw time support even when records cancel.
 pub struct ReduceWindow<C, RIn, ROut> {
     /// Novel and prior input, netted together.
     pub input: Updates<C, RIn>,
     /// Raw novel (key, time) support, before advancement or netting.
-    pub seeds: Updates<C, i64>,
+    pub seeds: Keyed<C>,
     /// Prior output.
     pub output: Updates<C, ROut>,
 }
@@ -40,7 +38,7 @@ impl<C: Default, RIn, ROut> Default for ReduceWindow<C, RIn, ROut> {
     fn default() -> Self {
         Self {
             input: Updates::default(),
-            seeds: Updates::default(),
+            seeds: Keyed::default(),
             output: Updates::default(),
         }
     }
@@ -117,20 +115,13 @@ impl<C: TimeContainer> Run<C> {
         self.pos = 0;
         self.times.suffix_meets(&mut self.suffix);
     }
-    fn head(&self) -> Option<C::Time> {
-        (self.pos < self.times.len()).then(|| self.times.time_at(self.pos))
+    fn head(&self) -> Option<(&C, usize)> {
+        (self.pos < self.times.len()).then_some((&self.times, self.pos))
     }
-    fn meet(&self) -> Option<C::Time> {
-        self.times.suffix_meet(&self.suffix, self.pos)
+    fn meet_into(&self, output: &mut C) {
+        self.times.suffix_meet(&self.suffix, self.pos, output);
     }
-    fn consume(&mut self, at: &C::Time) -> bool {
-        if self.head().as_ref() == Some(at) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
-    }
+
 }
 struct Schedule<C: TimeContainer> {
     bins: Vec<Option<Run<C>>>,
@@ -141,21 +132,6 @@ impl<C: TimeContainer> Default for Schedule<C> {
     }
 }
 impl<C: TimeContainer> Schedule<C> {
-    fn head(&self) -> Option<C::Time> {
-        self.bins.iter().flatten().filter_map(Run::head).min()
-    }
-    fn consume(&mut self, at: &C::Time) -> bool {
-        let mut found = false;
-        for bin in &mut self.bins {
-            if let Some(run) = bin {
-                found |= run.consume(at);
-                if run.pos == run.times.len() {
-                    *bin = None;
-                }
-            }
-        }
-        found
-    }
     fn insert(&mut self, mut times: C, scratch: &mut Scratch<C, ()>) {
         if times.is_empty() {
             return;
@@ -165,7 +141,7 @@ impl<C: TimeContainer> Schedule<C> {
             self.bins
                 .resize_with(self.bins.len().max(level + 1), || None);
             if let Some(old) = self.bins[level].take() {
-                times.copy(Operand::Rows(
+                times.copy(Operand(
                     &old.times,
                     Rows::Range(old.pos..old.times.len()),
                 ));
@@ -184,19 +160,16 @@ impl<C: TimeContainer> Schedule<C> {
     }
 }
 
-/// Resumable reduce time walk. Keys/values are opaque identities; time work is bulk.
-/// Source rows enter replay buffers in total time order. Seeds and generated joins
-/// mark evaluations; reached witnesses preserve their influence at later times.
-/// A callback must commit its corrections before the next evaluation can read them.
-pub struct Sweep<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> {
+// Per-key histories; evaluation times and floors live in the batch, not these slots.
+struct KeySweep<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> {
+    key: u64,
+    floor_row: usize,
     input: Replay<C, RIn>,
     output: Replay<C, ROut>,
     seeds: Run<C>,
     schedule: Schedule<C>,
     reached: C,
     produced: Buffer<C, ROut>,
-    floor: Option<C::Time>,
-    at: Option<C::Time>,
     pending: C,
     candidates: C,
     time_scratch: Scratch<C, ()>,
@@ -204,244 +177,366 @@ pub struct Sweep<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> {
     carried: Vec<bool>,
     frontier_mask: Vec<bool>,
     selected: Vec<usize>,
-    simple: bool,
-    single: Option<C::Time>,
-    single_input: Vec<(u64, RIn)>,
-    single_output: Vec<(u64, ROut)>,
 }
-impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> Default for Sweep<C, RIn, ROut> {
+impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> Default for KeySweep<C, RIn, ROut> {
     fn default() -> Self {
-        Self {
-            input: Replay::default(),
-            output: Replay::default(),
-            seeds: Run::default(),
-            schedule: Schedule::default(),
-            reached: C::default(),
-            produced: Buffer::default(),
-            floor: None,
-            at: None,
-            pending: C::default(),
-            candidates: C::default(),
-            time_scratch: Scratch::default(),
-            mask: vec![],
-            carried: vec![],
-            frontier_mask: vec![],
-            selected: vec![],
-            simple: false,
-            single: None,
-            single_input: vec![],
-            single_output: vec![],
-        }
+        Self { key: 0, floor_row: 0, input: Replay::default(), output: Replay::default(),
+            seeds: Run::default(), schedule: Schedule::default(), reached: C::default(),
+            produced: Buffer::default(), pending: C::default(), candidates: C::default(),
+            time_scratch: Scratch::default(), mask: vec![], carried: vec![],
+            frontier_mask: vec![], selected: vec![] }
     }
 }
-impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> Sweep<C, RIn, ROut> {
-    /// Initialize a selected key. Seeds are separate from netted record histories.
-    pub fn load(
-        &mut self,
-        input: &Updates<C, RIn>,
-        ir: Range<usize>,
-        output: &Updates<C, ROut>,
-        or: Range<usize>,
-        seeds: &C,
-        sr: Range<usize>,
-    ) {
+impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> KeySweep<C, RIn, ROut> {
+    fn load(&mut self, window: &ReduceWindow<C, RIn, ROut>,
+        (ir, or, sr): &(Range<usize>, Range<usize>, Range<usize>), floor: (&C, usize)) {
         self.seeds.times.clear();
-        self.seeds.times.copy(Operand::Rows(seeds, Rows::Range(sr)));
-        unique(&mut self.seeds.times, &mut self.time_scratch);
-        self.seeds.reset();
-        assert!(
-            !self.seeds.times.is_empty(),
-            "a sweep needs raw or owed seeds"
-        );
+        self.seeds.times.copy(Operand(&window.seeds.times, Rows::Range(sr.clone())));
+        self.seeds.reset(); // Window seeds are already distinct and sorted by key/time.
         self.schedule.bins.clear();
         self.reached.clear();
         self.produced.clear();
         self.pending.clear();
-        self.at = None;
-        self.simple = false;
-        self.single = None;
-        // One dominating seed collapses the entire history to one evaluation.
-        // This is a lattice property, not a product-specific shortcut.
-        if self.seeds.times.len() == 1 {
-            let at = self.seeds.times.time_at(0);
-            self.mask.resize(ir.len() + or.len(), false);
-            C::less_equal(
-                &[
-                    Binary {
-                        left: Operand::Rows(&input.times, Rows::Range(ir.clone())),
-                        right: Operand::Repeat(&at, ir.len()),
-                    },
-                    Binary {
-                        left: Operand::Rows(&output.times, Rows::Range(or.clone())),
-                        right: Operand::Repeat(&at, or.len()),
-                    },
-                ],
-                &mut self.mask,
-            );
-            if self.mask.iter().all(|&m| m) {
-                self.simple = true;
-                self.single = Some(at);
-                accumulate(input, ir, &mut self.single_input);
-                accumulate(output, or, &mut self.single_output);
-                return;
-            }
-        }
-        self.floor = self.seeds.meet();
-        self.input.load(input, ir, self.floor.as_ref());
-        self.output.load(output, or, self.floor.as_ref());
+        self.input.load(&window.input, ir.clone(), Some(floor));
+        self.output.load(&window.output, or.clone(), Some(floor));
     }
-    fn head(&self) -> Option<C::Time> {
-        [
-            self.input.head(),
-            self.output.head(),
-            self.seeds.head(),
-            self.schedule.head(),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
+    fn heads(&self) -> impl Iterator<Item = (&C, usize)> {
+        self.input.head().into_iter().chain(self.output.head()).chain(self.seeds.head())
+            .chain(self.schedule.bins.iter().flatten().filter_map(Run::head))
     }
-    fn settle(&mut self) {
-        let mut floor = None;
-        include(&mut floor, self.input.meet());
-        include(&mut floor, self.output.meet());
-        include(&mut floor, self.seeds.meet());
-        for run in self.schedule.bins.iter().flatten() {
-            include(&mut floor, run.meet());
+    fn has_remaining(&self) -> bool { self.heads().next().is_some() }
+    fn consume(&mut self, comparisons: &[Ordering]) -> bool {
+        let mut equal = comparisons.iter().map(|c| c.is_eq());
+        if self.input.head().is_some() && equal.next().unwrap() { self.input.step(); }
+        if self.output.head().is_some() && equal.next().unwrap() { self.output.step(); }
+        let mut fresh = false;
+        if self.seeds.head().is_some() && equal.next().unwrap() {
+            self.seeds.pos += 1;
+            fresh = true;
         }
-        if let Some(floor) = floor {
-            self.reached
-                .apply(Operation::Join, &[(0..self.reached.len(), floor.clone())]);
-            unique(&mut self.reached, &mut self.time_scratch);
-            self.floor = Some(floor);
+        for bin in &mut self.schedule.bins {
+            if let Some(run) = bin {
+                if equal.next().unwrap() { run.pos += 1; fresh = true; }
+                if run.pos == run.times.len() { *bin = None; }
+            }
         }
+        assert!(equal.next().is_none());
+        fresh
     }
-    /// Walk to one evaluation, appending its input/output brackets to caller buffers.
-    /// Call `commit` before resuming this key. Other keys may suspend independently.
-    pub fn next(
-        &mut self,
-        upper: &Antichain<C::Time>,
-        input: &mut Vec<(u64, RIn)>,
-        output: &mut Vec<(u64, ROut)>,
-    ) -> Option<C::Time> {
-        assert!(
-            self.at.is_none(),
-            "commit corrections before resuming a sweep"
-        );
-        if self.simple {
-            let at = self.single.take()?;
-            if upper.less_equal(&at) {
-                self.pending.copy(Operand::Repeat(&at, 1));
-                return None;
-            }
-            input.extend_from_slice(&self.single_input);
-            output.extend_from_slice(&self.single_output);
-            self.at = Some(at.clone());
-            return Some(at);
+    fn evaluate(&mut self, at: (&C, usize), floor: (&C, usize), carried: bool,
+        fresh: bool, upper: &C, input: &mut Vec<(u64, RIn)>, output: &mut Vec<(u64, ROut)>) -> bool {
+        if fresh {
+            self.reached.copy(Operand::repeat_row(at.0, at.1, 1));
         }
-        while let Some(at) = self.head() {
-            self.input.step_at(&at);
-            self.output.step_at(&at);
-            let fresh = self.seeds.consume(&at) | self.schedule.consume(&at);
-            if fresh {
-                self.reached.copy(Operand::Repeat(&at, 1));
-            }
-            visible(&self.reached, &at, &mut self.mask);
-            let interested = fresh || self.mask.iter().any(|&v| v);
-            if upper.less_equal(&at) {
-                if interested {
-                    self.pending.copy(Operand::Repeat(&at, 1));
-                }
-                self.settle();
-                continue;
-            }
-            self.candidates.clear();
-            append_forward(
-                &self.reached,
-                &at,
-                &self.mask,
-                &mut self.selected,
-                &mut self.candidates,
-            );
+        visible(&self.reached, at, &mut self.mask);
+        let interested = fresh || self.mask.iter().any(|&v| v);
+        if carried {
             if interested {
-                read_and_forward(
-                    &mut self.input.buffer,
-                    &at,
-                    self.floor.as_ref(),
-                    input,
-                    &mut self.candidates,
-                    &mut self.mask,
-                    &mut self.selected,
-                );
-                let start = output.len();
-                read_and_forward(
-                    &mut self.output.buffer,
-                    &at,
-                    self.floor.as_ref(),
-                    output,
-                    &mut self.candidates,
-                    &mut self.mask,
-                    &mut self.selected,
-                );
-                read_and_forward(
-                    &mut self.produced,
-                    &at,
-                    self.floor.as_ref(),
-                    output,
-                    &mut self.candidates,
-                    &mut self.mask,
-                    &mut self.selected,
-                );
-                crate::consolidation::consolidate_from(output, start);
+                self.pending.copy(Operand::repeat_row(at.0, at.1, 1));
             }
-            unique(&mut self.candidates, &mut self.time_scratch);
-            beyond(
-                &self.candidates,
-                upper.elements(),
-                &mut self.carried,
-                &mut self.frontier_mask,
+            return false;
+        }
+        self.candidates.clear();
+        append_forward(
+            &self.reached,
+            at,
+            &self.mask,
+            &mut self.selected,
+            &mut self.candidates,
+        );
+        if interested {
+            read_and_forward(
+                &mut self.input.buffer,
+                at,
+                Some(floor),
+                input,
+                &mut self.candidates,
+                &mut self.mask,
+                &mut self.selected,
             );
-            self.selected.clear();
-            self.selected
-                .extend((0..self.candidates.len()).filter(|&r| self.carried[r]));
-            self.pending.copy(Operand::Rows(
+            let start = output.len();
+            read_and_forward(
+                &mut self.output.buffer,
+                at,
+                Some(floor),
+                output,
+                &mut self.candidates,
+                &mut self.mask,
+                &mut self.selected,
+            );
+            read_and_forward(
+                &mut self.produced,
+                at,
+                Some(floor),
+                output,
+                &mut self.candidates,
+                &mut self.mask,
+                &mut self.selected,
+            );
+            crate::consolidation::consolidate_from(output, start);
+        }
+        unique(&mut self.candidates, &mut self.time_scratch);
+        beyond(
+            &self.candidates,
+            upper,
+            &mut self.carried,
+            &mut self.frontier_mask,
+        );
+        self.selected.clear();
+        self.selected
+            .extend((0..self.candidates.len()).filter(|&r| self.carried[r]));
+        self.pending.copy(Operand(
+            &self.candidates,
+            Rows::Indices(&self.selected),
+        ));
+        self.selected.clear();
+        self.selected
+            .extend((0..self.candidates.len()).filter(|&r| !self.carried[r]));
+        if !self.selected.is_empty() {
+            let mut future = C::default();
+            future.copy(Operand(
                 &self.candidates,
                 Rows::Indices(&self.selected),
             ));
-            self.selected.clear();
-            self.selected
-                .extend((0..self.candidates.len()).filter(|&r| !self.carried[r]));
-            if !self.selected.is_empty() {
-                let mut future = C::default();
-                future.copy(Operand::Rows(
-                    &self.candidates,
-                    Rows::Indices(&self.selected),
-                ));
-                self.schedule.insert(future, &mut self.time_scratch);
+            self.schedule.insert(future, &mut self.time_scratch);
+        }
+        interested
+    }
+}
+
+/// A bounded group of reduce walks. Time selection, readiness, floors and emission
+/// operate on shared columns. Commit each returned wave before calling `next` again.
+pub struct Sweep<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> {
+    /// Keys of the current evaluation wave.
+    pub keys: Vec<u64>,
+    /// One timestamp per evaluation key.
+    pub times: C,
+    /// Input brackets, delimited by `input_ends`.
+    pub input: Vec<(u64, RIn)>,
+    /// Exclusive input bracket ends, including empty brackets.
+    pub input_ends: Vec<usize>,
+    /// Output brackets, delimited by `output_ends`.
+    pub output: Vec<(u64, ROut)>,
+    /// Exclusive output bracket ends, including empty brackets.
+    pub output_ends: Vec<usize>,
+    slots: Vec<KeySweep<C, RIn, ROut>>,
+    used: usize, // Current group; spare slots retain allocations.
+    live: Vec<usize>,
+    active: Vec<Option<usize>>, // Simple keys need no retained slot.
+    heads: C,
+    candidates: C,
+    ranges: Vec<Range<usize>>,
+    window_ranges: Vec<(Range<usize>, Range<usize>, Range<usize>)>,
+    simple: Vec<bool>,
+    winners: Vec<usize>,
+    challengers: Vec<(usize, usize)>,
+    left: Vec<usize>,
+    right: Vec<usize>,
+    ready: Vec<usize>,
+    comparisons: Vec<Ordering>,
+    floors: C,
+    minima: C,
+    deferred: Keyed<C>,
+    carried: Vec<bool>,
+    mask: Vec<bool>,
+    initial: bool,
+    evaluating: bool,
+    finished: bool,
+}
+impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> Default for Sweep<C, RIn, ROut> {
+    fn default() -> Self {
+        Self { keys: vec![], times: C::default(), input: vec![], input_ends: vec![],
+            output: vec![], output_ends: vec![], slots: vec![], used: 0, live: vec![],
+            active: vec![], heads: C::default(), floors: C::default(), minima: C::default(),
+            candidates: C::default(), ranges: vec![], window_ranges: vec![], simple: vec![],
+            winners: vec![], challengers: vec![], left: vec![], right: vec![], ready: vec![], comparisons: vec![],
+            deferred: Keyed::default(), carried: vec![], mask: vec![],
+            initial: false, evaluating: false, finished: true }
+    }
+}
+impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup> Sweep<C, RIn, ROut> {
+    fn clear_wave(&mut self) {
+        self.keys.clear(); self.times.clear(); self.input.clear(); self.output.clear();
+        self.input_ends.clear(); self.output_ends.clear(); self.active.clear();
+    }
+    /// Load affected keys from a window with consolidated seeds. Single dominating
+    /// seeds are classified in bulk and need no per-key replay state.
+    pub fn load(&mut self, window: &ReduceWindow<C, RIn, ROut>, keys: &[u64], upper: &C) {
+        assert!(!self.evaluating, "commit before replacing a wave");
+        self.clear_wave(); self.deferred.clear(); self.live.clear();
+        self.initial = true; self.finished = false;
+        self.window_ranges.clear();
+        self.window_ranges.extend(keys.iter().map(|&k| (key_range(&window.input.keys, k),
+            key_range(&window.output.keys, k), key_range(&window.seeds.keys, k))));
+        let ranges = &self.window_ranges;
+        assert!(ranges.iter().all(|r| !r.2.is_empty()), "each key needs a seed");
+        let requests: Vec<_> = ranges.iter().filter(|r| r.2.len() == 1).flat_map(|(ir, or, sr)| [
+            Binary { left: Operand(&window.input.times, Rows::Range(ir.clone())),
+                right: Operand::repeat_row(&window.seeds.times, sr.start, ir.len()) },
+            Binary { left: Operand(&window.output.times, Rows::Range(or.clone())),
+                right: Operand::repeat_row(&window.seeds.times, sr.start, or.len()) },
+        ]).collect();
+        self.mask.resize(requests.iter().map(Binary::len).sum(), false);
+        C::less_equal(&requests, &mut self.mask);
+        drop(requests);
+        let mut offset = 0;
+        self.simple.clear();
+        self.simple.extend(ranges.iter().map(|(ir, or, sr)| {
+            if sr.len() != 1 { return false; }
+            let start = offset; offset += ir.len() + or.len();
+            self.mask[start..offset].iter().all(|&x| x)
+        }));
+        self.left.clear();
+        self.left.extend(ranges.iter().zip(&self.simple).filter(|(_, s)| **s).map(|(r, _)| r.2.start));
+        self.heads.clear();
+        self.heads.copy(Operand(&window.seeds.times, Rows::Indices(&self.left)));
+        beyond(&self.heads, upper, &mut self.carried, &mut self.mask);
+        self.ready.clear(); self.right.clear(); self.winners.clear();
+        let mut seed = 0;
+        for (i, ((ir, or, _), simple)) in ranges.iter().zip(&self.simple).enumerate() {
+            if *simple {
+                if self.carried[seed] {
+                    self.right.push(seed);
+                    self.deferred.keys.push(keys[i]);
+                } else {
+                    self.ready.push(seed);
+                    self.keys.push(keys[i]); self.active.push(None);
+                    accumulate(&window.input, ir.clone(), &mut self.input);
+                    accumulate(&window.output, or.clone(), &mut self.output);
+                    self.input_ends.push(self.input.len()); self.output_ends.push(self.output.len());
+                }
+                seed += 1;
+            } else { self.winners.push(i); }
+        }
+        self.times.copy(Operand(&self.heads, Rows::Indices(&self.ready)));
+        self.deferred.times.copy(Operand(&self.heads, Rows::Indices(&self.right)));
+        self.floors.clear();
+        self.ranges.clear();
+        self.ranges.extend(self.winners.iter().map(|&i| ranges[i].2.clone()));
+        window.seeds.times.meet_reduce(&self.ranges, &mut self.floors);
+        self.used = self.winners.len();
+        self.slots.resize_with(self.slots.len().max(self.used), KeySweep::default);
+        for (slot, &i) in self.winners.iter().enumerate() {
+            self.slots[slot].key = keys[i]; self.slots[slot].floor_row = slot;
+            self.slots[slot].load(window, &ranges[i], (&self.floors, slot));
+            self.live.push(slot);
+        }
+    }
+    fn settle(&mut self) {
+        self.live.retain(|&i| self.slots[i].has_remaining());
+        self.minima.clear();
+        self.ranges.clear();
+        for (row, &i) in self.live.iter().enumerate() {
+            let s = &mut self.slots[i];
+            let start = self.minima.len();
+            s.input.meet_into(&mut self.minima); s.output.meet_into(&mut self.minima);
+            s.seeds.meet_into(&mut self.minima);
+            for run in s.schedule.bins.iter().flatten() { run.meet_into(&mut self.minima); }
+            self.ranges.push(start..self.minima.len()); s.floor_row = row;
+        }
+        self.floors.clear();
+        self.minima.meet_reduce(&self.ranges, &mut self.floors);
+        for &i in &self.live {
+            let s = &mut self.slots[i];
+            s.reached.apply(Operation::Join, &[(0..s.reached.len(), Operand::repeat_row(&self.floors, s.floor_row, s.reached.len()))]);
+            unique(&mut s.reached, &mut s.time_scratch);
+        }
+    }
+    /// Produce a wave of ready evaluations. False means this group is drained.
+    pub fn next(&mut self, upper: &C) -> bool {
+        assert!(!self.evaluating, "commit corrections before resuming a wave");
+        if std::mem::take(&mut self.initial) && !self.keys.is_empty() {
+            self.evaluating = true; return true;
+        }
+        self.clear_wave();
+        while !self.live.is_empty() {
+            // Collect once in key/range order. Each comparison then resolves one
+            // pair of lanes, with indices selecting all keys' candidates together.
+            self.candidates.clear(); self.ranges.clear();
+            let mut sources = Vec::new();
+            for &i in &self.live {
+                let start = sources.len();
+                sources.extend(self.slots[i].heads().map(|(t, r)| Operand::repeat_row(t, r, 1)));
+                self.ranges.push(start..sources.len());
             }
-            if interested {
-                self.at = Some(at.clone());
-                return Some(at);
+            self.candidates.copy_many(&sources);
+            drop(sources);
+            self.winners.clear(); self.challengers.clear();
+            self.winners.extend(self.ranges.iter().map(|r| r.start));
+            self.challengers.extend(self.ranges.iter().enumerate().filter(|(_, r)| r.len() > 1)
+                .map(|(key, r)| (key, r.start + 1)));
+            while !self.challengers.is_empty() {
+                self.left.clear(); self.right.clear();
+                self.left.extend(self.challengers.iter().map(|&(key, _)| self.winners[key]));
+                self.right.extend(self.challengers.iter().map(|&(_, candidate)| candidate));
+                self.comparisons.resize(self.challengers.len(), Ordering::Equal);
+                C::compare(&[Binary {
+                    left: Operand(&self.candidates, Rows::Indices(&self.left)),
+                    right: Operand(&self.candidates, Rows::Indices(&self.right)),
+                }], &mut self.comparisons);
+                for (&(key, candidate), c) in self.challengers.iter().zip(&self.comparisons) {
+                    if c.is_gt() { self.winners[key] = candidate; }
+                }
+                self.challengers.retain_mut(|(key, candidate)| { *candidate += 1; *candidate < self.ranges[*key].end });
+            }
+            self.heads.clear();
+            self.heads.copy(Operand(&self.candidates, Rows::Indices(&self.winners)));
+            self.right.clear();
+            for (r, &winner) in self.ranges.iter().zip(&self.winners) {
+                self.right.resize(self.right.len() + r.len(), winner);
+            }
+            self.comparisons.resize(self.candidates.len(), Ordering::Equal);
+            C::compare(&[Binary {
+                left: Operand(&self.candidates, Rows::Range(0..self.candidates.len())),
+                right: Operand(&self.candidates, Rows::Indices(&self.right)),
+            }], &mut self.comparisons);
+            beyond(&self.heads, upper, &mut self.carried, &mut self.mask);
+            self.ready.clear();
+            for (row, (&i, r)) in self.live.iter().zip(&self.ranges).enumerate() {
+                let s = &mut self.slots[i];
+                let fresh = s.consume(&self.comparisons[r.clone()]);
+                if s.evaluate((&self.heads, row), (&self.floors, s.floor_row), self.carried[row], fresh, upper, &mut self.input, &mut self.output) {
+                    self.ready.push(row); self.keys.push(s.key); self.active.push(Some(i));
+                    self.input_ends.push(self.input.len()); self.output_ends.push(self.output.len());
+                }
+            }
+            if !self.ready.is_empty() {
+                self.times.copy(Operand(&self.heads, Rows::Indices(&self.ready)));
+                self.evaluating = true; return true;
             }
             self.settle();
         }
-        None
-    }
-    /// Incorporate a callback's corrections before selecting the next time.
-    pub fn commit(&mut self, corrections: &[(u64, ROut)]) {
-        let at = self.at.take().expect("commit needs a suspended sweep");
-        if self.simple {
-            return;
+        if !self.finished {
+            self.deferred.times.copy_many(&self.slots[..self.used].iter().map(|s| Operand(&s.pending, Rows::Range(0..s.pending.len()))).collect::<Vec<_>>());
+            for s in &self.slots[..self.used] { self.deferred.keys.resize(self.deferred.keys.len() + s.pending.len(), s.key); }
+            self.finished = true;
         }
-        if self.head().is_some() {
-            self.produced.corrections(&at, corrections);
+        false
+    }
+    /// Emit the callback's corrections in bulk, then advance the surviving keys' floors.
+    pub fn commit(&mut self, corrections: &[(u64, ROut)], ends: &[usize], into: &mut Updates<C, ROut>) {
+        assert!(self.evaluating && ends.len() == self.keys.len(), "commit needs one bracket per active key");
+        let mut start = 0;
+        let requests: Vec<_> = ends.iter().enumerate().map(|(row, &end)| {
+            let n = end - start; start = end; Operand::repeat_row(&self.times, row, n)
+        }).collect();
+        assert_eq!(start, corrections.len());
+        into.times.copy_many(&requests);
+        start = 0;
+        for (row, &end) in ends.iter().enumerate() {
+            let rows = &corrections[start..end]; start = end;
+            into.keys.resize(into.keys.len() + rows.len(), self.keys[row]);
+            if let Some(i) = self.active[row] {
+                if self.slots[i].has_remaining() { self.slots[i].produced.corrections((&self.times, row), rows); }
+            }
         }
-        self.settle();
+        into.ids.extend(corrections.iter().map(|r| r.0)); into.diffs.extend(corrections.iter().map(|r| r.1.clone()));
+        if self.active.iter().any(Option::is_some) { self.settle(); }
+        self.evaluating = false;
+        self.clear_wave();
     }
-    /// Deferred timestamps, kept in their original representation.
-    pub fn pending(&self) -> &C {
-        &self.pending
-    }
+    /// Deferred key/time associations, available after `next` reports exhaustion.
+    pub fn pending(&self) -> &Keyed<C> { &self.deferred }
 }
 
 fn accumulate<C: TimeContainer, R: Semigroup>(
@@ -449,7 +544,6 @@ fn accumulate<C: TimeContainer, R: Semigroup>(
     range: Range<usize>,
     into: &mut Vec<(u64, R)>,
 ) {
-    into.clear();
     let mut pos = range.start;
     while pos < range.end {
         let id = data.ids[pos];
@@ -467,7 +561,7 @@ fn accumulate<C: TimeContainer, R: Semigroup>(
 
 fn append_forward<C: TimeContainer>(
     times: &C,
-    at: &C::Time,
+    at: (&C, usize),
     mask: &[bool],
     rows: &mut Vec<usize>,
     into: &mut C,
@@ -477,15 +571,15 @@ fn append_forward<C: TimeContainer>(
     into.map(
         Operation::Join,
         &[Binary {
-            left: Operand::Rows(times, Rows::Indices(rows)),
-            right: Operand::Repeat(at, rows.len()),
+            left: Operand(times, Rows::Indices(rows)),
+            right: Operand::repeat_row(at.0, at.1, rows.len()),
         }],
     );
 }
 fn read_and_forward<C: TimeContainer, R: Semigroup>(
     buffer: &mut Buffer<C, R>,
-    at: &C::Time,
-    floor: Option<&C::Time>,
+    at: (&C, usize),
+    floor: Option<(&C, usize)>,
     into: &mut Vec<(u64, R)>,
     candidates: &mut C,
     mask: &mut Vec<bool>,
@@ -519,7 +613,7 @@ fn read_and_forward<C: TimeContainer, R: Semigroup>(
 pub struct ProxyReduceTactic<C: TimeContainer, RIn: Semigroup, ROut: Semigroup, Bk> {
     backend: Bk,
     pending: Pending<C>,
-    slots: Vec<Sweep<C, RIn, ROut>>,
+    sweep: Sweep<C, RIn, ROut>,
     key_batch_size: usize,
 }
 impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup, Bk>
@@ -530,7 +624,7 @@ impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup, Bk>
         Self {
             backend,
             pending: Pending::default(),
-            slots: vec![],
+            sweep: Sweep::default(),
             key_batch_size: usize::MAX,
         }
     }
@@ -542,7 +636,7 @@ impl<C: TimeContainer, RIn: Semigroup, ROut: Semigroup, Bk>
     }
 }
 impl<
-        C: TimeContainer,
+        C: TimeContainer + FromIterator<C::Time> + IntoIterator<Item = C::Time>,
         RIn: Semigroup,
         ROut: Semigroup,
         B1,
@@ -563,11 +657,12 @@ impl<
         if held.elements().iter().all(|t| upper.less_equal(t)) {
             return (None, held.clone());
         }
-        let due = self.pending.activate(upper);
+        let upper_times: C = upper.elements().iter().cloned().collect();
+        let due = self.pending.activate(&upper_times);
         let mut changed = due.keys.clone();
         changed.dedup();
         if changed.is_empty() && input_batches.is_empty() {
-            return (None, self.pending.frontier());
+            return (None, self.pending.frontier().into_iter().collect());
         }
         let instance = ReduceInstance {
             source_batches: &source_batches,
@@ -583,14 +678,8 @@ impl<
         self.backend.begin(description.clone());
         let mut from = Some(0);
         let mut window = ReduceWindow::default();
-        let mut in_all = Vec::new();
-        let mut out_all = Vec::new();
-        let mut in_ends = Vec::new();
-        let mut out_ends = Vec::new();
-        let mut batch_keys = Vec::new();
-        let mut active = Vec::new();
         let mut deltas: Updates<C, ROut> = Updates::default();
-        let mut deferred: Updates<C, i64> = Updates::default();
+        let mut deferred = Keyed::default();
         while from.is_some() {
             window.input.clear();
             window.output.clear();
@@ -608,74 +697,21 @@ impl<
             deltas.clear();
             deferred.clear();
             for group in keys.chunks(self.key_batch_size) {
-                while self.slots.len() < group.len() {
-                    self.slots.push(Sweep::default());
-                }
-                for (i, &key) in group.iter().enumerate() {
-                    self.slots[i].load(
-                        &window.input,
-                        key_range(&window.input.keys, key),
-                        &window.output,
-                        key_range(&window.output.keys, key),
-                        &window.seeds.times,
-                        key_range(&window.seeds.keys, key),
-                    );
-                }
-                let mut live: Vec<_> = (0..group.len()).collect();
-                while !live.is_empty() {
-                    in_all.clear();
-                    out_all.clear();
-                    in_ends.clear();
-                    out_ends.clear();
-                    batch_keys.clear();
-                    active.clear();
-                    for &i in &live {
-                        if let Some(at) = self.slots[i].next(upper, &mut in_all, &mut out_all) {
-                            batch_keys.push(group[i]);
-                            in_ends.push(in_all.len());
-                            out_ends.push(out_all.len());
-                            active.push((i, at));
-                        }
-                    }
-                    live.clear();
-                    if active.is_empty() {
-                        break;
-                    }
+                self.sweep.load(&window, group, &upper_times);
+                while self.sweep.next(&upper_times) {
                     let (corrections, ends) = self.backend.reduce_corrections(
-                        &batch_keys,
-                        &in_ends,
-                        &in_all,
-                        &out_ends,
-                        &out_all,
+                        &self.sweep.keys, &self.sweep.input_ends, &self.sweep.input,
+                        &self.sweep.output_ends, &self.sweep.output,
                     );
-                    assert_eq!(ends.len(), active.len());
-                    let mut start = 0;
-                    for ((i, at), end) in active.drain(..).zip(ends) {
-                        let rows = &corrections[start..end];
-                        start = end;
-                        deltas.times.copy(Operand::Repeat(&at, rows.len()));
-                        deltas.keys.resize(deltas.keys.len() + rows.len(), group[i]);
-                        deltas.ids.extend(rows.iter().map(|r| r.0));
-                        deltas.diffs.extend(rows.iter().map(|r| r.1.clone()));
-                        self.slots[i].commit(rows);
-                        live.push(i);
-                    }
-                    assert_eq!(start, corrections.len());
+                    self.sweep.commit(&corrections, &ends, &mut deltas);
                 }
-                for (i, &key) in group.iter().enumerate() {
-                    let times = self.slots[i].pending();
-                    let n = times.len();
-                    deferred.times.copy(Operand::Rows(times, Rows::Range(0..n)));
-                    deferred.keys.resize(deferred.keys.len() + n, key);
-                    deferred.ids.resize(deferred.ids.len() + n, 0);
-                    deferred.diffs.resize(deferred.diffs.len() + n, 1);
-                }
+                deferred.append_range(self.sweep.pending(), 0..self.sweep.pending().len());
             }
             self.backend.emit(&deltas);
             self.pending.insert(std::mem::take(&mut deferred));
         }
         let result = Some(Span::new(description, self.backend.finish()));
-        (result, self.pending.frontier())
+        (result, self.pending.frontier().into_iter().collect())
     }
 }
 fn key_range(keys: &[u64], key: u64) -> Range<usize> {

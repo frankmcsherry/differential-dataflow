@@ -184,6 +184,7 @@ impl<T: ColTime> ColTimes<T> {
         }
     }
     pub fn clear(&mut self) {
+        if self.rows == 0 { return; }
         for l in &mut self.lanes {
             // Clearing shared storage should not first copy its old contents.
             if let Some(lane) = Arc::get_mut(l) {
