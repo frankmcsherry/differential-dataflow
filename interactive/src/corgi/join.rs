@@ -1,10 +1,12 @@
-//! The corgi JOIN backend for the `int_proxy` proxy-join seam.
+//! Corgi's product-time join tactic and its value presentation.
 //!
-//! [`CorgiJoinBackend`] implements [`ProxyJoinBackend`]: `advance` draws blocks of the two
-//! inputs' key intersection as `((group, coord), time, diff)` bridges, and `cross` redeems
-//! matched coordinates directly against the instance's chunks (`gather_lanes`), runs the
-//! compiled projection, and cuts `TARGET_OUT`-sized [`CorgiContainer`]s. Peak state is one
-//! block's bridges plus one container, however large the unit.
+//! [`differential_dataflow::operators::int_proxy::ProxyJoinTactic`] selects common keys into primitive columns, replays long histories
+//! through DD's time-container harness, and emits bounded columnar containers. Small histories use
+//! a direct product without replay allocation. [`CorgiJoinBackend`] preserves the existing
+//! canonical value coordinates and real-key collision checks while redeeming matches.
+//!
+//! A presentation contains complete keys; a single key's histories can be large. Output
+//! is bounded independently and the iterator can suspend inside one cross product.
 //!
 //! # Tokens
 //!
@@ -31,8 +33,8 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use differential_dataflow::operators::int_proxy::{JoinInstance, ProxyBridge, ProxyJoinBackend};
-use differential_dataflow::operators::int_proxy::join::JoinMatches;
+use differential_dataflow::operators::int_proxy::JoinInstance;
+use differential_dataflow::operators::int_proxy::ProxyJoinBackend;
 use differential_dataflow::trace::chunk::{Chunk, ChunkBatch};
 
 use corgi::arrange::{compare_at, gather, gather_lanes};
@@ -41,6 +43,8 @@ use corgi::{shape_of_value, Shape, Value as CValue};
 
 use crate::corgi::chunk::{key_is_hashed, key_lane, recover_key, CorgiChunk};
 use crate::corgi::col_times::ColTime;
+type Updates<T> = differential_dataflow::operators::int_proxy::updates::Updates<super::col_times::ColTimes<T>, Diff>;
+type Matches<T> = differential_dataflow::operators::int_proxy::join::JoinMatches<super::col_times::ColTimes<T>, Diff>;
 use crate::corgi::container::CorgiContainer;
 use crate::corgi::logic::compile_join_projection;
 use crate::ir::Diff;
@@ -53,8 +57,9 @@ const TARGET_OUT: usize = 1 << 18;
 /// Coordinate packing: chunk index in the high bits, row in the low `COORD_BITS`.
 const COORD_BITS: u32 = 48;
 
-/// The corgi [`ProxyJoinBackend`]: holds the projection `Term`s (`Var(0)=key`, `Var(1)=val0`,
+/// Value presentation and redemption: holds the projection `Term`s (`Var(0)=key`, `Var(1)=val0`,
 /// `Var(2)=val1`), compiled per container against the matched columns' shapes.
+#[derive(Clone)]
 pub struct CorgiJoinBackend<T: ColTime> {
     key: Term,
     val: Term,
@@ -71,18 +76,13 @@ impl<T: ColTime> CorgiJoinBackend<T> {
     }
 }
 
-impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<T> {
-    type R0 = Diff;
-    type R1 = Diff;
-    type ROut = Diff;
-    type Output = CorgiContainer<T, Diff>;
-
-    fn advance(
+impl<T: ColTime> CorgiJoinBackend<T> {
+    fn advance_columns(
         &mut self,
         instance: &JoinInstance<T, CBatch<T>, CBatch<T>>,
         from: &mut Option<u64>,
-        bridge0: &mut ProxyBridge<T, Diff>,
-        bridge1: &mut ProxyBridge<T, Diff>,
+        bridge0: &mut Updates<T>,
+        bridge1: &mut Updates<T>,
     ) {
         self.colliding.clear();
         let chunks0 = side_chunks(&instance.batches0);
@@ -116,10 +116,10 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
         );
     }
 
-    fn cross(
+    fn cross_columns(
         &mut self,
         instance: &JoinInstance<T, CBatch<T>, CBatch<T>>,
-        matches: &mut JoinMatches<T, Diff>,
+        matches: &mut Matches<T>,
         output: &mut Vec<CorgiContainer<T, Diff>>,
     ) {
         let chunks0 = side_chunks(&instance.batches0);
@@ -185,8 +185,8 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
                 keys: nk,
                 vals: nv,
                 times: kept.as_ref().map_or_else(
-                    || matches.times[start..end].to_vec(),
-                    |kept| kept.iter().map(|&index| matches.times[index].clone()).collect(),
+                    || matches.times.gather(&(start..end).collect::<Vec<_>>()),
+                    |kept| matches.times.gather(kept),
                 ),
                 diffs: kept.as_ref().map_or_else(
                     || matches.diffs[start..end].to_vec(),
@@ -282,90 +282,66 @@ impl<'a, T: ColTime> RunRef<'a, T> {
 
 /// Per-key staging for one side: consolidated `(coord, time, diff)` entries, built in scratch
 /// so a side that nets to zero suppresses the key before anything reaches the bridges.
-struct SideScratch<T> {
-    entries: Vec<(u64, T, Diff)>,
-    /// `(time, diff)` scratch for one value's cross-chunk merge.
-    tds: Vec<(T, Diff)>,
+struct SideScratch<T: ColTime> {
+    entries: Updates<T>,
 }
-
 impl<T: ColTime> SideScratch<T> {
-    fn new() -> Self {
-        SideScratch { entries: Vec::new(), tds: Vec::new() }
+    fn new() -> Self { Self { entries: Updates::default() } }
+    fn append(&mut self, run: &RunRef<'_, T>, start: usize, end: usize, coord: u64) {
+        self.entries.keys.resize(self.entries.len() + end - start, 0);
+        self.entries.ids.resize(self.entries.len() + end - start, coord);
+        self.entries.times.push_range(run.chunk.times(), start, end);
+        self.entries.diffs.extend_from_slice(&run.chunk.diffs()[start..end]);
     }
-
-    fn push(&mut self, coord: u64, time: T, diff: Diff) {
-        match self.entries.last_mut() {
-            Some((lc, lt, ld)) if *lc == coord && *lt == time => *ld += diff,
-            _ => self.entries.push((coord, time, diff)),
-        }
-    }
-
-    /// Stage one key's records from `runs` (its equal-key row ranges, one per chunk holding it):
-    /// values merged across chunks by content, equal values sharing the canonical coordinate of
-    /// their least occurrence, times advanced by `lower`, consolidated, zeros dropped. Entries
-    /// end sorted by `(coord, time)`.
     fn stage_runs(&mut self, runs: &[RunRef<'_, T>], lower: &T) {
         self.entries.clear();
         if let [run] = runs {
-            // Single-chunk run: values grouped, times ascending within a value; advanced times
-            // stay ascending (join is monotone), so consolidation is adjacent. Coordinates of
-            // successive value runs ascend, so entries are born sorted.
-            let coord_hi = (run.cid as u64) << COORD_BITS;
-            let mut v_start = run.s;
-            for row in run.s..run.e {
-                if row > v_start && !run.val_eq(row, run, v_start) {
-                    v_start = row;
-                }
-                self.push(coord_hi | v_start as u64, run.chunk.times().get(row).join(lower), run.chunk.diffs()[row]);
+            let mut start = run.s;
+            while start < run.e {
+                let end = run.val_run_end(start);
+                self.append(run, start, end, ((run.cid as u64) << COORD_BITS) | start as u64);
+                start = end;
             }
-        } else {
-            // Cross-chunk merge by value content: heads are (run index, row); each step takes
-            // the least value among heads, drains every chunk's sub-run of it into `tds`,
-            // and consolidates. The canonical coordinate is the least contributing (chunk, row).
-            let mut heads: Vec<(usize, usize)> = runs.iter().enumerate().map(|(i, r)| (i, r.s)).collect();
-            while !heads.is_empty() {
-                let mut min = 0usize;
-                for h in 1..heads.len() {
-                    if runs[heads[h].0].val_less(heads[h].1, &runs[heads[min].0], heads[min].1) {
-                        min = h;
-                    }
-                }
-                let (ri_min, row_min) = heads[min];
-                self.tds.clear();
-                let mut coord = u64::MAX;
-                let mut h = 0usize;
-                while h < heads.len() {
-                    let (ri, row) = heads[h];
-                    let run = &runs[ri];
-                    if run.val_eq(row, &runs[ri_min], row_min) {
-                        let r_end = run.val_run_end(row);
-                        for r in row..r_end {
-                            self.tds.push((run.chunk.times().get(r).join(lower), run.chunk.diffs()[r]));
-                        }
-                        coord = coord.min(((run.cid as u64) << COORD_BITS) | row as u64);
-                        if r_end < run.e { heads[h] = (ri, r_end); h += 1; } else { heads.swap_remove(h); }
-                    } else {
-                        h += 1;
-                    }
-                }
-                self.tds.sort_by(|a, b| a.0.cmp(&b.0));
-                let tds = std::mem::take(&mut self.tds);
-                for (time, diff) in tds.iter() {
-                    self.push(coord, time.clone(), *diff);
-                }
-                self.tds = tds;
-                self.tds.clear();
-            }
-            // Canonical coordinates interleave chunks; restore bridge order.
-            self.entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            self.entries.times.join_assign(lower);
+            self.entries.consolidate();
+            return;
         }
-        self.entries.retain(|(_, _, d)| *d != 0);
+        // Merge equal values across chunks, assigning one canonical coordinate to every
+        // occurrence. Only selected time ranges are copied, one primitive lane at a time.
+        let mut heads: Vec<_> = runs.iter().enumerate().map(|(i, r)| (i, r.s)).collect();
+        while !heads.is_empty() {
+            let mut min = 0;
+            for h in 1..heads.len() {
+                if runs[heads[h].0].val_less(heads[h].1, &runs[heads[min].0], heads[min].1) { min = h; }
+            }
+            let (reference, row) = heads[min];
+            let start = self.entries.len();
+            let mut coord = u64::MAX;
+            let mut h = 0;
+            while h < heads.len() {
+                let (ri, r) = heads[h];
+                let run = &runs[ri];
+                if run.val_eq(r, &runs[reference], row) {
+                    let end = run.val_run_end(r);
+                    coord = coord.min(((run.cid as u64) << COORD_BITS) | r as u64);
+                    self.append(run, r, end, 0);
+                    if end < run.e { heads[h] = (ri, end); h += 1; } else { heads.swap_remove(h); }
+                } else { h += 1; }
+            }
+            self.entries.ids[start..].fill(coord);
+        }
+        self.entries.times.join_assign(lower);
+        // Advancing a product can reverse lexicographic order, even for a single chunk.
+        self.entries.consolidate();
     }
-
-    /// Move the staged entries into `bridge` under group token `k`.
-    fn emit(&mut self, k: u64, bridge: &mut ProxyBridge<T, Diff>) -> usize {
+    fn emit(&mut self, key: u64, bridge: &mut Updates<T>) -> usize {
         let n = self.entries.len();
-        bridge.extend(self.entries.drain(..).map(|(coord, t, d)| ((k, coord), t, d)));
+        self.entries.keys.fill(key);
+        bridge.keys.extend_from_slice(&self.entries.keys);
+        bridge.ids.extend_from_slice(&self.entries.ids);
+        bridge.times.push_range(&self.entries.times, 0, n);
+        bridge.diffs.extend_from_slice(&self.entries.diffs);
+        self.entries.clear();
         n
     }
 }
@@ -531,11 +507,11 @@ fn stage_collision<T: ColTime>(
     runs: &[RunRef<'_, T>],
     lower: &T,
     token: u64,
-    bridge: &mut ProxyBridge<T, Diff>,
+    bridge: &mut Updates<T>,
 ) {
     let mut positions: Vec<usize> = runs.iter().map(|run| run.s).collect();
     let mut scratch = SideScratch::new();
-    let mut staged = Vec::new();
+    let mut staged = Updates::default();
     loop {
         let Some(min) = positions
             .iter()
@@ -570,9 +546,9 @@ fn stage_collision<T: ColTime>(
             positions[index] = end;
         }
         scratch.stage_runs(&equal_runs, lower);
-        staged.extend(scratch.entries.drain(..).map(|(coord, time, diff)| ((token, coord), time, diff)));
+        scratch.emit(token, &mut staged);
     }
-    staged.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    staged.consolidate();
     bridge.extend(staged);
 }
 
@@ -590,8 +566,8 @@ fn advance_leaf<T: ColTime>(
     chunks1: &[&CorgiChunk<T, Diff>],
     lower: &T,
     from: &mut Option<u64>,
-    bridge0: &mut ProxyBridge<T, Diff>,
-    bridge1: &mut ProxyBridge<T, Diff>,
+    bridge0: &mut Updates<T>,
+    bridge1: &mut Updates<T>,
     colliding: &mut Vec<u64>,
 ) {
     let start = from.expect("advance called on an exhausted unit");
@@ -641,8 +617,8 @@ fn leaf_probe<'a, T: ColTime>(
     lower: &T,
     h: Option<u64>,
     from: &mut Option<u64>,
-    bridge_d: &mut ProxyBridge<T, Diff>,
-    bridge_p: &mut ProxyBridge<T, Diff>,
+    bridge_d: &mut Updates<T>,
+    bridge_p: &mut Updates<T>,
     hashed: bool,
     colliding: &mut Vec<u64>,
 ) {
@@ -696,7 +672,7 @@ fn leaf_probe<'a, T: ColTime>(
         }
         let (drefs, prefs) = refs.split_at(dref_count);
         if collision {
-            let (mut staged_d, mut staged_p) = (Vec::new(), Vec::new());
+            let (mut staged_d, mut staged_p) = (Updates::default(), Updates::default());
             stage_collision(drefs, lower, k, &mut staged_d);
             stage_collision(prefs, lower, k, &mut staged_p);
             if !staged_d.is_empty() && !staged_p.is_empty() {
@@ -726,8 +702,8 @@ fn leaf_merge<'a, T: ColTime>(
     lower: &T,
     h: Option<u64>,
     from: &mut Option<u64>,
-    bridge0: &mut ProxyBridge<T, Diff>,
-    bridge1: &mut ProxyBridge<T, Diff>,
+    bridge0: &mut Updates<T>,
+    bridge1: &mut Updates<T>,
     hashed: bool,
     colliding: &mut Vec<u64>,
 ) {
@@ -753,7 +729,7 @@ fn leaf_merge<'a, T: ColTime>(
             colliding.push(k);
         }
         if collision {
-            let (mut staged0, mut staged1) = (Vec::new(), Vec::new());
+            let (mut staged0, mut staged1) = (Updates::default(), Updates::default());
             stage_collision(&r0, lower, k, &mut staged0);
             stage_collision(&r1, lower, k, &mut staged1);
             if !staged0.is_empty() && !staged1.is_empty() {
@@ -769,6 +745,19 @@ fn leaf_merge<'a, T: ColTime>(
         }
         s0.emit(k, bridge0);
         s1.emit(k, bridge1);
+    }
+}
+
+impl<T: ColTime> ProxyJoinBackend<super::col_times::ColTimes<T>, CBatch<T>, CBatch<T>> for CorgiJoinBackend<T> {
+    type R0 = Diff;
+    type R1 = Diff;
+    type ROut = Diff;
+    type Output = CorgiContainer<T, Diff>;
+    fn advance(&mut self, instance: &JoinInstance<T, CBatch<T>, CBatch<T>>, from: &mut Option<u64>, a: &mut Updates<T>, b: &mut Updates<T>) {
+        self.advance_columns(instance, from, a, b);
+    }
+    fn cross(&mut self, instance: &JoinInstance<T, CBatch<T>, CBatch<T>>, matches: &mut Matches<T>, output: &mut Vec<CorgiContainer<T, Diff>>) {
+        self.cross_columns(instance, matches, output);
     }
 }
 
@@ -801,16 +790,16 @@ mod tests {
     fn cross_bridges(
         backend: &mut CorgiJoinBackend<u64>,
         instance: &JoinInstance<u64, CBatch<u64>, CBatch<u64>>,
-        left: &ProxyBridge<u64, Diff>,
-        right: &ProxyBridge<u64, Diff>,
+        left: &Updates<u64>,
+        right: &Updates<u64>,
     ) -> usize {
-        let mut matches = JoinMatches::default();
-        for a in left {
-            for b in right {
-                if a.0.0 == b.0.0 {
-                    matches.ids.push((a.0.0, (a.0.1, b.0.1)));
-                    matches.times.push(a.1.max(b.1));
-                    matches.diffs.push(a.2 * b.2);
+        let mut matches = Matches::default();
+        for a in 0..left.len() {
+            for b in 0..right.len() {
+                if left.keys[a] == right.keys[b] {
+                    matches.ids.push((left.keys[a], (left.ids[a], right.ids[b])));
+                    matches.times.push(&left.times.get(a).max(right.times.get(b)));
+                    matches.diffs.push(left.diffs[a] * right.diffs[b]);
                 }
             }
         }
@@ -831,7 +820,7 @@ mod tests {
         };
         let mut backend = backend();
         let mut from = Some(0);
-        let (mut left, mut right) = (Vec::new(), Vec::new());
+        let (mut left, mut right) = (Updates::default(), Updates::default());
 
         backend.advance(&instance, &mut from, &mut left, &mut right);
         assert!(from.is_some(), "the first block must leave work for the collision block");
@@ -857,7 +846,7 @@ mod tests {
         };
         let mut backend = backend();
         let mut from = Some(0);
-        let (mut left, mut right) = (Vec::new(), Vec::new());
+        let (mut left, mut right) = (Updates::default(), Updates::default());
 
         backend.advance(&instance, &mut from, &mut left, &mut right);
         assert_eq!(backend.colliding, vec![collision]);

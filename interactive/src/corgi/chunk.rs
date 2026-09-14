@@ -1,6 +1,6 @@
-//! `CorgiChunk`: a [`Chunk`](differential_dataflow::trace::chunk::Chunk) whose key/val payload is a
-//! pair of corgi columns, with per-tuple times held columnar in a [`ColTimes`] (SoA over
-//! `<T as Columnar>::Container`, killing the per-row `PointStamp` allocation); diffs stay a `Vec`.
+//! `CorgiChunk`: a [`Chunk`] whose key/val payload is a
+//! pair of corgi columns, with product times in shared primitive [`ColTimes`] lanes;
+//! differences stay a primitive vector.
 //! It is a **`Chunk` but NOT `NavigableChunk`**:
 //! it exposes no `Ord` key, no cursor, no sorted-trie layout — the merge/advance/settle transducers
 //! drive everything through corgi's own structural order (`compare_at`) and gather primitives
@@ -31,7 +31,7 @@ use differential_dataflow::trace::chunk::{pack, Chunk, ChunkBatch};
 use corgi::arrange::{compare_adjacent, gather, gather_lanes, group_bounds, sort_perm, survey_groups, GroupRun};
 use corgi::Value as CValue;
 
-use columnar::Columnar;
+
 
 use crate::corgi::col_times::{ColTime, ColTimes};
 
@@ -53,12 +53,9 @@ const INGEST: usize = 1 << 24;
 
 /// Shared, immutable chunk contents. `Clone` of a `CorgiChunk` is an `Rc` bump.
 ///
-/// Same payload as [`CorgiContainer`](crate::corgi::container::CorgiContainer), and the two
-/// should eventually be ONE type: today they differ only in time storage (`ColTimes` here —
-/// bulk-read, never mutated — vs `Vec<T>` there, because feedback/enter mutate times row-wise)
-/// and in invariants (sorted+consolidated+shared here, raw+owned there). A time container with
-/// bulk mutation verbs (apply one summary across a range) removes the last real difference.
-struct Inner<T: Columnar, R> {
+/// Keys, values, and times use the same column layout as edge containers. The chunk
+/// additionally promises sorted, consolidated, immutable contents.
+struct Inner<T: ColTime, R> {
     /// Key column (corgi), aligned with `vals`/`times`/`diffs`, sorted by `(key, val, time)`.
     keys: CValue,
     /// Val column (corgi).
@@ -70,13 +67,13 @@ struct Inner<T: Columnar, R> {
 }
 
 /// A sorted, consolidated run of `((key, val), time, diff)` with corgi-columnar key/val, shared via `Rc`.
-pub struct CorgiChunk<T: Columnar, R>(Rc<Inner<T, R>>);
+pub struct CorgiChunk<T: ColTime, R>(Rc<Inner<T, R>>);
 
-impl<T: Columnar, R> Clone for CorgiChunk<T, R> {
+impl<T: ColTime, R> Clone for CorgiChunk<T, R> {
     fn clone(&self) -> Self { CorgiChunk(Rc::clone(&self.0)) }
 }
 
-impl<T: Columnar, R> Default for CorgiChunk<T, R> {
+impl<T: ColTime, R> Default for CorgiChunk<T, R> {
     fn default() -> Self {
         CorgiChunk(Rc::new(Inner { keys: CValue::Unit(0), vals: CValue::Unit(0), times: ColTimes::new(), diffs: Vec::new() }))
     }
@@ -90,7 +87,7 @@ fn split_kv(kv: CValue) -> (CValue, CValue) {
     (keys, vals)
 }
 
-impl<T: Columnar + Clone, R: Clone> CorgiChunk<T, R> {
+impl<T: ColTime + Clone, R: Clone> CorgiChunk<T, R> {
     fn from_parts(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> Self {
         CorgiChunk(Rc::new(Inner { keys, vals, times, diffs }))
     }
@@ -268,19 +265,25 @@ where
         let kv = chunk.kv();
         let (times, diffs) = (chunk.times(), chunk.diffs());
         let (mut ki, mut si) = (Vec::new(), Vec::new());
-        for i in 0..chunk.len_() {
-            let ti = times.get(i);
-            if frontier.less_equal(&ti) { residual.insert_ref(&ti); ki.push(i); } else { si.push(i); }
+        for (i, carried) in times.beyond(frontier).into_iter().enumerate() {
+            if carried {
+                // Materialize only a prospective frontier member, never an owned time per row.
+                if !residual.elements().iter().any(|t| (0..times.width().max(t.width()))
+                    .all(|j| t.coordinate(j) <= times.coordinate(j, i))) {
+                    residual.insert(times.get(i));
+                }
+                ki.push(i);
+            } else { si.push(i); }
         }
+        if ki.is_empty() { ship.push_back(chunk); return; }
+        if si.is_empty() { keep.push_back(chunk); return; }
         if !ki.is_empty() {
-            let mut t = ColTimes::new();
-            for &i in &ki { t.push_ref(times, i); }
+            let t = times.gather(&ki);
             let d: Vec<R> = ki.iter().map(|&i| diffs[i].clone()).collect();
             keep.push_back(Self::from_kv(gather(&kv, &ki), t, d));
         }
         if !si.is_empty() {
-            let mut t = ColTimes::new();
-            for &i in &si { t.push_ref(times, i); }
+            let t = times.gather(&si);
             let d: Vec<R> = si.iter().map(|&i| diffs[i].clone()).collect();
             ship.push_back(Self::from_kv(gather(&kv, &si), t, d));
         }
@@ -295,7 +298,7 @@ where
         // Concatenate the pushed-back carry with the newly-arrived chunks, then advance/consolidate
         // each *complete* `(key, val)` group; withhold the last group as the carry unless `done`.
         if input.is_empty() { return; }
-        let (ckv, ctimes, cdiffs) = if input.len() == 1 {
+        let (ckv, mut ctimes, cdiffs) = if input.len() == 1 {
             // Merge output normally arrives uniquely owned. Move its columns
             // into advancement instead of copying the whole chunk first.
             let chunk = input.pop_front().unwrap();
@@ -328,30 +331,32 @@ where
         }
 
         // Advance + consolidate each complete group; emit `TARGET`-sized chunks. All rows of a group
-        // share `(key, val)`, so one representative offset materializes each output row's kv. Times are
-        // materialized here (owned `T`) because `advance_by` mutates and the tiebreak re-sort is a Rust
-        // sort — the compaction path, not the merge hot path.
+        // share `(key, val)`, so one representative offset supplies each output row's payload.
+        // Advance all primitive lanes once, then radix-sort selected time rows within each group.
         let srcs = [Some(&ckv)];
         let (mut tags, mut offs) = (Vec::new(), Vec::new());
         let (mut otimes, mut odiffs): (ColTimes<T>, Vec<R>) = (ColTimes::new(), Vec::new());
-        let mut pairs: Vec<(T, R)> = Vec::new();
+        ctimes.advance_by(frontier);
+        let mut order = Vec::new();
         let mut i = 0;
         for &g_end in &bounds {
             if g_end > end { break; }
-            pairs.extend((i..g_end)
-                .map(|k| { let mut t = ctimes.get(k); t.advance_by(frontier); (t, cdiffs[k].clone()) }));
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            // Reuse scratch across groups and move owned times out. Cloning
-            // each consolidated representative could allocate for nested times.
-            let mut drain = pairs.drain(..).peekable();
-            while let Some((t, mut d)) = drain.next() {
-                while drain.peek().is_some_and(|(next, _)| next == &t) {
-                    d.plus_equals(&drain.next().unwrap().1);
+            order.clear();
+            order.extend(i..g_end);
+            ctimes.sort_indices(&mut order);
+            let mut pos = 0;
+            while pos < order.len() {
+                let row = order[pos];
+                let mut d = cdiffs[row].clone();
+                pos += 1;
+                while pos < order.len() && ctimes.cmp(row, order[pos]) == Ordering::Equal {
+                    d.plus_equals(&cdiffs[order[pos]]);
+                    pos += 1;
                 }
                 if !d.is_zero() {
-                    tags.push(0); offs.push(i); otimes.push(&t); odiffs.push(d);
+                    tags.push(0); offs.push(i); otimes.push_ref(&ctimes, row); odiffs.push(d);
                     if otimes.len() >= TARGET {
-                        Self::emit(&srcs, &tags, &offs, std::mem::replace(&mut otimes, ColTimes::new()), std::mem::take(&mut odiffs), out);
+                        Self::emit(&srcs, &tags, &offs, std::mem::take(&mut otimes), std::mem::take(&mut odiffs), out);
                         tags.clear(); offs.clear();
                     }
                 }
@@ -404,12 +409,11 @@ where
 /// Sort parallel columns by `(key, val, time)` and consolidate exact `(key, val, time)` triples
 /// (summing diffs, dropping zeros). Returns a sorted+consolidated `(keys, vals, times, diffs)`.
 ///
-/// Multi-record: one columnar `sort_perm` (discrimination sort) orders by `(key, val)`, one batched
-/// `compare_adjacent` flags adjacent-equal runs; only the small per-run *time* tiebreak is a Rust sort
-/// (time is not a corgi type). No per-pair `compare_at`.
-fn sort_consolidate<T, R>(keys: CValue, vals: CValue, times: Vec<T>, diffs: Vec<R>) -> (CValue, CValue, Vec<T>, Vec<R>)
+/// Corgi orders key/value columns and identifies equal groups. Primitive radix sorting
+/// orders times within each group; timestamps and differences are gathered only at the end.
+fn sort_consolidate<T: ColTime, R>(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> (CValue, CValue, ColTimes<T>, Vec<R>)
 where
-    T: Ord + Clone + Columnar,
+    T: ColTime,
     R: Semigroup + Clone,
 {
     let n = times.len();
@@ -417,18 +421,16 @@ where
         return (keys, vals, times, diffs);
     }
     let kv = CValue::Prod(vec![keys, vals]);
-    // Batched argsort by (key, val); reorder the parallel Rust columns by the same permutation.
+    // Order the payload; retain time/diff source coordinates until final consolidation.
     let perm = sort_perm(&kv);
     let kv_s = gather(&kv, &perm);
-    let times_s: Vec<T> = perm.iter().map(|&i| times[i].clone()).collect();
-    let diffs_s: Vec<R> = perm.iter().map(|&i| diffs[i].clone()).collect();
     // Batched adjacent-equality over the kv-sorted column: `adj[m] == 0` iff `kv_s[m] == kv_s[m+1]`.
     // Naming the pattern rather than writing out the two index columns: corgi reads both sides
     // densely, and the `i`/`i+1` index vectors this used to build are not built at all.
     let adj: Vec<i8> = compare_adjacent(&kv_s);
 
     // Walk maximal equal-`(key,val)` runs; within each, order by time and consolidate equal times.
-    let (mut keep, mut ot, mut od) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut keep, mut time_rows, mut od) = (Vec::new(), Vec::new(), Vec::new());
     let mut run = Vec::new();
     let mut i = 0;
     while i < n {
@@ -437,28 +439,27 @@ where
             j += 1;
         }
         run.clear();
-        run.extend(i..j);
-        run.sort_by(|&a, &b| times_s[a].cmp(&times_s[b]));
+        run.extend_from_slice(&perm[i..j]);
+        times.sort_indices(&mut run);
         let mut k = 0;
         while k < run.len() {
             let rep = run[k];
-            let t = times_s[rep].clone();
-            let mut d = diffs_s[rep].clone();
+            let mut d = diffs[rep].clone();
             k += 1;
-            while k < run.len() && times_s[run[k]] == t {
-                d.plus_equals(&diffs_s[run[k]]);
+            while k < run.len() && times.cmp(run[k], rep) == Ordering::Equal {
+                d.plus_equals(&diffs[run[k]]);
                 k += 1;
             }
             if !d.is_zero() {
-                keep.push(rep);
-                ot.push(t);
+                keep.push(i);
+                time_rows.push(rep);
                 od.push(d);
             }
         }
         i = j;
     }
     let (keys, vals) = split_kv(gather(&kv_s, &keep));
-    (keys, vals, ot, od)
+    (keys, vals, times.gather(&time_rows), od)
 }
 
 impl<T, R> CorgiChunk<T, R>
@@ -468,13 +469,13 @@ where
 {
     /// One sorted+consolidated chunk from columns already in corgi form (the column-native arrange
     /// ingest — no transcode).
-    pub fn from_columns(keys: CValue, vals: CValue, times: Vec<T>, diffs: Vec<R>) -> Self {
-        let (keys, vals, times, diffs) = sort_consolidate(keys, vals, times, diffs);
+    pub fn from_columns(keys: CValue, vals: CValue, times: impl Into<ColTimes<T>>, diffs: Vec<R>) -> Self {
+        let (keys, vals, times, diffs) = sort_consolidate(keys, vals, times.into(), diffs);
         debug_assert!({
             let lane = corgi::arrange::leaf_slice(key_lane(&keys));
             lane.is_some_and(|ids| ids.windows(2).all(|pair| pair[0] <= pair[1]))
         }, "arrangement key must lead with a sorted u64 identifier lane");
-        Self::from_parts(keys, vals, ColTimes::from_iter(times), diffs)
+        Self::from_parts(keys, vals, times, diffs)
     }
 
 }
@@ -484,7 +485,7 @@ where
 /// Build a `ChunkBatch<CorgiChunk>` from corgi key/val COLUMNS directly (no transcode): sort +
 /// consolidate into one chunk, then `settle`. The column-native egress the reduce backend seals its
 /// output with (it resolves proxy ids to real columns by `gather` and hands them here).
-pub fn columns_to_batch<T, R>(keys: CValue, vals: CValue, times: Vec<T>, diffs: Vec<R>) -> ChunkBatch<CorgiChunk<T, R>>
+pub fn columns_to_batch<T, R>(keys: CValue, vals: CValue, times: impl Into<ColTimes<T>>, diffs: Vec<R>) -> ChunkBatch<CorgiChunk<T, R>>
 where
     T: ColTime,
     R: Semigroup + Clone + 'static,
@@ -514,19 +515,19 @@ where
 /// Crucially it **accumulates to `TARGET`** before consolidating (like `ContainerChunker`), so it
 /// emits few large chunks rather than one tiny chunk per input container — otherwise the columnar
 /// per-chunk set-up (`gather`/`sort_perm`) dominates when input arrives as many small batches.
-pub struct CorgiChunker<T: Columnar, R> {
+pub struct CorgiChunker<T: ColTime, R> {
     /// Un-consolidated key/val column blocks (one per absorbed container), flat time/diff.
     k_blocks: Vec<CValue>,
     v_blocks: Vec<CValue>,
-    times: Vec<T>,
+    times: ColTimes<T>,
     diffs: Vec<R>,
     ready: VecDeque<CorgiChunk<T, R>>,
     current: Option<CorgiChunk<T, R>>,
 }
 
-impl<T: Columnar, R> Default for CorgiChunker<T, R> {
+impl<T: ColTime, R> Default for CorgiChunker<T, R> {
     fn default() -> Self {
-        CorgiChunker { k_blocks: Vec::new(), v_blocks: Vec::new(), times: Vec::new(), diffs: Vec::new(), ready: VecDeque::new(), current: None }
+        CorgiChunker { k_blocks: Vec::new(), v_blocks: Vec::new(), times: ColTimes::new(), diffs: Vec::new(), ready: VecDeque::new(), current: None }
     }
 }
 
@@ -642,7 +643,8 @@ where
         }
         self.k_blocks.push(std::mem::replace(&mut c.keys, CValue::Unit(0)));
         self.v_blocks.push(std::mem::replace(&mut c.vals, CValue::Unit(0)));
-        self.times.append(&mut c.times);
+        if self.times.is_empty() { self.times = std::mem::take(&mut c.times); }
+        else { self.times.push_range(&c.times, 0, c.times.len()); c.times.clear(); }
         self.diffs.append(&mut c.diffs);
         if self.times.len() >= INGEST {
             self.flush();
@@ -726,7 +728,7 @@ mod test {
                     let chunks: Vec<_> = rows.chunks(size).map(|rows| CorgiChunk::from_columns(
                         CValue::u64(rows.iter().map(|r| r.0.0).collect()),
                         CValue::u64(rows.iter().map(|r| r.0.1).collect()),
-                        rows.iter().map(|r| r.1.clone()).collect(), rows.iter().map(|r| r.2).collect(),
+                        rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(), rows.iter().map(|r| r.2).collect(),
                     )).collect();
                     let retained = if shared { chunks.clone() } else { Vec::new() };
                     let (mut input, mut output) = (VecDeque::new(), VecDeque::new());

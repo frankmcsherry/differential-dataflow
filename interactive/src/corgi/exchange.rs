@@ -7,7 +7,7 @@
 //!
 //! # Partitioning a column, not a stream of rows
 //!
-//! Timely's stock distributor ([`DrainContainerDistributor`]) drains a container item by item and
+//! Timely's stock distributor (`DrainContainerDistributor`) drains a container item by item and
 //! pushes each into a per-destination builder. A corgi container has no items to drain: it is four
 //! columns, and taking it apart row-wise would undo the representation before the data even left
 //! the worker.
@@ -44,6 +44,7 @@ use timely::worker::Worker;
 use corgi::arrange::gather;
 
 use crate::corgi::container::CorgiContainer;
+use crate::corgi::col_times::ColTime;
 
 /// Partitions a [`CorgiContainer`] across workers by the structural hash of each row's key.
 ///
@@ -67,7 +68,7 @@ impl<T, R> Default for CorgiDistributor<T, R> {
     }
 }
 
-impl<T: Clone + 'static, R: Clone + 'static> CorgiDistributor<T, R> {
+impl<T: ColTime, R: Clone + 'static> CorgiDistributor<T, R> {
     /// Group row indices by destination, leaving each destination's rows as a contiguous,
     /// input-ordered run of `self.order` delimited by `self.starts`.
     ///
@@ -98,7 +99,7 @@ impl<T: Clone + 'static, R: Clone + 'static> CorgiDistributor<T, R> {
     }
 }
 
-impl<T: Clone + 'static, R: Clone + 'static> Distributor<CorgiContainer<T, R>> for CorgiDistributor<T, R> {
+impl<T: ColTime, R: Clone + 'static> Distributor<CorgiContainer<T, R>> for CorgiDistributor<T, R> {
     fn partition<Ts: Clone, P: Push<Message<Ts, CorgiContainer<T, R>>>>(
         &mut self,
         container: &mut CorgiContainer<T, R>,
@@ -130,7 +131,7 @@ impl<T: Clone + 'static, R: Clone + 'static> Distributor<CorgiContainer<T, R>> f
             let mut part = CorgiContainer {
                 keys: gather(&container.keys, idx),
                 vals: gather(&container.vals, idx),
-                times: idx.iter().map(|&i| container.times[i].clone()).collect(),
+                times: container.times.gather(idx),
                 diffs: idx.iter().map(|&i| container.diffs[i].clone()).collect(),
             };
             Message::push_at(&mut part, stamp.clone(), pusher);
@@ -164,7 +165,7 @@ pub struct CorgiPact;
 impl<Time, T, R> ParallelizationContract<Time, CorgiContainer<T, R>> for CorgiPact
 where
     Time: Timestamp,
-    T: Clone + Send + 'static,
+    T: ColTime + Send,
     R: Clone + Send + 'static,
     CorgiContainer<T, R>: timely::dataflow::channels::ContainerBytes,
 {
@@ -192,13 +193,14 @@ mod test {
 
     use super::CorgiDistributor;
     use crate::corgi::container::CorgiContainer;
+    use crate::corgi::col_times::ColTime;
     use crate::ir::{Diff, Time, Value as DValue};
 
     /// A pusher that keeps what it is given, so a test can inspect the partition directly.
     #[derive(Default)]
-    struct Collect<T, R>(Vec<CorgiContainer<T, R>>);
+    struct Collect<T: ColTime, R>(Vec<CorgiContainer<T, R>>);
 
-    impl<Ts, T: 'static, R: 'static> timely::communication::Push<timely::dataflow::channels::Message<Ts, CorgiContainer<T, R>>> for Collect<T, R> {
+    impl<Ts, T: ColTime, R: 'static> timely::communication::Push<timely::dataflow::channels::Message<Ts, CorgiContainer<T, R>>> for Collect<T, R> {
         fn push(&mut self, message: &mut Option<timely::dataflow::channels::Message<Ts, CorgiContainer<T, R>>>) {
             if let Some(message) = message.take() {
                 self.0.push(message.data);

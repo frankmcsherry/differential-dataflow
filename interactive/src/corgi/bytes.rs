@@ -10,26 +10,11 @@
 //! * `keys` / `vals` go through [`corgi::bytes`], which writes each leaf column as one contiguous
 //!   run of its stored bytes. A batch of a million `(u64, u64)` keys is two headers and two 8 MB
 //!   writes — no per-row framing, no per-row dispatch.
-//! * `times` / `diffs` go through `columnar`'s [`Stash`], the same encoder DD's own columnar
-//!   updates use. `T` is already `Columnar` (the arrangement stores times SoA in
-//!   [`ColTimes`](crate::corgi::col_times::ColTimes)), so this is the encoder that type was chosen
-//!   for.
+//! * Times encode their row count and lane count followed by contiguous u64 lanes.
+//!   Sizing reads dimensions only; neither encoding nor decoding constructs timestamps.
+//! * Diffs use columnar's Stash encoder. All sections are word aligned.
 //!
-//! Every section is a whole number of 64-bit words, so each begins 8-aligned in an 8-aligned
-//! buffer — which is what lets `Stash::try_from_bytes` install the received bytes directly rather
-//! than relocating them.
-//!
-//! The comparison worth keeping in view: the row backend's `Vec<((Row, Row), T, R)>` reaches the
-//! wire through `bincode`, which walks every `Value` of every row and emits varints. This walks
-//! four columns and emits memcpys. That difference is the whole reason a columnar exchange is
-//! worth building.
-//!
-//! **Known cost.** `length_in_bytes` and `into_bytes` are separate calls on `&self`, and the
-//! time/diff columns must be built to be measured, so they are built twice — two linear passes
-//! over `times`. The fix is the one [`container`](crate::corgi::container) already names: hold
-//! times columnar in the container instead of as `Vec<T>`, at which point both calls read a
-//! column that already exists. Keys and values do not have this problem: `corgi::bytes` sizes a
-//! `Value` by walking its shape, without touching a payload byte.
+//! This is an internal wire format: all workers must run the same build.
 
 use columnar::Columnar;
 use columnar::bytes::stash::Stash;
@@ -38,6 +23,7 @@ use timely::bytes::arc::Bytes;
 use timely::dataflow::channels::ContainerBytes;
 
 use crate::corgi::container::CorgiContainer;
+use crate::corgi::col_times::{ColTime, ColTimes};
 
 /// A columnar column of `T` backed either by an owned container or by received bytes.
 type ColStash<T> = Stash<<T as Columnar>::Container, Bytes>;
@@ -55,7 +41,7 @@ fn to_owned_vec<T: Columnar>(stash: &ColStash<T>) -> Vec<T> {
     (0..borrowed.len()).map(|i| <T as Columnar>::into_owned(borrowed.get(i))).collect()
 }
 
-impl<T: Columnar, R: Columnar> ContainerBytes for CorgiContainer<T, R> {
+impl<T: ColTime, R: Columnar> ContainerBytes for CorgiContainer<T, R> {
     fn from_bytes(mut bytes: Bytes) -> Self {
         let header = bytes.extract_to(32);
         let (kl, vl, tl, dl) = (header_word(&header, 0), header_word(&header, 1), header_word(&header, 2), header_word(&header, 3));
@@ -67,9 +53,24 @@ impl<T: Columnar, R: Columnar> ContainerBytes for CorgiContainer<T, R> {
         let (vals, vread) = corgi::bytes::read_from(&val_bytes).expect("corgi val column decode");
         assert_eq!(vread, vl, "corgi val column decode read {vread} of {vl} bytes");
 
-        let times: ColStash<T> = Stash::try_from_bytes(bytes.extract_to(tl)).expect("time column decode");
+        let time_bytes = bytes.extract_to(tl);
+        assert!(time_bytes.len() >= 16, "truncated product time header");
+        let rows = header_word(&time_bytes, 0);
+        let width = header_word(&time_bytes, 1);
+        let payload = width.checked_mul(rows).and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_add(16)).expect("product time length overflow");
+        assert_eq!(payload, tl, "product time payload length mismatch");
+        assert!(T::valid_width(width), "invalid product time width");
         let diffs: ColStash<R> = Stash::try_from_bytes(bytes.extract_to(dl)).expect("diff column decode");
-        let container = CorgiContainer { keys, vals, times: to_owned_vec(&times), diffs: to_owned_vec(&diffs) };
+        let diffs = to_owned_vec(&diffs);
+        assert_eq!(diffs.len(), rows, "product time row count mismatch");
+        let lanes = (0..width).map(|j| (0..rows).map(|r| {
+            let start = 16 + 8 * (j * rows + r);
+            let x = u64::from_le_bytes(time_bytes[start..start + 8].try_into().unwrap());
+            assert!(x <= T::maximum(j), "product time coordinate overflow");
+            x
+        }).collect()).collect();
+        let container = CorgiContainer { keys, vals, times: ColTimes::from_lanes(lanes, rows), diffs };
 
         // The four columns are one table, so they must agree on how many rows it has. Checking
         // that here is not ceremony — it is the only layer that knows the answer.
@@ -92,21 +93,19 @@ impl<T: Columnar, R: Columnar> ContainerBytes for CorgiContainer<T, R> {
     }
 
     fn length_in_bytes(&self) -> usize {
-        let times: ColStash<T> = Stash::Typed(T::as_columns(self.times.iter()));
         let diffs: ColStash<R> = Stash::Typed(R::as_columns(self.diffs.iter()));
         32 + corgi::bytes::length_in_bytes(&self.keys)
            + corgi::bytes::length_in_bytes(&self.vals)
-           + times.length_in_bytes()
+           + 16 + 8 * self.times.width() * self.times.len()
            + diffs.length_in_bytes()
     }
 
     fn into_bytes<W: std::io::Write>(&self, writer: &mut W) {
-        let times: ColStash<T> = Stash::Typed(T::as_columns(self.times.iter()));
         let diffs: ColStash<R> = Stash::Typed(R::as_columns(self.diffs.iter()));
         let lens = [
             corgi::bytes::length_in_bytes(&self.keys) as u64,
             corgi::bytes::length_in_bytes(&self.vals) as u64,
-            times.length_in_bytes() as u64,
+            (16 + 8 * self.times.width() * self.times.len()) as u64,
             diffs.length_in_bytes() as u64,
         ];
         for l in lens {
@@ -114,7 +113,19 @@ impl<T: Columnar, R: Columnar> ContainerBytes for CorgiContainer<T, R> {
         }
         corgi::bytes::write_to(&self.keys, writer).unwrap();
         corgi::bytes::write_to(&self.vals, writer).unwrap();
-        times.write_bytes(writer).unwrap();
+        writer.write_all(&(self.times.len() as u64).to_le_bytes()).unwrap();
+        writer.write_all(&(self.times.width() as u64).to_le_bytes()).unwrap();
+        for lane in &self.times.lanes {
+            // Write the existing primitive buffer directly on little-endian workers.
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: u64 has no padding and the byte view is bounded by the live slice.
+                let bytes = unsafe { std::slice::from_raw_parts(lane.as_ptr().cast::<u8>(), lane.len() * 8) };
+                writer.write_all(bytes).unwrap();
+            }
+            #[cfg(target_endian = "big")]
+            for x in lane.iter() { writer.write_all(&x.to_le_bytes()).unwrap(); }
+        }
         diffs.write_bytes(writer).unwrap();
     }
 }
