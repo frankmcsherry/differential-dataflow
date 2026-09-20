@@ -50,7 +50,68 @@ use crate::columnar::trie_merger;
 
 use super::spill::{self, BytesSource};
 
-use crate::trace::chunk::Chunk;
+use crate::trace::chunk::{Chunk, KeyedChunk};
+
+impl<U: ColumnarUpdate> KeyedChunk for ColChunk<U> {
+    type Key = U::Key;
+
+    fn select_keys(chunks: &[Self], keys: &[U::Key]) -> Vec<Self> {
+        if keys.is_empty() { return Vec::new(); }
+        // Convert request keys once so comparisons use the layout's borrowed
+        // representation (which need not be &U::Key).
+        let mut requested = ContainerOf::<U::Key>::default();
+        for key in keys { requested.push(key); }
+        let (mut pending, mut result) = (VecDeque::new(), VecDeque::new());
+        for chunk in chunks {
+            if Chunk::len(chunk) == 0 { continue; }
+            let (first, last) = match chunk {
+                Self::Resident(trie) => {
+                    let view = trie.view();
+                    (view.keys.values.get(0), view.keys.values.get(view.keys.values.len() - 1))
+                }
+                Self::Paged(p) => (p.meta.fk.borrow().get(0), p.meta.lk.borrow().get(0)),
+            };
+            let mut start = 0;
+            trie_merger::gallop(requested.borrow(), &mut start, keys.len(), |k| k < first);
+            if start == keys.len() || requested.borrow().get(start) > last { continue; }
+
+            // Unlike cursor reads, a miss borrows a temporary decoded body. Do
+            // not fill the source's OnceCell and retain all its unselected data.
+            let fetched;
+            let trie = match chunk {
+                Self::Resident(trie) => &**trie,
+                Self::Paged(p) => match p.cache.get() {
+                    Some(trie) => &**trie,
+                    None => {
+                        spill::note_fetched();
+                        fetched = spill::decode::<U>(&*p.source);
+                        &fetched
+                    }
+                },
+            };
+            let view = trie.view();
+            let requested = requested.borrow();
+            let mut selected = UpdatesTyped::<U>::default();
+            let mut pos = 0;
+            for k in start..keys.len() {
+                let key = requested.get(k);
+                trie_merger::gallop(view.keys.values, &mut pos, view.keys.values.len(), |x| x < key);
+                if pos == view.keys.values.len() { break; }
+                if view.keys.values.get(pos) == key {
+                    selected.extend_from_keys(view, pos..pos + 1);
+                    pos += 1;
+                }
+            }
+            if selected.len() > 0 {
+                selected.keys.bounds.push(selected.keys.values.len() as u64);
+                pending.push_back(Self::from_trie(selected));
+                pack_chunks(&mut pending, false, &mut result, |c| c);
+            }
+        }
+        pack_chunks(&mut pending, true, &mut result, |c| c);
+        result.into()
+    }
+}
 
 /// The chunk size: the [`Chunk::TARGET`] grading value.
 ///
@@ -448,20 +509,30 @@ where U::Time: 'static {
     /// with [`trie_merger::split_at`], and seal through [`seal_chunk`] (the spill
     /// point — pages a committed chunk when a spiller is installed).
     fn settle(input: &mut VecDeque<Self>, done: bool, out: &mut VecDeque<Self>) {
-        crate::trace::chunk::pack(
-            input, done, out,
-            |acc, next| {
-                let mut build = UpdatesBuilder::new_from(into_trie(std::mem::take(acc)));
-                build.meld(&into_trie(next));
-                *acc = ColChunk::Resident(Rc::new(build.done()));
-            },
-            |chunk, n| {
-                let (first, rest) = trie_merger::split_at(into_trie(chunk), n);
-                (ColChunk::Resident(Rc::new(first)), ColChunk::Resident(Rc::new(rest)))
-            },
-            seal_chunk,
-        );
+        pack_chunks(input, done, out, seal_chunk);
     }
+}
+
+/// Shared packing, with separate commit policies for trace storage and reads.
+fn pack_chunks<U: ColumnarUpdate>(
+    input: &mut VecDeque<ColChunk<U>>,
+    done: bool,
+    out: &mut VecDeque<ColChunk<U>>,
+    seal: impl FnMut(ColChunk<U>) -> ColChunk<U>,
+) {
+    crate::trace::chunk::pack(
+        input, done, out,
+        |acc, next| {
+            let mut build = UpdatesBuilder::new_from(into_trie(std::mem::take(acc)));
+            build.meld(&into_trie(next));
+            *acc = ColChunk::Resident(Rc::new(build.done()));
+        },
+        |chunk, n| {
+            let (first, rest) = trie_merger::split_at(into_trie(chunk), n);
+            (ColChunk::Resident(Rc::new(first)), ColChunk::Resident(Rc::new(rest)))
+        },
+        seal,
+    );
 }
 
 /// The columnar spill point: when a spiller is installed and over the high-water
