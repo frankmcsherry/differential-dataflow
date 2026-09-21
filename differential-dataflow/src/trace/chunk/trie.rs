@@ -120,7 +120,38 @@ impl Offsets {
     }
 
     /// Append `other`'s bounds at indices `range`, each shifted by `delta`.
+    ///
+    /// The portion of `range` inside `other`'s strided prefix is an arithmetic
+    /// progression; when it continues `self`'s own progression it folds in O(1)
+    /// rather than costing a `bound` / `push` pair per group. Only the remainder
+    /// (`other`'s spill and tail) is copied one bound at a time.
     fn extend_shifted(&mut self, other: &Offsets, range: std::ops::Range<usize>, delta: isize) {
+        if range.is_empty() { return; }
+        let mid = range.end.min(other.strided);
+        if mid > range.start && other.stride > 0 {
+            // `close` is what the first `push` would do, so it is safe either way.
+            self.close();
+            let first = ((range.start as isize) * (other.stride as isize) + delta) as usize;
+            let count = mid - range.start;
+            let folded = if !self.spill.is_empty() {
+                false
+            } else if self.stride == 0 && self.strided == 0 {
+                // `self` is the empty sequence `[0]`; fold if the run starts one step in.
+                if first == other.stride { self.stride = other.stride; self.strided = count; true }
+                else { false }
+            } else if other.stride == self.stride && first == (self.strided + 1) * self.stride {
+                self.strided += count;
+                true
+            } else {
+                false
+            };
+            if folded {
+                for i in mid .. range.end {
+                    self.push(((other.bound(i) as isize) + delta) as usize);
+                }
+                return;
+            }
+        }
         for i in range {
             self.push(((other.bound(i) as isize) + delta) as usize);
         }
@@ -1151,7 +1182,7 @@ mod test {
     use timely::progress::Antichain;
     use std::collections::VecDeque;
     use std::rc::Rc;
-    use super::{Chunk, Pos, TrieChunk, TrieStorage, TARGET};
+    use super::{Chunk, Offsets, Pos, TrieChunk, TrieStorage, TARGET};
     use crate::trace::Navigable;
     use crate::trace::chunk::merge_chains;
     use crate::consolidation::consolidate_updates;
@@ -1498,6 +1529,54 @@ mod test {
             consolidate_updates(&mut want);
             assert_eq!(result.is_none(), want.is_empty(), "absence must track emptiness\n  u1={u1:?}\n  u2={u2:?}\n  f={f}");
             assert_eq!(got, want, "fuel-driven merge mismatch\n  u1={u1:?}\n  u2={u2:?}\n  f={f}");
+        }
+    }
+
+    /// `extend_shifted`'s O(1) strided fold must represent exactly what pushing the
+    /// bounds one at a time would.
+    #[test]
+    fn extend_shifted_matches_pushes() {
+        let mut rng = rng_from(0x0ff5);
+        // Build an `Offsets` from a strictly increasing bound sequence.
+        fn build(bounds: &[usize]) -> Offsets {
+            let mut o = Offsets::default();
+            for &b in bounds { o.push(b); }
+            o
+        }
+        fn read(o: &Offsets) -> Vec<usize> {
+            (0 .. o.count()).map(|i| o.bound(i)).collect()
+        }
+        // Bound sequences of assorted shapes: pure strides, strides that break, and
+        // sequences that spill immediately.
+        let shapes: Vec<Vec<usize>> = vec![
+            (1 ..= 12).collect(),
+            (1 ..= 12).map(|i| i * 3).collect(),
+            vec![2, 4, 6, 7, 9, 13, 14],
+            vec![5, 5 + 1, 5 + 7, 20, 21],
+            vec![1],
+            (1 ..= 5).chain(std::iter::once(11)).collect(),
+        ];
+        for src in &shapes {
+            for dst in &shapes {
+                let other = build(src);
+                let n = other.count();
+                for _ in 0 .. 40 {
+                    let a = (rng() as usize) % n;
+                    let b = (rng() as usize) % n;
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let delta = (rng() as usize % 17) as isize;
+                    // The destination's own last bound, so the appended run is shifted
+                    // to continue it (what the transducers do).
+                    let mut fast = build(dst);
+                    let base = fast.bound(fast.count() - 1) as isize;
+                    let shift = base - other.bound(lo) as isize + delta;
+                    let mut slow = fast.clone();
+                    fast.extend_shifted(&other, lo .. hi, shift);
+                    for i in lo .. hi { slow.push(((other.bound(i) as isize) + shift) as usize); }
+                    assert_eq!(read(&fast), read(&slow), "src={src:?} dst={dst:?} range={lo}..{hi} shift={shift}");
+                    assert_eq!(fast.count(), slow.count());
+                }
+            }
         }
     }
 

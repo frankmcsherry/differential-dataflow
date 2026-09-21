@@ -151,19 +151,25 @@ impl<C: NavigableChunk> Cursor for ChunkBatchCursor<C> {
         if !self.key_valid(s) { return; }
         let n = s.chunks.len();
         let k = self.key(s);
-        // Advance to the last chunk the key spans.
-        while self.chunk + 1 < n && Self::key_spills(s, self.chunk, k) {
-            self.goto(self.chunk + 1, s);
+        // Step within the active chunk first. A key can only spill forward if it is
+        // that chunk's last, and stepping reveals that without reading any bounds:
+        // the common (mid-chunk) case costs one inner step and no key comparison.
+        self.inner.as_mut().unwrap().step_key(&s.chunks[self.chunk]);
+        if self.inner.as_ref().unwrap().key_valid(&s.chunks[self.chunk]) {
+            self.key_chunk = self.chunk;
+            return;
         }
-        // Step past the key within its last chunk.
-        {
+        // The chunk is exhausted, so `k` was its last key. Skip `k`'s continuation:
+        // each chunk it spills into begins with it.
+        while self.chunk + 1 < n {
+            self.goto(self.chunk + 1, s);
+            let spills = <KeyCon<C> as BatchContainer>::reborrow(s.chunks[self.chunk].bounds().0.0)
+                == <KeyCon<C> as BatchContainer>::reborrow(k);
+            if !spills { break; }
             let inner = self.inner.as_mut().unwrap();
             inner.seek_key(&s.chunks[self.chunk], k);
             inner.step_key(&s.chunks[self.chunk]);
-        }
-        // If that exhausted the chunk, the next key (if any) starts the next chunk.
-        if !self.inner.as_ref().unwrap().key_valid(&s.chunks[self.chunk]) && self.chunk + 1 < n {
-            self.goto(self.chunk + 1, s);
+            if inner.key_valid(&s.chunks[self.chunk]) { break; }
         }
         self.key_chunk = self.chunk;
     }
