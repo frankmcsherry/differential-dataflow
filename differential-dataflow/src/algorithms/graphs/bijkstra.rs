@@ -29,7 +29,8 @@ where
     bidijkstra_arranged(forward, reverse, goals)
 }
 
-use crate::trace::{BatchCursor, Cursor, Navigable, TraceReader};
+use crate::trace::TraceReader;
+use crate::cursor::{BatchCursor, Cursor, Navigable};
 use crate::operators::arrange::Arranged;
 
 /// Bi-directional Dijkstra search using arranged forward and reverse edge collections.

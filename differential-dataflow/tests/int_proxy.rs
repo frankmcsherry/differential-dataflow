@@ -27,8 +27,8 @@ use differential_dataflow::trace::chunk::vec::{
     ChunkBatcher as VChunkBatcher, ChunkSpine as VChunkSpine, VecChunk,
 };
 use differential_dataflow::trace::chunk::ChunkBatch;
-use differential_dataflow::trace::cursor::Cursor;
-use differential_dataflow::trace::{Navigable};
+use differential_dataflow::cursor::Cursor;
+use differential_dataflow::cursor::Navigable;
 use differential_dataflow::AsCollection;
 
 type Span<K, V, T, R> = Rc<ChunkBatch<VecChunk<K, V, T, R>>>;

@@ -1,5 +1,5 @@
 use differential_dataflow::input::InputSession;
-use differential_dataflow::operators::CountTotal;
+use differential_dataflow::cursor::operators::CountTotal;
 
 use rand::{Rng, SeedableRng, StdRng};
 

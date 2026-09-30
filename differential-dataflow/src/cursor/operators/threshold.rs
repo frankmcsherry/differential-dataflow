@@ -14,7 +14,8 @@ use crate::difference::{Semigroup, Abelian};
 use crate::hashable::Hashable;
 use crate::collection::AsCollection;
 use crate::operators::arrange::Arranged;
-use crate::trace::{BatchCursor, BatchDiff, BatchDiffGat, BatchKey, Cursor, Navigable, TraceReader};
+use crate::trace::TraceReader;
+use crate::cursor::{BatchCursor, BatchDiff, BatchDiffGat, BatchKey, Cursor, Navigable};
 
 /// Extension trait for the `distinct` differential dataflow method.
 pub trait ThresholdTotal<'scope, T: Timestamp + TotalOrder + Lattice, K: ExchangeData, R: ExchangeData+Semigroup> : Sized {
@@ -30,7 +31,7 @@ pub trait ThresholdTotal<'scope, T: Timestamp + TotalOrder + Lattice, K: Exchang
     ///
     /// ```
     /// use differential_dataflow::input::Input;
-    /// use differential_dataflow::operators::ThresholdTotal;
+    /// use differential_dataflow::cursor::operators::ThresholdTotal;
     ///
     /// ::timely::example(|scope| {
     ///     // report the number of occurrences of each key
@@ -60,7 +61,7 @@ pub trait ThresholdTotal<'scope, T: Timestamp + TotalOrder + Lattice, K: Exchang
     ///
     /// ```
     /// use differential_dataflow::input::Input;
-    /// use differential_dataflow::operators::ThresholdTotal;
+    /// use differential_dataflow::cursor::operators::ThresholdTotal;
     ///
     /// ::timely::example(|scope| {
     ///     // report the number of occurrences of each key
@@ -146,8 +147,8 @@ where
 
                     let mut session = output.session(&caps);
 
-                    let (mut batch_cursor, batch_storage) = crate::trace::cursor::cursor_list(batch_storage.into_iter().filter_map(|b| b.inner).collect());
-                    let (mut trace_cursor, trace_storage) = crate::trace::cursor::cursor_list(trace.batches_through(lower_limit.borrow()).unwrap());
+                    let (mut batch_cursor, batch_storage) = crate::cursor::cursor_list(batch_storage.into_iter().filter_map(|b| b.inner).collect());
+                    let (mut trace_cursor, trace_storage) = crate::cursor::cursor_list(trace.batches_through(lower_limit.borrow()).unwrap());
 
                     while let Some(key) = batch_cursor.get_key(&batch_storage) {
                         let mut count: Option<BatchDiff<Tr>> = None;

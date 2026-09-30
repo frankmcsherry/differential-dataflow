@@ -66,8 +66,6 @@ pub trait ReduceTactic<T, B1, B2> {
     ) -> (Option<Span<T, B2>>, Antichain<T>);
 }
 
-pub use crate::operators::cursor::reduce::reduce_trace;
-
 /// Drives a key-wise reduction using a supplied [`ReduceTactic`].
 ///
 /// This is the general reduce operator: it does the dataflow plumbing (frontiers, capabilities, output

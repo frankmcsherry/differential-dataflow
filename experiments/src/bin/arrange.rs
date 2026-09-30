@@ -5,8 +5,8 @@ use timely::dataflow::operators::{Exchange, Probe};
 // use timely::progress::timestamp::RootTimestamp;
 
 use differential_dataflow::input::Input;
-use differential_dataflow::operators::count::CountTotal;
-use differential_dataflow::operators::threshold::ThresholdTotal;
+use differential_dataflow::cursor::operators::count::CountTotal;
+use differential_dataflow::cursor::operators::threshold::ThresholdTotal;
 
 #[derive(Debug)]
 enum Comp {

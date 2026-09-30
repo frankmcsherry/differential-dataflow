@@ -43,7 +43,8 @@ where
     propagate_core(edges.arrange_by_key(), nodes, logic)
 }
 
-use crate::trace::{BatchCursor, Cursor, Navigable, TraceReader};
+use crate::trace::TraceReader;
+use crate::cursor::{BatchCursor, Cursor, Navigable};
 use crate::operators::arrange::arrangement::Arranged;
 
 /// Propagates labels forward, retaining the minimum label.

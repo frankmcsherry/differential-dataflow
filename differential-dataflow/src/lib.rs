@@ -94,6 +94,7 @@ impl<T: timely::ExchangeData + Data> ExchangeData for T { }
 
 pub mod hashable;
 pub mod operators;
+#[cfg(feature = "cursor")]
 pub mod algorithms;
 pub mod lattice;
 pub mod batcher;
@@ -106,6 +107,8 @@ pub mod logging;
 pub mod consolidation;
 pub mod capture;
 pub mod columnar;
+#[cfg(feature = "cursor")]
+pub mod cursor;
 
 /// Configuration options for differential dataflow.
 #[derive(Default)]

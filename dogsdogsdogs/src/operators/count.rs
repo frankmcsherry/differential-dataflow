@@ -5,7 +5,8 @@ use timely::progress::Antichain;
 use differential_dataflow::{AsCollection, ExchangeData, VecCollection, Hashable};
 use differential_dataflow::difference::Monoid;
 use differential_dataflow::operators::arrange::Arranged;
-use differential_dataflow::trace::{BatchCursor, BatchTimeGat, BatchVal, Cursor, Navigable, TraceReader};
+use differential_dataflow::trace::{TraceReader};
+use differential_dataflow::cursor::{BatchCursor, BatchTimeGat, BatchVal, Cursor, Navigable};
 use differential_dataflow::trace::implementations::BatchContainer;
 
 /// Updates a stream of prefix routing judgements based on approximate counts.

@@ -2,7 +2,7 @@
 
 use crate::lattice::Lattice;
 use crate::operators::history::{EditList, HistoryReplay, ValueHistory};
-use crate::trace::Cursor;
+use crate::cursor::Cursor;
 
 /// Walks the cursor's values at the current key into `target`, advancing times by `meet` if supplied.
 fn load_values<'a, V, T, D, C>(

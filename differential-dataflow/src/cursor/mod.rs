@@ -4,9 +4,23 @@
 //! of tuples of the form `(key, val, time, diff)`. The cursor is different from an iterator
 //! both because it allows navigation on multiple levels (key and val), but also because it
 //! supports efficient seeking (via the `seek_key` and `seek_val` methods).
+//!
+//! Cursors are one way to read batches, and this module holds everything that reads that way.
+//! Its layout mirrors the modules it attaches to: cursors for the batch types of
+//! [`ord_neu`](crate::trace::implementations::ord_neu), [`chunk`](crate::trace::chunk), and
+//! [`columnar`](crate::columnar), cursors through the [trace wrappers](crate::trace::wrappers),
+//! and the operators and `Collection` / `Arranged` methods that read arrangements by cursor.
+//! Those modules do not refer back to this one.
+//! The module is present with the `cursor` feature.
 
 pub mod cursor_list;
 pub mod wrappers;
+pub mod ord_neu;
+pub mod chunk;
+pub mod columnar;
+pub mod operators;
+mod collection;
+mod arranged;
 
 pub use self::cursor_list::CursorList;
 

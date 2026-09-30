@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use differential_dataflow::input::Input;
 use differential_dataflow::operators::*;
+use differential_dataflow::cursor::operators::*;
 
 fn main() {
 

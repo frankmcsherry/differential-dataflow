@@ -13,6 +13,6 @@ workspace = true
 core_affinity = "0.5.9"
 rand="0.3.13"
 timely = { workspace = true, features = ["getopts"] }
-differential-dataflow = { workspace = true }
+differential-dataflow = { workspace = true, features = ["cursor"] }
 graph_map = { git = "https://github.com/frankmcsherry/graph-map" }
 serde = { version = "1.0", features = ["derive"] }

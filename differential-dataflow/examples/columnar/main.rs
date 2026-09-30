@@ -96,7 +96,7 @@ mod reachability {
     use differential_dataflow::AsCollection;
     use differential_dataflow::operators::iterate::Variable;
     use differential_dataflow::operators::arrange::arrangement::arrange_core;
-    use differential_dataflow::operators::join::join_traces;
+    use differential_dataflow::cursor::operators::join::join_traces;
 
     use differential_dataflow::columnar::trace::{Batcher as ValBatcher, Builder as ValBuilder, Spine as ValSpine};
     use differential_dataflow::columnar::collection::{Builder as ValColBuilder, Pact as ValPact, RecordedUpdates, as_recorded_updates};

@@ -4,7 +4,7 @@ use timely::progress::{Antichain, frontier::AntichainRef};
 use differential_dataflow::trace::implementations::{ValBatcher, ValSpine};
 use differential_dataflow::batcher::Batcher;
 use differential_dataflow::trace::{Description, Span, Trace, TraceReader};
-use differential_dataflow::trace::cursor::{Cursor, cursor_list};
+use differential_dataflow::cursor::{Cursor, cursor_list};
 
 type IntegerTrace = ValSpine<u64, u64, usize, i64>;
 

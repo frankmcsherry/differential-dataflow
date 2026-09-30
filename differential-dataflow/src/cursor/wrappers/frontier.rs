@@ -2,8 +2,8 @@
 
 use crate::trace::implementations::BatchContainer;
 use crate::trace::wrappers::frontier::BatchFrontier;
-use crate::trace::Navigable;
-use crate::trace::cursor::Cursor;
+use crate::cursor::Navigable;
+use crate::cursor::Cursor;
 
 impl<B> Navigable for BatchFrontier<B, <B::Cursor as Cursor>::Time>
 where

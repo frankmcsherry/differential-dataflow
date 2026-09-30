@@ -8,7 +8,6 @@
 //! and allows various data structures to be interpretable as multiple different types of trace.
 
 pub mod chunk;
-pub mod cursor;
 pub mod description;
 pub mod implementations;
 pub mod wrappers;
@@ -17,9 +16,6 @@ use timely::progress::{Antichain, frontier::AntichainRef};
 use timely::progress::Timestamp;
 use crate::lattice::Lattice;
 
-pub use self::cursor::Cursor;
-pub use self::cursor::Navigable;
-pub use self::cursor::{BatchCursor, BatchKey, BatchVal, BatchValOwn, BatchDiff, BatchDiffGat, BatchTimeGat};
 pub use self::description::Description;
 pub use crate::batcher::Batcher;
 
@@ -79,7 +75,7 @@ pub trait TraceReader {
     ///
     /// A span is [`Span<Self::Time, Self::Batch>`](Span), pairing a description with a batch
     /// when its interval brought any updates. The trace has no opinion on how a batch is read:
-    /// operators that want cursors add a [`Navigable`] bound of their own, and operators that
+    /// operators that want cursors add a `Navigable` bound of their own, and operators that
     /// read batches some other way add none.
     type Batch: 'static + Clone;
 

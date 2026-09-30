@@ -11,7 +11,8 @@ use crate::difference::{IsZero, Semigroup};
 use crate::hashable::Hashable;
 use crate::collection::AsCollection;
 use crate::operators::arrange::Arranged;
-use crate::trace::{BatchCursor, BatchDiff, BatchDiffGat, Cursor, Navigable, TraceReader};
+use crate::trace::TraceReader;
+use crate::cursor::{BatchCursor, BatchDiff, BatchDiffGat, Cursor, Navigable};
 
 /// Extension trait for the `count` differential dataflow method.
 pub trait CountTotal<'scope, T: Timestamp + TotalOrder + Lattice, K: ExchangeData, R: Semigroup> : Sized {
@@ -21,7 +22,7 @@ pub trait CountTotal<'scope, T: Timestamp + TotalOrder + Lattice, K: ExchangeDat
     ///
     /// ```
     /// use differential_dataflow::input::Input;
-    /// use differential_dataflow::operators::CountTotal;
+    /// use differential_dataflow::cursor::operators::CountTotal;
     ///
     /// ::timely::example(|scope| {
     ///     // report the number of occurrences of each key
@@ -96,8 +97,8 @@ where
 
                     let mut session = output.session(&caps);
 
-                    let (mut batch_cursor, batch_storage) = crate::trace::cursor::cursor_list(batch_storage.into_iter().filter_map(|b| b.inner).collect());
-                    let (mut trace_cursor, trace_storage) = crate::trace::cursor::cursor_list(trace.batches_through(lower_limit.borrow()).unwrap());
+                    let (mut batch_cursor, batch_storage) = crate::cursor::cursor_list(batch_storage.into_iter().filter_map(|b| b.inner).collect());
+                    let (mut trace_cursor, trace_storage) = crate::cursor::cursor_list(trace.batches_through(lower_limit.borrow()).unwrap());
 
                     while let Some(key) = batch_cursor.get_key(&batch_storage) {
                         let mut count: Option<BatchDiff<Tr>> = None;

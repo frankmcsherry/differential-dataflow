@@ -1,13 +1,13 @@
-//! Dataflow operators over the columnar [`RecordedUpdates`](super::RecordedUpdates)
+//! Dataflow operators over the columnar [`RecordedUpdates`]
 //! container — the collection-level surface of the columnar chunk.
 //!
 //! [`join_function`] is a columnar `flat_map` (subsuming map/filter/negate/
-//! enter_at); [`leave_dynamic`] truncates dynamic-scope timestamps; and
-//! [`as_recorded_updates`] extracts a `RecordedUpdates` collection from a
-//! columnar arrangement's batch stream.
+//! enter_at), and [`leave_dynamic`] truncates dynamic-scope timestamps.
+//! The other direction — extracting a `RecordedUpdates` collection from a
+//! columnar arrangement's batch stream — reads by cursor, and lives in
+//! [`cursor::columnar`](crate::cursor::columnar).
 
 use crate::columnar::layout;
-use crate::columnar::trace::Spine;
 use super::{Builder, RecordedUpdates};
 
 /// A columnar flat_map: iterates RecordedUpdates, calls logic per (key, val, time, diff),
@@ -151,47 +151,4 @@ where
     });
 
     stream.as_collection()
-}
-
-/// Extract a `Collection<_, RecordedUpdates<U>>` from a columnar `Arranged`.
-///
-/// Cursors through each batch and pushes `(key, val, time, diff)` refs into
-/// a `Builder`, which sorts and consolidates on flush.
-pub fn as_recorded_updates<U>(
-    arranged: crate::operators::arrange::Arranged<
-        crate::operators::arrange::TraceAgent<Spine<U::Key, U::Val, U::Time, U::Diff>>,
-    >,
-) -> crate::Collection<U::Time, RecordedUpdates<U>>
-where
-    U: layout::ColumnarUpdate,
-{
-    use timely::dataflow::operators::generic::Operator;
-    use timely::dataflow::channels::pact::Pipeline;
-    use crate::trace::{Navigable, Cursor};
-    use crate::AsCollection;
-
-    arranged.stream
-        .unary::<Builder<U>, _, _, _>(Pipeline, "AsRecordedUpdates", |_, _| {
-            move |input, output| {
-                input.for_each(|time, batches| {
-                    let mut session = output.session_with_builder(&time);
-                    for batch in batches.drain(..) {
-                        let Some(batch) = batch.inner else { continue };
-                        let mut cursor = batch.cursor();
-                        while cursor.key_valid(&batch) {
-                            while cursor.val_valid(&batch) {
-                                let key = cursor.key(&batch);
-                                let val = cursor.val(&batch);
-                                cursor.map_times(&batch, |time, diff| {
-                                    session.give((key, val, time, diff));
-                                });
-                                cursor.step_val(&batch);
-                            }
-                            cursor.step_key(&batch);
-                        }
-                    }
-                });
-            }
-        })
-        .as_collection()
 }

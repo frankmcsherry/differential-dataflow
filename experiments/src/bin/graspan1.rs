@@ -6,7 +6,7 @@ use timely::order::Product;
 use differential_dataflow::difference::Present;
 use differential_dataflow::input::Input;
 use differential_dataflow::trace::implementations::{ValBatcher, ValSpine};
-use differential_dataflow::operators::*;
+use differential_dataflow::cursor::operators::*;
 use differential_dataflow::operators::iterate::Variable;
 
 type Node = u32;

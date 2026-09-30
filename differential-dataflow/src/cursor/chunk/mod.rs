@@ -8,11 +8,13 @@
 //! Chunk bodies are read when navigation reaches them.
 //! Implementors must keep `bounds` cheap even when a chunk's body is paged out.
 
-use crate::trace::Navigable;
-use crate::trace::cursor::Cursor;
+use crate::cursor::Navigable;
+use crate::cursor::Cursor;
 use crate::trace::implementations::BatchContainer;
 
-use super::{Chunk, ChunkBatch};
+use crate::trace::chunk::{Chunk, ChunkBatch};
+
+pub mod vec;
 
 /// The navigation capability: a [`Chunk`] whose contents can be read by cursor.
 ///
@@ -36,7 +38,7 @@ pub trait NavigableChunk: Chunk + Navigable<Cursor: Cursor<Time = <Self as Chunk
 type KeyCon<C> = <<C as Navigable>::Cursor as Cursor>::KeyContainer;
 type ValCon<C> = <<C as Navigable>::Cursor as Cursor>::ValContainer;
 
-impl<C: NavigableChunk> crate::trace::Navigable for ChunkBatch<C> {
+impl<C: NavigableChunk> crate::cursor::Navigable for ChunkBatch<C> {
     type Cursor = ChunkBatchCursor<C>;
     fn cursor(&self) -> Self::Cursor {
         ChunkBatchCursor { key_chunk: 0, chunk: 0, inner: self.chunks.first().map(C::cursor) }

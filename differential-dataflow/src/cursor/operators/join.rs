@@ -14,8 +14,9 @@ use crate::lattice::Lattice;
 use crate::operators::arrange::Arranged;
 use crate::operators::history::ValueHistory;
 use crate::operators::join::{Fresh, JoinTactic, join_with_tactic};
-use crate::trace::{BatchCursor, BatchDiff, BatchVal, Cursor, Navigable, TraceReader};
-use crate::trace::cursor::cursor_list;
+use crate::trace::TraceReader;
+use crate::cursor::{BatchCursor, BatchDiff, BatchVal, Cursor, Navigable};
+use crate::cursor::cursor_list;
 use crate::trace::implementations::containers::BatchContainer;
 
 /// An equijoin of two traces, sharing a common key type.
@@ -48,7 +49,7 @@ where
 
 /// The conventional cursor-based [`JoinTactic`].
 ///
-/// It builds a [`CursorList`](crate::trace::cursor::CursorList) over each input batch list and plays the merge-join out at whatever rate
+/// It builds a [`CursorList`](crate::cursor::CursorList) over each input batch list and plays the merge-join out at whatever rate
 /// the driver's fuel allows. Each prepared unit joins a `B0`-side cursor against a `B1`-side cursor,
 /// emitting `(val0, val1)` to `logic` and yielding the output containers `logic` fills. `logic` is
 /// shared across all outstanding units (an `Rc<RefCell<_>>`), preserving the single mutable-state

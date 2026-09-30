@@ -5,7 +5,8 @@ use timely::progress::Antichain;
 use differential_dataflow::{ExchangeData, VecCollection};
 use differential_dataflow::difference::{Monoid, Semigroup};
 use differential_dataflow::operators::arrange::Arranged;
-use differential_dataflow::trace::{BatchCursor, BatchDiff, BatchTimeGat, Cursor, Navigable, TraceReader};
+use differential_dataflow::trace::{TraceReader};
+use differential_dataflow::cursor::{BatchCursor, BatchDiff, BatchTimeGat, Cursor, Navigable};
 use differential_dataflow::trace::implementations::BatchContainer;
 
 /// Restricts proposed extensions to those the arrangement would also have proposed.

@@ -18,7 +18,8 @@ where
     bfs_arranged(edges, roots)
 }
 
-use crate::trace::{BatchCursor, Cursor, Navigable, TraceReader};
+use crate::trace::TraceReader;
+use crate::cursor::{BatchCursor, Cursor, Navigable};
 use crate::operators::arrange::Arranged;
 
 /// Returns pairs (node, dist) indicating distance of each node from a root.

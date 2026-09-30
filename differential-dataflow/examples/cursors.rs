@@ -38,7 +38,7 @@ use timely::progress::frontier::{Antichain, AntichainRef};
 use timely::dataflow::operators::Probe;
 
 use differential_dataflow::input::Input;
-use differential_dataflow::trace::cursor::{Cursor, cursor_list};
+use differential_dataflow::cursor::{Cursor, cursor_list};
 use differential_dataflow::trace::TraceReader;
 
 type Node = u32;

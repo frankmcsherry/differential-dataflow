@@ -7,8 +7,9 @@ use timely::progress::{Antichain, Timestamp};
 use crate::Data;
 use crate::operators::arrange::{Arranged, TraceAgent};
 use crate::operators::reduce::{ReduceTactic, reduce_with_tactic, sort_dedup};
-use crate::trace::{Span, BatchCursor, BatchDiff, BatchVal, BatchValOwn, Builder, Cursor, Description, Navigable, Trace, TraceReader};
-use crate::trace::cursor::cursor_list;
+use crate::trace::{Span, Builder, Description, Trace, TraceReader};
+use crate::cursor::{BatchCursor, BatchDiff, BatchVal, BatchValOwn, Cursor, Navigable};
+use crate::cursor::cursor_list;
 use crate::trace::implementations::containers::BatchContainer;
 
 /// The time type of the updates' cursor: the time coordinate the tactic works in.
@@ -43,7 +44,7 @@ where
 }
 /// The conventional cursor-based [`ReduceTactic`].
 ///
-/// It builds a [`CursorList`](crate::trace::cursor::CursorList) over the input, output, and new-batch
+/// It builds a [`CursorList`](crate::cursor::CursorList) over the input, output, and new-batch
 /// updates and replays them together per key, applying `logic` and shaping output with `push`. It holds
 /// the outstanding synthetic interesting `(key, time)` moments across activations, and reasons only
 /// about times: capabilities are the driver's concern.
@@ -246,9 +247,9 @@ mod history_replay {
     use timely::progress::Antichain;
 
     use crate::lattice::Lattice;
-    use crate::operators::cursor::history::replay_key;
+    use crate::cursor::operators::history::replay_key;
     use crate::operators::history::ValueHistory;
-    use crate::trace::Cursor;
+    use crate::cursor::Cursor;
 
     use crate::operators::reduce::sort_dedup;
 

@@ -77,15 +77,15 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: crate::difference::Semigroup> V
         self.buffer.clear();
     }
 
-    pub(in crate::operators) fn edits_mut(&mut self) -> &mut EditList<V, T, D> {
+    pub(crate) fn edits_mut(&mut self) -> &mut EditList<V, T, D> {
         &mut self.edits
     }
 
-    pub(in crate::operators) fn edit_len(&self) -> usize {
+    pub(crate) fn edit_len(&self) -> usize {
         self.edits.len()
     }
 
-    pub(in crate::operators) fn map_edits<F: FnMut(V, &T, &D)>(&self, logic: F) {
+    pub(crate) fn map_edits<F: FnMut(V, &T, &D)>(&self, logic: F) {
         self.edits.map(logic)
     }
 
@@ -107,7 +107,7 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: crate::difference::Semigroup> V
     }
 
     /// Organizes history based on current contents of edits, returning a fresh replay.
-    pub(in crate::operators) fn replay<'history>(&'history mut self) -> HistoryReplay<'history, V, T, D> {
+    pub(crate) fn replay<'history>(&'history mut self) -> HistoryReplay<'history, V, T, D> {
         self.build();
         HistoryReplay { replay: self }
     }
@@ -169,19 +169,19 @@ impl<V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::difference::Semi
     pub fn is_done(&self) -> bool { self.history.is_empty() }
 }
 
-pub(in crate::operators) struct HistoryReplay<'history, V, T, D> {
+pub(crate) struct HistoryReplay<'history, V, T, D> {
     replay: &'history mut ValueHistory<V, T, D>,
 }
 
 // A `HistoryReplay` is a thin handle over a `ValueHistory`.
 // The replay machinery lives on `ValueHistory` itself, and these methods forward to it.
 impl<'history, V: Copy + Ord, T: Ord + Clone + Lattice, D: Clone + crate::difference::Semigroup> HistoryReplay<'history, V, T, D> {
-    pub(in crate::operators) fn time(&self) -> Option<&T> { self.replay.time() }
-    pub(in crate::operators) fn meet(&self) -> Option<&T> { self.replay.meet() }
-    pub(in crate::operators) fn edit(&self) -> Option<(V, &T, &D)> { self.replay.edit() }
-    pub(in crate::operators) fn buffer(&self) -> &[((V, T), D)] { self.replay.buffer() }
-    pub(in crate::operators) fn step(&mut self) { self.replay.step() }
-    pub(in crate::operators) fn step_while_time_is(&mut self, time: &T) -> bool { self.replay.step_while_time_is(time) }
-    pub(in crate::operators) fn advance_buffer_by(&mut self, meet: &T) { self.replay.advance_buffer_by(meet) }
-    pub(in crate::operators) fn is_done(&self) -> bool { self.replay.is_done() }
+    pub(crate) fn time(&self) -> Option<&T> { self.replay.time() }
+    pub(crate) fn meet(&self) -> Option<&T> { self.replay.meet() }
+    pub(crate) fn edit(&self) -> Option<(V, &T, &D)> { self.replay.edit() }
+    pub(crate) fn buffer(&self) -> &[((V, T), D)] { self.replay.buffer() }
+    pub(crate) fn step(&mut self) { self.replay.step() }
+    pub(crate) fn step_while_time_is(&mut self, time: &T) -> bool { self.replay.step_while_time_is(time) }
+    pub(crate) fn advance_buffer_by(&mut self, meet: &T) { self.replay.advance_buffer_by(meet) }
+    pub(crate) fn is_done(&self) -> bool { self.replay.is_done() }
 }

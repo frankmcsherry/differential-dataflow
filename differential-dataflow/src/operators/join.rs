@@ -44,8 +44,6 @@ pub enum Fresh {
     Input1,
 }
 
-pub use crate::operators::cursor::join::join_traces;
-
 /// Drives an equijoin of two traces using a supplied [`JoinTactic`].
 ///
 /// This is the general join operator: it does the dataflow plumbing (frontiers, capabilities, trace

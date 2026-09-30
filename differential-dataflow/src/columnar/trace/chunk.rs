@@ -29,7 +29,6 @@
 
 use std::cell::OnceCell;
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::rc::Rc;
 
 use columnar::{Borrow, Columnar, Container, ContainerOf, Index, Len, Push};
@@ -40,11 +39,8 @@ use timely::progress::frontier::AntichainRef;
 
 use crate::consolidation::Consolidate;
 use crate::lattice::Lattice;
-use crate::trace::Navigable;
-use crate::trace::cursor::Cursor;
-use crate::trace::implementations::{BatchContainer, Layout};
 
-use crate::columnar::layout::{ColumnarLayout, ColumnarUpdate, Coltainer};
+use crate::columnar::layout::ColumnarUpdate;
 use crate::columnar::updates::{child_range, UpdatesBuilder, UpdatesTyped};
 use crate::columnar::trie_merger;
 
@@ -62,15 +58,15 @@ const TARGET: usize = 8192;
 /// single-element columnar containers (so [`Chunk::bounds`] returns refs without
 /// fetching), plus the record count.
 pub struct ChunkMeta<U: ColumnarUpdate> {
-    fk: ContainerOf<U::Key>, fv: ContainerOf<U::Val>, ft: ContainerOf<U::Time>,
-    lk: ContainerOf<U::Key>, lv: ContainerOf<U::Val>, lt: ContainerOf<U::Time>,
+    pub(crate) fk: ContainerOf<U::Key>, pub(crate) fv: ContainerOf<U::Val>, pub(crate) ft: ContainerOf<U::Time>,
+    pub(crate) lk: ContainerOf<U::Key>, pub(crate) lv: ContainerOf<U::Val>, pub(crate) lt: ContainerOf<U::Time>,
     len: usize,
 }
 
 /// A paged chunk: resident `meta`, a byte handle to fetch the trie, and a cache
 /// populated on first read. Opaque — held inside [`ColChunk::Paged`].
 pub struct PagedChunk<U: ColumnarUpdate> {
-    meta: ChunkMeta<U>,
+    pub(crate) meta: ChunkMeta<U>,
     source: Box<dyn BytesSource>,
     cache: OnceCell<Rc<UpdatesTyped<U>>>,
 }
@@ -122,7 +118,7 @@ impl<U: ColumnarUpdate> ColChunk<U> {
 
     /// Borrow the chunk's trie, fetching (and caching) it if paged. Reads tie to
     /// `&self`, so cursor refs remain valid for the borrow.
-    fn trie(&self) -> &UpdatesTyped<U> {
+    pub(crate) fn trie(&self) -> &UpdatesTyped<U> {
         match self {
             ColChunk::Resident(rc) => &**rc,
             ColChunk::Paged(p) => &**p.cache.get_or_init(|| {
@@ -186,92 +182,6 @@ impl<U: ColumnarUpdate> PushInto<((U::Key, U::Val), U::Time, U::Diff)> for ColCh
     }
 }
 
-// --- Cursor (trace side), navigating the trie directly (cf. `OrdValCursor`) ---
-
-/// A cursor over a [`ColChunk`], tracking the current key and value as absolute
-/// indices into the trie's flat `keys.values` / `vals.values` columns.
-pub struct ColChunkCursor<U: ColumnarUpdate> {
-    key_cursor: usize,
-    val_cursor: usize,
-    phantom: PhantomData<U>,
-}
-
-impl<U: ColumnarUpdate> Cursor for ColChunkCursor<U> {
-    type Storage = ColChunk<U>;
-
-    type KeyContainer = <ColumnarLayout<U> as Layout>::KeyContainer;
-    type Key<'a> = <<ColumnarLayout<U> as Layout>::KeyContainer as BatchContainer>::ReadItem<'a>;
-    type ValContainer = <ColumnarLayout<U> as Layout>::ValContainer;
-    type Val<'a> = <<ColumnarLayout<U> as Layout>::ValContainer as BatchContainer>::ReadItem<'a>;
-    type ValOwn = <<ColumnarLayout<U> as Layout>::ValContainer as BatchContainer>::Owned;
-    type TimeContainer = <ColumnarLayout<U> as Layout>::TimeContainer;
-    type TimeGat<'a> = <<ColumnarLayout<U> as Layout>::TimeContainer as BatchContainer>::ReadItem<'a>;
-    type Time = <<ColumnarLayout<U> as Layout>::TimeContainer as BatchContainer>::Owned;
-    type DiffContainer = <ColumnarLayout<U> as Layout>::DiffContainer;
-    type DiffGat<'a> = <<ColumnarLayout<U> as Layout>::DiffContainer as BatchContainer>::ReadItem<'a>;
-    type Diff = <<ColumnarLayout<U> as Layout>::DiffContainer as BatchContainer>::Owned;
-
-    fn key_valid(&self, s: &Self::Storage) -> bool { self.key_cursor < s.trie().view().keys.values.len() }
-    fn val_valid(&self, s: &Self::Storage) -> bool {
-        let view = s.trie().view();
-        self.key_cursor < view.keys.values.len()
-            && self.val_cursor < child_range(view.vals.bounds, self.key_cursor).end
-    }
-    fn key<'a>(&self, s: &'a Self::Storage) -> Self::Key<'a> { s.trie().view().keys.values.get(self.key_cursor) }
-    fn val<'a>(&self, s: &'a Self::Storage) -> Self::Val<'a> { s.trie().view().vals.values.get(self.val_cursor) }
-    fn get_key<'a>(&self, s: &'a Self::Storage) -> Option<Self::Key<'a>> {
-        if self.key_valid(s) { Some(self.key(s)) } else { None }
-    }
-    fn get_val<'a>(&self, s: &'a Self::Storage) -> Option<Self::Val<'a>> {
-        if self.val_valid(s) { Some(self.val(s)) } else { None }
-    }
-    fn map_times<L: FnMut(Self::TimeGat<'_>, Self::DiffGat<'_>)>(&mut self, s: &Self::Storage, mut logic: L) {
-        if !self.val_valid(s) { return; }
-        let view = s.trie().view();
-        for t in child_range(view.times.bounds, self.val_cursor) {
-            let time = view.times.values.get(t);
-            for d in child_range(view.diffs.bounds, t) {
-                logic(time, view.diffs.values.get(d));
-            }
-        }
-    }
-    fn step_key(&mut self, s: &Self::Storage) {
-        self.key_cursor += 1;
-        if self.key_valid(s) { self.rewind_vals(s); }
-        else { self.key_cursor = s.trie().view().keys.values.len(); }
-    }
-    fn seek_key(&mut self, s: &Self::Storage, key: Self::Key<'_>) {
-        let view = s.trie().view();
-        let n = view.keys.values.len();
-        let mut lo = self.key_cursor;
-        trie_merger::gallop(view.keys.values, &mut lo, n, |x|
-            <Coltainer<U::Key> as BatchContainer>::reborrow(x).lt(&<Coltainer<U::Key> as BatchContainer>::reborrow(key)));
-        self.key_cursor = lo;
-        if self.key_valid(s) { self.rewind_vals(s); }
-    }
-    fn step_val(&mut self, s: &Self::Storage) {
-        self.val_cursor += 1;
-        if !self.val_valid(s) {
-            self.val_cursor = child_range(s.trie().view().vals.bounds, self.key_cursor).end;
-        }
-    }
-    fn seek_val(&mut self, s: &Self::Storage, val: Self::Val<'_>) {
-        if !self.key_valid(s) { return; }
-        let view = s.trie().view();
-        let upper = child_range(view.vals.bounds, self.key_cursor).end;
-        let mut lo = self.val_cursor;
-        trie_merger::gallop(view.vals.values, &mut lo, upper, |x|
-            <Coltainer<U::Val> as BatchContainer>::reborrow(x).lt(&<Coltainer<U::Val> as BatchContainer>::reborrow(val)));
-        self.val_cursor = lo;
-    }
-    fn rewind_keys(&mut self, s: &Self::Storage) { self.key_cursor = 0; self.rewind_vals(s); }
-    fn rewind_vals(&mut self, s: &Self::Storage) {
-        if self.key_valid(s) {
-            self.val_cursor = child_range(s.trie().view().vals.bounds, self.key_cursor).start;
-        }
-    }
-}
-
 /// Wrap a non-empty resident trie as a chunk and append it to `out`.
 fn emit<U: ColumnarUpdate>(updates: UpdatesTyped<U>, out: &mut VecDeque<ColChunk<U>>) {
     if updates.len() > 0 { out.push_back(ColChunk::Resident(Rc::new(updates))); }
@@ -283,39 +193,6 @@ fn emit<U: ColumnarUpdate>(updates: UpdatesTyped<U>, out: &mut VecDeque<ColChunk
 /// and we skip [`UpdatesTyped::filter_zero`]'s rebuild entirely.
 fn consolidated<U: ColumnarUpdate>(merged: UpdatesTyped<U>) -> UpdatesTyped<U> {
     if merged.diffs.values.len() == merged.times.values.len() { merged } else { merged.filter_zero() }
-}
-
-impl<U: ColumnarUpdate> Navigable for ColChunk<U>
-where U::Time: 'static {
-    type Cursor = ColChunkCursor<U>;
-
-    fn cursor(&self) -> Self::Cursor {
-        ColChunkCursor { key_cursor: 0, val_cursor: 0, phantom: PhantomData }
-    }
-}
-
-impl<U: ColumnarUpdate> crate::trace::chunk::NavigableChunk for ColChunk<U>
-where U::Time: 'static {
-    fn bounds(&self) -> (
-        (<Self::Cursor as Cursor>::Key<'_>, <Self::Cursor as Cursor>::Val<'_>, <Self::Cursor as Cursor>::TimeGat<'_>),
-        (<Self::Cursor as Cursor>::Key<'_>, <Self::Cursor as Cursor>::Val<'_>, <Self::Cursor as Cursor>::TimeGat<'_>),
-    ) {
-        match self {
-            ColChunk::Resident(rc) => {
-                let view = rc.view();
-                let (nk, nv, nt) = (view.keys.values.len(), view.vals.values.len(), view.times.values.len());
-                // Sorted trie: the first/last of each flat column are the bounding triples.
-                ((view.keys.values.get(0), view.vals.values.get(0), view.times.values.get(0)),
-                 (view.keys.values.get(nk - 1), view.vals.values.get(nv - 1), view.times.values.get(nt - 1)))
-            }
-            ColChunk::Paged(p) => {
-                // Read the resident metadata — no fetch.
-                let m = &p.meta;
-                ((m.fk.borrow().get(0), m.fv.borrow().get(0), m.ft.borrow().get(0)),
-                 (m.lk.borrow().get(0), m.lv.borrow().get(0), m.lt.borrow().get(0)))
-            }
-        }
-    }
 }
 
 impl<U: ColumnarUpdate> Chunk for ColChunk<U>
@@ -546,7 +423,6 @@ mod test {
     use super::{ColChunk, Chunk};
     use crate::columnar::updates::UpdatesTyped;
     use crate::trace::chunk::merge_chains;
-    use crate::trace::Navigable;
 
     type Upd = (u64, u64, u64, i64);
 
@@ -636,33 +512,6 @@ mod test {
         assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
-    // The straddle-aware `ChunkBatch` cursor reconstructs the same grouped
-    // updates as a flat reference, even when a key — and a `(key, val)`'s times —
-    // span a chunk boundary.
-    #[test]
-    fn cursor_handles_straddle() {
-        use crate::trace::cursor::Cursor;
-        use crate::trace::chunk::ChunkBatch;
-
-        let chunks = vec![
-            chunk(vec![(0, 0, 0, 1), (1, 0, 0, 1), (1, 1, 0, 1)]),
-            chunk(vec![(1, 1, 1, 1), (1, 2, 0, 1)]),
-            chunk(vec![(2, 0, 0, 1)]),
-        ];
-        let batch = ChunkBatch::new(chunks);
-
-        let mut cursor = batch.cursor();
-        let got = cursor.to_vec(&batch, |k| *k, |v| *v);
-        let want = vec![
-            ((0u64, 0u64), vec![(0u64, 1i64)]),
-            ((1, 0), vec![(0, 1)]),
-            ((1, 1), vec![(0, 1), (1, 1)]),
-            ((1, 2), vec![(0, 1)]),
-            ((2, 0), vec![(0, 1)]),
-        ];
-        assert_eq!(got, want);
-    }
-
     // Driving `ChunkBatchMerger` to completion with tiny `fuel` (so it suspends
     // and settles on nearly every tick) yields the same advanced-and-consolidated
     // batch as a one-shot reference, and that batch is graded. Exercises the
@@ -671,7 +520,6 @@ mod test {
     fn batch_merger_resumable_matches_reference() {
         use crate::trace::implementations::spine_fueled::Merger;
         use crate::trace::chunk::{ChunkBatch, ChunkBatchMerger, is_graded};
-        use crate::trace::cursor::Cursor;
         use crate::consolidation::consolidate_updates;
 
         let mut seed = 0x9E3779B97F4A7C15u64;
@@ -692,17 +540,7 @@ mod test {
             ChunkBatch::new(chunks)
         }
         fn read(b: &ChunkBatch<ColChunk<Upd>>) -> Vec<Upd> {
-            let mut out = Vec::new();
-            let mut c = b.cursor();
-            while c.key_valid(b) {
-                let k = *c.key(b);
-                while c.val_valid(b) {
-                    let v = *c.val(b);
-                    c.map_times(b, |t, d| out.push(((k, v), *t, *d)));
-                    c.step_val(b);
-                }
-                c.step_key(b);
-            }
+            let mut out: Vec<_> = flat(b.chunks.iter().cloned()).into_iter().map(|(k, v, t, d)| ((k, v), t, d)).collect();
             consolidate_updates(&mut out);
             out.into_iter().map(|((k, v), t, d)| (k, v, t, d)).collect()
         }

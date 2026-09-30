@@ -14,7 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-differential-dataflow = { workspace = true }
+differential-dataflow = { workspace = true, features = ["cursor"] }
 timely = { workspace = true }
 interactive = { path = ".." }
 mimalloc = "0.1.48"

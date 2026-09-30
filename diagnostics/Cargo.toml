@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-differential-dataflow.workspace = true
+differential-dataflow = { workspace = true, features = ["cursor"] }
 timely = { workspace = true, features = ["getopts"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

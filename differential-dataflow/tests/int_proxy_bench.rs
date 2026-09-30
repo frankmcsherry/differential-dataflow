@@ -35,8 +35,8 @@ use differential_dataflow::operators::reduce::reduce_with_tactic;
 use differential_dataflow::trace::chunk::vec::{
     ChunkBatcher as VChunkBatcher, ChunkBuilder as VChunkBuilder, ChunkSpine as VChunkSpine,
 };
-use differential_dataflow::trace::chunk::vec::cursor::VecChunkCursor;
-use differential_dataflow::trace::cursor::Cursor;
+use differential_dataflow::cursor::chunk::vec::VecChunkCursor;
+use differential_dataflow::cursor::Cursor;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {

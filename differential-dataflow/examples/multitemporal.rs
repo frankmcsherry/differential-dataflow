@@ -7,8 +7,9 @@ use timely::progress::frontier::{Antichain, AntichainRef};
 use timely::PartialOrder;
 
 use differential_dataflow::AsCollection;
-use differential_dataflow::trace::{Cursor, TraceReader};
-use differential_dataflow::trace::cursor::cursor_list;
+use differential_dataflow::trace::{TraceReader};
+use differential_dataflow::cursor::Cursor;
+use differential_dataflow::cursor::cursor_list;
 
 use pair::Pair;
 

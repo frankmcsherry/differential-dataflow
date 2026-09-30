@@ -5,8 +5,8 @@ use timely::progress::timestamp::Refines;
 use crate::lattice::Lattice;
 use crate::trace::implementations::BatchContainer;
 use crate::trace::wrappers::enter::BatchEnter;
-use crate::trace::Navigable;
-use crate::trace::cursor::Cursor;
+use crate::cursor::Navigable;
+use crate::cursor::Cursor;
 
 impl<B, TInner> Navigable for BatchEnter<B, TInner>
 where

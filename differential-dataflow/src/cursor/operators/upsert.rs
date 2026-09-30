@@ -56,7 +56,7 @@
 //!
 //!         use timely::dataflow::operators::Input;
 //!         use differential_dataflow::trace::implementations::{ValBuilder, ValSpine};
-//!         use differential_dataflow::operators::arrange::upsert;
+//!         use differential_dataflow::cursor::operators::upsert;
 //!
 //!         let stream = scope.input_from(&mut input);
 //!         let arranged = upsert::arrange_from_upsert::<ValBuilder<Key, Val, _, _>, ValSpine<Key, Val, _, _>,String,String>(stream, &"test");
@@ -108,12 +108,13 @@ use timely::progress::{Antichain, Timestamp};
 use timely::dataflow::operators::Capability;
 
 use crate::operators::arrange::arrangement::Arranged;
-use crate::trace::{self, BatchCursor, BatchDiff, Builder, Cursor, Description, Navigable, Trace, TraceReader};
+use crate::trace::{self, Builder, Description, Trace, TraceReader};
+use crate::cursor::{BatchCursor, BatchDiff, Cursor, Navigable};
 use crate::{ExchangeData, Hashable};
 
 use crate::trace::implementations::containers::BatchContainer;
 
-use super::TraceAgent;
+use crate::operators::arrange::TraceAgent;
 
 /// Arrange data from a stream of keyed upserts.
 ///
@@ -232,7 +233,7 @@ where
                                 // Prepare a cursor to the existing arrangement, and a batch builder for
                                 // new stuff that we add.
                                 let batches = reader_local.batches_through(Antichain::new().borrow()).unwrap();
-                                let (mut trace_cursor, trace_storage) = crate::trace::cursor::cursor_list(batches);
+                                let (mut trace_cursor, trace_storage) = crate::cursor::cursor_list(batches);
                                 let mut builder = Bu::default();
                                 let mut key_con = <BatchCursor<Tr> as Cursor>::KeyContainer::with_capacity(1);
                                 for (key, mut list) in to_process {

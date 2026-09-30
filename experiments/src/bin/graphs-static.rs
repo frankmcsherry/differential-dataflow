@@ -3,7 +3,7 @@ use timely::dataflow::operators::ToStream;
 
 use differential_dataflow::input::Input;
 use differential_dataflow::VecCollection;
-use differential_dataflow::operators::*;
+use differential_dataflow::cursor::operators::*;
 use differential_dataflow::operators::iterate::Variable;
 use differential_dataflow::AsCollection;
 

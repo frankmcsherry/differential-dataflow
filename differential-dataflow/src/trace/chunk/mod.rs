@@ -21,7 +21,7 @@
 //! The [`vec`](mod@vec) module provides a worked implementation and specializes the aliases for its chunk type.
 //! The `chunks` example builds an arrangement from it.
 //!
-//! Reading chunks through cursors is an optional capability provided by the [`cursor`] module.
+//! Reading chunks through cursors is an optional capability provided by the [`cursor::chunk`](crate::cursor::chunk) module.
 //!
 //! # Bounded footprint
 //!
@@ -44,9 +44,6 @@ use crate::lattice::Lattice;
 use crate::trace::implementations::spine_fueled::SpineBatch;
 
 pub mod vec;
-pub mod cursor;
-
-pub use cursor::{ChunkBatchCursor, NavigableChunk};
 
 /// A non-empty, bounded, consolidated, sorted sequence of `(data, time, diff)`.
 ///
@@ -59,7 +56,7 @@ pub use cursor::{ChunkBatchCursor, NavigableChunk};
 /// The "metadata" operations provide chunk information, and should be lightweight.
 ///
 /// The trait exposes only time, which trace maintenance needs.
-/// Reading a chunk's contents is a separate, optional capability: see the [`cursor`] module.
+/// Reading a chunk's contents is a separate, optional capability: see the [`cursor::chunk`](crate::cursor::chunk) module.
 pub trait Chunk: Sized + Clone {
     /// The timestamp type of the chunk's updates.
     ///

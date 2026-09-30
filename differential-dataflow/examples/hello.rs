@@ -2,7 +2,7 @@ use rand::{Rng, SeedableRng, StdRng};
 
 use differential_dataflow::input::Input;
 // use differential_dataflow::operators::Count;
-use differential_dataflow::operators::count::CountTotal;
+use differential_dataflow::cursor::operators::count::CountTotal;
 
 fn main() {
 

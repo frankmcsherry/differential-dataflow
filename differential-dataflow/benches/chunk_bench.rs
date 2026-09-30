@@ -22,10 +22,11 @@ use timely::container::{PushInto, SizableContainer};
 
 use differential_dataflow::consolidation::Consolidate;
 use differential_dataflow::columnar::layout::ColumnarUpdate;
-use differential_dataflow::trace::chunk::{merge_chains, Chunk, NavigableChunk};
+use differential_dataflow::trace::chunk::{merge_chains, Chunk};
+use differential_dataflow::cursor::chunk::NavigableChunk;
 use differential_dataflow::trace::chunk::vec::VecChunk;
 use differential_dataflow::columnar::trace::ColChunk;
-use differential_dataflow::trace::cursor::Cursor;
+use differential_dataflow::cursor::Cursor;
 use differential_dataflow::batcher::merge::chunker::ContainerChunker;
 
 /// A global allocator that tracks currently-resident bytes, so we can snapshot
