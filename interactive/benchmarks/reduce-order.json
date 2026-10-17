@@ -1,0 +1,2312 @@
+{
+  "boundary": "All variants use the same allocation-free Corgi port at pinned 41e8731. Three interleaved runs per variant; each 11 timings plus separate allocation pass. 50000 keys, eight values/key. Reconciliation only; presentation and verification excluded. System allocator, scalar u64 time.",
+  "variants": {
+    "baseline": "master-next reduce unchanged",
+    "order_buffers": "Reuse input value-ID order and reconcile into correction tail; scalar equality",
+    "batch_equality": "Order/buffer reuse plus gathered bulk equality (rejected for the combined fix)"
+  },
+  "runs": {
+    "baseline": [
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50064,
+          "samples_ns": [
+            1580250,
+            1459625,
+            1333417,
+            1269000,
+            1268167,
+            1265667,
+            1278167,
+            1243916,
+            1247667,
+            1258750,
+            1253958
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50019,
+          "samples_ns": [
+            1170792,
+            1163709,
+            1207625,
+            1152459,
+            1191958,
+            1157250,
+            1170291,
+            1189625,
+            1193458,
+            1181667,
+            1190625
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50116,
+          "samples_ns": [
+            3277750,
+            3215542,
+            3177875,
+            3310375,
+            3299583,
+            3096083,
+            3273250,
+            3181542,
+            3284583,
+            3507917,
+            3356125
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50071,
+          "samples_ns": [
+            3220125,
+            3176334,
+            3191417,
+            3181083,
+            3236834,
+            3239792,
+            3260083,
+            3238583,
+            3258250,
+            3288125,
+            3238875
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50143,
+          "samples_ns": [
+            4915292,
+            4939583,
+            4834916,
+            4872875,
+            5042292,
+            4898250,
+            4853500,
+            4896250,
+            4821333,
+            4771917,
+            4833458
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50098,
+          "samples_ns": [
+            5824583,
+            5639000,
+            5654500,
+            5692000,
+            5759917,
+            5658875,
+            5714458,
+            6096750,
+            5575708,
+            5645209,
+            5693500
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50064,
+          "samples_ns": [
+            1199125,
+            1201167,
+            1226750,
+            1200459,
+            1201708,
+            1190542,
+            1195875,
+            1205917,
+            1208250,
+            1195875,
+            1199292
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50019,
+          "samples_ns": [
+            1165625,
+            1175917,
+            1180334,
+            1174667,
+            1191833,
+            1185416,
+            1177167,
+            1182125,
+            1183000,
+            1191000,
+            1177500
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50142,
+          "samples_ns": [
+            4161667,
+            4060375,
+            4092542,
+            4021208,
+            4068209,
+            4067000,
+            4122291,
+            4142792,
+            4012958,
+            4070458,
+            4050875
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50097,
+          "samples_ns": [
+            4322208,
+            4283833,
+            4349042,
+            4263416,
+            4432959,
+            4467250,
+            4433958,
+            4411750,
+            4378083,
+            4354083,
+            4458667
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50166,
+          "samples_ns": [
+            5599250,
+            5475041,
+            5475750,
+            5529708,
+            5462458,
+            5489459,
+            5452667,
+            5520584,
+            5496708,
+            5177500,
+            5378917
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50121,
+          "samples_ns": [
+            8117917,
+            8070667,
+            8075375,
+            8057708,
+            8080666,
+            8050250,
+            8071375,
+            8095292,
+            8097708,
+            8099167,
+            8087083
+          ]
+        }
+      ],
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50064,
+          "samples_ns": [
+            1194500,
+            1194459,
+            1196750,
+            1199875,
+            1181666,
+            1192542,
+            1193500,
+            1190042,
+            1174625,
+            1187416,
+            1239250
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50019,
+          "samples_ns": [
+            1221750,
+            1217000,
+            1194500,
+            1191542,
+            1199916,
+            1187208,
+            1243375,
+            1195208,
+            1182000,
+            1187250,
+            1192416
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50116,
+          "samples_ns": [
+            3174583,
+            3335000,
+            3195625,
+            3163083,
+            3447000,
+            3214083,
+            3258084,
+            3361041,
+            3178292,
+            3187084,
+            3210541
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50071,
+          "samples_ns": [
+            3124666,
+            3179917,
+            3062875,
+            3259375,
+            3215916,
+            3204250,
+            3274375,
+            3186792,
+            3199458,
+            3386166,
+            3181750
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50143,
+          "samples_ns": [
+            4984334,
+            4793792,
+            4873792,
+            4802042,
+            4847792,
+            4776959,
+            4856250,
+            4994458,
+            4963292,
+            4669875,
+            4824917
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50098,
+          "samples_ns": [
+            5695167,
+            5607333,
+            5687292,
+            5614709,
+            5727083,
+            5733625,
+            5791875,
+            5745541,
+            5812416,
+            5772333,
+            5674584
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50064,
+          "samples_ns": [
+            1346584,
+            1298375,
+            1283875,
+            1301292,
+            1286208,
+            1288125,
+            1298875,
+            1318500,
+            1289958,
+            1291084,
+            1295167
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50019,
+          "samples_ns": [
+            1104125,
+            1160459,
+            1197375,
+            1171500,
+            1224708,
+            1193875,
+            1189542,
+            1181292,
+            1187334,
+            1213458,
+            1208625
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50142,
+          "samples_ns": [
+            4055916,
+            4064500,
+            4040166,
+            4010875,
+            4083083,
+            4094500,
+            4047541,
+            4079666,
+            4148625,
+            4009458,
+            4143625
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50097,
+          "samples_ns": [
+            4286334,
+            4338416,
+            4305208,
+            4499125,
+            4359125,
+            4304250,
+            4384500,
+            4513292,
+            4422583,
+            4488584,
+            4440875
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50166,
+          "samples_ns": [
+            5607750,
+            5575708,
+            5533708,
+            5590333,
+            5553333,
+            5590084,
+            5533583,
+            5558000,
+            5655459,
+            5578833,
+            5631125
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50121,
+          "samples_ns": [
+            8099666,
+            8116041,
+            8118459,
+            8060833,
+            8078625,
+            8129375,
+            8112125,
+            8196750,
+            8120917,
+            8058542,
+            8061209
+          ]
+        }
+      ],
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50064,
+          "samples_ns": [
+            1237500,
+            1209542,
+            1249250,
+            1212666,
+            1257084,
+            1241917,
+            1218042,
+            1238709,
+            1308167,
+            1249583,
+            1253292
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50019,
+          "samples_ns": [
+            1171792,
+            1161416,
+            1143250,
+            1164500,
+            1149666,
+            1146167,
+            1180250,
+            1138166,
+            1167375,
+            1156208,
+            1183209
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50116,
+          "samples_ns": [
+            3263750,
+            3300834,
+            3342125,
+            3310542,
+            3260125,
+            3326000,
+            3258208,
+            3232542,
+            3279458,
+            3273542,
+            3311291
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50071,
+          "samples_ns": [
+            3191542,
+            3140292,
+            3161584,
+            3166791,
+            3177875,
+            3159500,
+            3134167,
+            3184958,
+            3198834,
+            3222167,
+            3245208
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50143,
+          "samples_ns": [
+            5173000,
+            4971125,
+            4933458,
+            4933292,
+            4999167,
+            5214667,
+            4997875,
+            4678167,
+            4828417,
+            4819375,
+            4779792
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50098,
+          "samples_ns": [
+            5704542,
+            5757500,
+            5751250,
+            5675916,
+            5624416,
+            5660250,
+            5717000,
+            5624459,
+            5672250,
+            5623208,
+            5675625
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50064,
+          "samples_ns": [
+            1287125,
+            1290041,
+            1279375,
+            1301709,
+            1372458,
+            1327875,
+            1302916,
+            1343292,
+            1292042,
+            1415458,
+            1343916
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50019,
+          "samples_ns": [
+            1169166,
+            1152125,
+            1154334,
+            1156666,
+            1148292,
+            1152084,
+            1166500,
+            1151166,
+            1158000,
+            1151208,
+            1154333
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50142,
+          "samples_ns": [
+            4166625,
+            4287750,
+            4133583,
+            4119667,
+            4271792,
+            4263750,
+            4205542,
+            4155959,
+            4175334,
+            4049000,
+            4080167
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50097,
+          "samples_ns": [
+            4410792,
+            4351875,
+            4314292,
+            4322250,
+            4344125,
+            4379459,
+            4321625,
+            4325542,
+            4326166,
+            4370291,
+            4289667
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50166,
+          "samples_ns": [
+            5433292,
+            5355875,
+            5397917,
+            5426666,
+            5395292,
+            5388708,
+            5365500,
+            5443167,
+            5393833,
+            5343666,
+            5398375
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 50121,
+          "samples_ns": [
+            8050333,
+            8118250,
+            8054709,
+            8260000,
+            8225667,
+            8274583,
+            8217250,
+            8210500,
+            8187042,
+            8251917,
+            8207209
+          ]
+        }
+      ]
+    ],
+    "order_buffers": [
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            978292,
+            892042,
+            871375,
+            864375,
+            871375,
+            865917,
+            858208,
+            799625,
+            786584,
+            823209,
+            804250
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 20,
+          "samples_ns": [
+            832125,
+            824584,
+            824458,
+            845125,
+            842875,
+            827000,
+            822458,
+            817833,
+            831875,
+            828625,
+            812875
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 57,
+          "samples_ns": [
+            921709,
+            979958,
+            838417,
+            878750,
+            879708,
+            907417,
+            949333,
+            952083,
+            861166,
+            903250,
+            896041
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 13,
+          "samples_ns": [
+            966084,
+            980541,
+            958541,
+            1010042,
+            973834,
+            962958,
+            966584,
+            975792,
+            955709,
+            978625,
+            967417
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 77,
+          "samples_ns": [
+            1975083,
+            1965750,
+            1963667,
+            1969375,
+            2046750,
+            2000750,
+            2006292,
+            1972292,
+            2020167,
+            2012167,
+            1999292
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 33,
+          "samples_ns": [
+            2675500,
+            2672334,
+            2661250,
+            2606625,
+            2592917,
+            2630542,
+            2610708,
+            2609917,
+            2621125,
+            2611959,
+            2625208
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            766959,
+            767625,
+            782666,
+            812625,
+            766000,
+            808292,
+            773583,
+            760416,
+            806167,
+            771792,
+            800916
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 20,
+          "samples_ns": [
+            820833,
+            817417,
+            817875,
+            808834,
+            811000,
+            803208,
+            800333,
+            802417,
+            807250,
+            848166,
+            806167
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 68,
+          "samples_ns": [
+            1047708,
+            1045584,
+            1008042,
+            1016541,
+            1029833,
+            1045292,
+            1027084,
+            1094375,
+            1073125,
+            1049500,
+            1022667
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 24,
+          "samples_ns": [
+            1244250,
+            1229042,
+            1250083,
+            1241833,
+            1248500,
+            1242792,
+            1254167,
+            1241833,
+            1293000,
+            1244292,
+            1247958
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 88,
+          "samples_ns": [
+            2216000,
+            2219458,
+            2261416,
+            2254583,
+            2245542,
+            2282583,
+            2262334,
+            2238250,
+            2274917,
+            2255042,
+            2262334
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 44,
+          "samples_ns": [
+            4745584,
+            4781208,
+            4765042,
+            4764250,
+            4711084,
+            4754708,
+            4607709,
+            4716167,
+            4687834,
+            4669292,
+            4697041
+          ]
+        }
+      ],
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            856917,
+            792917,
+            809458,
+            837042,
+            812625,
+            778334,
+            777333,
+            821209,
+            761542,
+            768333,
+            774750
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 20,
+          "samples_ns": [
+            809958,
+            813667,
+            814750,
+            810292,
+            806916,
+            833250,
+            829041,
+            832083,
+            859625,
+            840917,
+            850750
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 57,
+          "samples_ns": [
+            914916,
+            919042,
+            882500,
+            850625,
+            897459,
+            878000,
+            892625,
+            919875,
+            847708,
+            960125,
+            866959
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 13,
+          "samples_ns": [
+            983709,
+            962042,
+            968917,
+            1023375,
+            964917,
+            980875,
+            951291,
+            991375,
+            968333,
+            976667,
+            951333
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 77,
+          "samples_ns": [
+            2015792,
+            1924375,
+            1982250,
+            2010917,
+            2147583,
+            2015791,
+            1997958,
+            2007791,
+            1981459,
+            2010334,
+            2002875
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 33,
+          "samples_ns": [
+            2613917,
+            2629625,
+            2635917,
+            2611333,
+            2622292,
+            2657542,
+            2636833,
+            2661209,
+            2643584,
+            2660667,
+            2645500
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            804042,
+            794000,
+            806834,
+            803542,
+            815667,
+            803334,
+            802875,
+            798500,
+            799083,
+            825250,
+            814708
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 20,
+          "samples_ns": [
+            839292,
+            838500,
+            845208,
+            843667,
+            855292,
+            833125,
+            828584,
+            830833,
+            828166,
+            842958,
+            840875
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 68,
+          "samples_ns": [
+            1108000,
+            1067542,
+            1054833,
+            1083959,
+            1043792,
+            1046917,
+            1047542,
+            1085333,
+            1009833,
+            994583,
+            1008584
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 24,
+          "samples_ns": [
+            1223500,
+            1258416,
+            1236542,
+            1231250,
+            1229834,
+            1250708,
+            1235500,
+            1222334,
+            1286750,
+            1254416,
+            1235833
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 88,
+          "samples_ns": [
+            2162042,
+            2107625,
+            2126875,
+            2145166,
+            2156916,
+            2140792,
+            2174750,
+            2182000,
+            2216750,
+            2197917,
+            2183792
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 44,
+          "samples_ns": [
+            4738291,
+            4755958,
+            4775833,
+            4886750,
+            4778958,
+            4740834,
+            4775084,
+            4759292,
+            4730667,
+            4742542,
+            4703125
+          ]
+        }
+      ],
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            791084,
+            768708,
+            775333,
+            773417,
+            782542,
+            782417,
+            774666,
+            786958,
+            785125,
+            781166,
+            766750
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 20,
+          "samples_ns": [
+            801833,
+            796417,
+            807542,
+            834875,
+            809167,
+            813334,
+            800750,
+            810542,
+            810167,
+            811375,
+            801000
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 57,
+          "samples_ns": [
+            878458,
+            866167,
+            890334,
+            883125,
+            957084,
+            932375,
+            915250,
+            877625,
+            888583,
+            894500,
+            866459
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 13,
+          "samples_ns": [
+            970250,
+            980250,
+            971417,
+            981292,
+            977500,
+            971500,
+            977292,
+            958500,
+            976625,
+            970667,
+            960000
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 77,
+          "samples_ns": [
+            1986209,
+            1976375,
+            2003750,
+            1980042,
+            1937292,
+            1967958,
+            1931000,
+            1938958,
+            1902917,
+            1947875,
+            1942334
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 33,
+          "samples_ns": [
+            2616708,
+            2624208,
+            2610166,
+            2621459,
+            2629459,
+            2618833,
+            2625708,
+            2637000,
+            2639917,
+            2619917,
+            2640500
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            770709,
+            812709,
+            812042,
+            780834,
+            791458,
+            774958,
+            781167,
+            778542,
+            767875,
+            774375,
+            775792
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 20,
+          "samples_ns": [
+            819792,
+            815417,
+            810292,
+            823333,
+            811041,
+            809250,
+            810459,
+            843833,
+            804792,
+            809625,
+            824584
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 68,
+          "samples_ns": [
+            1063875,
+            1037084,
+            1044125,
+            1031416,
+            1024750,
+            1056500,
+            997708,
+            1043750,
+            1061542,
+            1010625,
+            1054542
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 24,
+          "samples_ns": [
+            1239208,
+            1238041,
+            1256500,
+            1231917,
+            1306000,
+            1259208,
+            1257125,
+            1249708,
+            1244667,
+            1235291,
+            1327458
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 88,
+          "samples_ns": [
+            2192125,
+            2173125,
+            2211500,
+            2149625,
+            2152792,
+            2163917,
+            2157625,
+            2156541,
+            2219500,
+            2164209,
+            2171541
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 44,
+          "samples_ns": [
+            5104167,
+            5085000,
+            5073041,
+            5117416,
+            5097125,
+            5062583,
+            4636125,
+            4708958,
+            4706083,
+            4704875,
+            4711416
+          ]
+        }
+      ]
+    ],
+    "batch_equality": [
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            948167,
+            914834,
+            866792,
+            859541,
+            818208,
+            817208,
+            826250,
+            780416,
+            779750,
+            775125,
+            780709
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 66,
+          "samples_ns": [
+            1071708,
+            1049542,
+            1080708,
+            1050083,
+            1058000,
+            1057875,
+            1055542,
+            1051958,
+            1053084,
+            1060542,
+            1039500
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 57,
+          "samples_ns": [
+            890792,
+            918833,
+            922833,
+            861791,
+            898750,
+            910458,
+            858792,
+            920833,
+            912583,
+            969333,
+            893791
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 59,
+          "samples_ns": [
+            1198708,
+            1199458,
+            1180583,
+            1183167,
+            1176666,
+            1205292,
+            1220750,
+            1183333,
+            1184333,
+            1170958,
+            1181958
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 77,
+          "samples_ns": [
+            2059208,
+            2087750,
+            2045500,
+            2071583,
+            2047000,
+            2064542,
+            2212000,
+            2129209,
+            2076542,
+            2081584,
+            2086542
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 33,
+          "samples_ns": [
+            2635625,
+            2655875,
+            2673666,
+            2675417,
+            2632209,
+            2627542,
+            2657584,
+            2609209,
+            2616500,
+            2687208,
+            2675042
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            811125,
+            802625,
+            803333,
+            831792,
+            809875,
+            801000,
+            792125,
+            797583,
+            839459,
+            793792,
+            793625
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 66,
+          "samples_ns": [
+            1085375,
+            1096375,
+            1086792,
+            1089750,
+            1084250,
+            1105000,
+            1076125,
+            1088833,
+            1067459,
+            1084292,
+            1078875
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 68,
+          "samples_ns": [
+            1039959,
+            1072417,
+            1068500,
+            1020667,
+            1043500,
+            1023959,
+            1041667,
+            1048625,
+            1053250,
+            1042792,
+            1016208
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 106,
+          "samples_ns": [
+            1576709,
+            1560500,
+            1608750,
+            1572208,
+            1590708,
+            1567875,
+            1552666,
+            1561917,
+            1495500,
+            1521625,
+            1557625
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 88,
+          "samples_ns": [
+            2263958,
+            2233833,
+            2240334,
+            2266416,
+            2278583,
+            2288375,
+            2237958,
+            2233708,
+            2214834,
+            2244417,
+            2251750
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 248,
+          "samples_ns": [
+            6548625,
+            6622959,
+            6576208,
+            6524792,
+            6565000,
+            6704041,
+            6592125,
+            6605834,
+            6520625,
+            6661333,
+            6600834
+          ]
+        }
+      ],
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            844417,
+            787292,
+            788334,
+            781250,
+            787958,
+            781416,
+            796625,
+            793417,
+            789542,
+            803125,
+            805208
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 66,
+          "samples_ns": [
+            1065875,
+            1071833,
+            1063916,
+            1084084,
+            1117917,
+            1087500,
+            1060959,
+            1056334,
+            1072666,
+            1065209,
+            1064125
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 57,
+          "samples_ns": [
+            869333,
+            898834,
+            968542,
+            920500,
+            863291,
+            865541,
+            877459,
+            893125,
+            872750,
+            871458,
+            894625
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 59,
+          "samples_ns": [
+            1204042,
+            1198917,
+            1177375,
+            1174833,
+            1225125,
+            1186042,
+            1204417,
+            1260209,
+            1224917,
+            1182708,
+            1165875
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 77,
+          "samples_ns": [
+            2082291,
+            2074250,
+            2057125,
+            2056708,
+            2075250,
+            2048500,
+            2060333,
+            2050250,
+            2150791,
+            2085208,
+            2096000
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 33,
+          "samples_ns": [
+            2790792,
+            2800958,
+            2806958,
+            2775292,
+            2795792,
+            2783125,
+            2786083,
+            2795292,
+            2770292,
+            2750458,
+            2766250
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            833375,
+            778083,
+            788375,
+            787541,
+            787458,
+            823666,
+            806917,
+            796125,
+            793000,
+            788458,
+            800625
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 66,
+          "samples_ns": [
+            1102791,
+            1079791,
+            1071500,
+            1101792,
+            1066417,
+            1068458,
+            1075333,
+            1089084,
+            1085541,
+            1088084,
+            1071959
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 68,
+          "samples_ns": [
+            1052833,
+            1061375,
+            1017333,
+            1037875,
+            1024458,
+            1093542,
+            1089333,
+            1023917,
+            1032584,
+            1058167,
+            1024833
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 106,
+          "samples_ns": [
+            1588708,
+            1562875,
+            1579125,
+            1555791,
+            1566416,
+            1567000,
+            1556666,
+            1493750,
+            1569375,
+            1547750,
+            1572291
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 88,
+          "samples_ns": [
+            2259333,
+            2315833,
+            2228917,
+            2274959,
+            2260500,
+            2326833,
+            2265375,
+            2266417,
+            2246792,
+            2272541,
+            2299250
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 248,
+          "samples_ns": [
+            6662125,
+            6760542,
+            6613791,
+            6506291,
+            6702625,
+            6628542,
+            6648042,
+            6493042,
+            6532917,
+            6530791,
+            6575500
+          ]
+        }
+      ],
+      [
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            862750,
+            839333,
+            827375,
+            818042,
+            832208,
+            832917,
+            825417,
+            814709,
+            831333,
+            827125,
+            821416
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 66,
+          "samples_ns": [
+            1124125,
+            1098291,
+            1098167,
+            1128125,
+            1103500,
+            1114625,
+            1085375,
+            1110250,
+            1089000,
+            1106125,
+            1101166
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 57,
+          "samples_ns": [
+            861459,
+            864041,
+            847792,
+            885792,
+            888667,
+            877417,
+            869208,
+            857000,
+            946500,
+            901250,
+            851708
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 59,
+          "samples_ns": [
+            1165750,
+            1171292,
+            1159291,
+            1153000,
+            1171375,
+            1178666,
+            1229833,
+            1147625,
+            1166792,
+            1138958,
+            1165791
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 77,
+          "samples_ns": [
+            2017500,
+            2029750,
+            2018709,
+            2047084,
+            2039125,
+            2006958,
+            2022333,
+            2007166,
+            2006667,
+            2010750,
+            2022084
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "int",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 33,
+          "samples_ns": [
+            2748375,
+            2729917,
+            2704958,
+            2720958,
+            2725875,
+            2714958,
+            2689542,
+            2815458,
+            2829625,
+            2879584,
+            2875792
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 64,
+          "samples_ns": [
+            791583,
+            814541,
+            803667,
+            796167,
+            805250,
+            799375,
+            794500,
+            790959,
+            790667,
+            793209,
+            790042
+          ]
+        },
+        {
+          "reducer": "Count",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 66,
+          "samples_ns": [
+            1095084,
+            1093250,
+            1077333,
+            1088166,
+            1090834,
+            1055167,
+            1084667,
+            1080375,
+            1106333,
+            1088000,
+            1115125
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 68,
+          "samples_ns": [
+            1038958,
+            1087417,
+            1063209,
+            1039750,
+            1037291,
+            1019500,
+            1018000,
+            1037208,
+            1027417,
+            1088291,
+            1057333
+          ]
+        },
+        {
+          "reducer": "Min",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 106,
+          "samples_ns": [
+            1595500,
+            1578417,
+            1575500,
+            1576750,
+            1616875,
+            1604292,
+            1590500,
+            1577000,
+            1569125,
+            1586500,
+            1577000
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": false,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 88,
+          "samples_ns": [
+            2241667,
+            2260792,
+            2295042,
+            2246125,
+            2266084,
+            2254792,
+            2265666,
+            2249625,
+            2227875,
+            2220458,
+            2187208
+          ]
+        },
+        {
+          "reducer": "Collect",
+          "values": "pair",
+          "history": true,
+          "keys": 50000,
+          "width": 8,
+          "allocation_calls": 248,
+          "samples_ns": [
+            6591958,
+            6598292,
+            6441125,
+            6437833,
+            6426083,
+            6460417,
+            6486167,
+            6536208,
+            6532292,
+            6656250,
+            6466583
+          ]
+        }
+      ]
+    ]
+  },
+  "binary_sha256": {
+    "baseline": "189e7d05a2246b0a7e4d8c40807a7f8a711a94c14d341db7ac0b52e4353963ec",
+    "order_buffers": "710c4ada83e09d480675100f36ce12a8668103d89275106d39d33a5be5603d57",
+    "batch_equality": "37da5344efa59e8dc8dbcf60409fa313c93f1c9e8f85c2503bb858b4c8b9fcfe"
+  },
+  "corgi_source_revision": "41e873124a850772a9c4f7df88be94e3163512ef",
+  "corgi_patch": "corgi-scalar-compare.patch",
+  "decision": "Keep order/buffer reuse, remove gathered equality from proposed runtime code. Underlying allocation-free scalar comparison is the prerequisite integration target. Indexed bulk comparison without operand gathers remains an unmeasured future option.",
+  "reproduction": "Apply ready DDIR reduce diff to master-next; compare to unmodified master-next and to ready diff + reduce-gather-equality-prototype.patch, all with the same local Corgi override. The order_buffers timing binary disabled the helper in place; final proposed source removes dead helper/dispatch/test code.",
+  "validation": "Full cargo test -p interactive -p ddir-server passed on retained order/buffer source, both with pinned Corgi and with local allocation-free Corgi; five existing ignored tests. All integration benchmark cases verified emitted columns and steady-state corrections."
+}
