@@ -9,6 +9,11 @@ The four-query `run.py` panel documented below remains a smaller control with
 independent graph oracles and hand-written physical plans. Its measurements
 are not directly interchangeable with the full suite's wider schema/plans.
 
+[Explicit IC6/BI5 alternatives](rewrites/README.md) compare join placement,
+reusable indexes, weighted sums and bounded ranking, with positive and negative
+results. `rewrites.py` runs them on the fixture, a deterministic synthetic graph,
+or an existing snapshot, and checks independently computed answers.
+
 ## Four-query control panel
 
 A small performance/correctness baseline for DDIR, through the real
@@ -91,8 +96,9 @@ inclusive interval. Reference implementations:
 All selected plans are installed once and import a shared graph program.
 Their common substrate symmetrizes friendships, attaches tag names, and maps
 people to countries; its load and maintenance costs are included. Even isolated
-controls retain this fixed substrate. This uses existing named-import semantics;
-it does not introduce native Corgi trace sharing or a new prepared-query feature.
+controls retain this fixed substrate. Corgi named imports reuse the producer's
+columnar arrangement by default. Plans are installed once; this is not a
+separate prepared-query API.
 
 Each round runs requests on the initial graph, retracts those bindings, removes
 a deterministic bounded set of friendship/tag/like edges, runs new requests on
@@ -184,10 +190,12 @@ python3 interactive/server/bench/ldbc/run.py --server target/debug/ddir_server \
 ```
 
 First optimization controls: IC6's expand-before-tag-filter plan, BI5's
-`collect`/`fold` sums, repeated scalar compilation/dispatch, and shared-import
-row/column conversion. Keep their patches independent and compare against this
-baseline before stacking them. The [full suite](SNB.md) adds recursive,
-optional, temporal and large-output cases on a separate shared substrate. This panel
+`collect`/`fold` sums, scalar evaluation/materialization between linear steps,
+and arrangement reuse (`DDIR_ARRANGED_IMPORTS=0`). Scalar plans now compile once,
+and default Corgi imports share arrangements. Keep patches independent and
+compare against this baseline before stacking them. The [full suite](SNB.md)
+adds recursive, optional, temporal and large-output cases on a separate shared
+substrate. This panel
 does not yet measure ad-hoc re-planning, parameterized BI, simultaneous bound-IC
 updates, or the official update stream. Empty strings are rejected by this narrow
 adapter; the full suite handles them through explicit source-shape contracts,

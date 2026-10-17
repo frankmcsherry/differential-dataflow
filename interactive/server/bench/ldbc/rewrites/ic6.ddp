@@ -1,0 +1,24 @@
+-- IC6 alternative: probe the requested tag before expanding authors' posts.
+-- Request and graph schemas, deduplication, ranking and result match ../ic6.ddp.
+let request = input 0 : ((int, int, List(int)) ; ());
+let edge = import "edge" : ((int) ; (int, int));
+let message = import "message" : ((int) ; (int, int, int));
+let tagged = import "tagged" : ((int) ; (List(int)));
+let one = request | key(((rid, pid, tag), ()) -> ((pid), (rid, tag)))
+    | join(edge, ((pid), (rid, tag), (q, _)) -> ((rid, pid, q, tag), ()));
+let two = one | key(((rid, origin, author, tag), ()) -> ((author), (rid, origin, tag)))
+    | join(edge, (_, (rid, origin, tag), (q, _)) -> ((rid, origin, q, tag), ()));
+let authors = (one + two) | filter(((_, origin, author, _), ()) -> (origin, author) ne) | distinct;
+let tagged_by_name = tagged | key((m, (name)) -> (name, m));
+let posts = message | filter((_, (kind, _, _)) -> (kind, 0) eq);
+let selected = request | key(((rid, _, tag), ()) -> (tag, rid))
+    | join(tagged_by_name, (tag, rid, m) -> (m, (rid, tag)))
+    | join(posts, ((m), (rid, tag), (_, creator, _)) -> ((creator, rid, tag), m))
+    | join(authors | key(((rid, _, author, tag), ()) -> ((author, rid, tag), ())),
+           ((_, rid, tag), m, ()) -> ((rid, m, tag), ())) | distinct;
+let counts = selected | key(((rid, m, tag), ()) -> ((m), (rid, tag)))
+    | join(tagged, (_, (rid, tag), (name)) -> ((rid, name, tag), ()))
+    | filter(((_, name, tag), ()) -> (name, tag) ne) | map(((rid, name, _), ()) -> ((rid, name), ())) | count;
+export "ic6.answer" = counts | key(((rid, name), n) -> (rid, (n neg, name)))
+    | collect | flatmap((_, vs) -> vs) | filter((_, (pos, _)) -> (pos, 10) lt)
+    | map((rid, (pos, (negn, name))) -> ((rid, pos), (name, negn neg)));

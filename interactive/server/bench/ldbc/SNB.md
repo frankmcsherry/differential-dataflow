@@ -117,8 +117,9 @@ bank entries are for transient request batches, not simultaneous BI bindings.
 All query programs are installed once. Every query imports the shared raw
 graph program and has a separate request input. Parameter-independent parts
 of an installed query remain as dataflows even when its request input is empty;
-their maintenance is included. Named imports currently cross the server's row
-boundary: this is not native Corgi arrangement sharing. Derived relations are
+their maintenance is included. Corgi named imports reuse the producer's
+columnar arrangement by default (`DDIR_ARRANGED_IMPORTS=0` disables this for
+attribution). Derived relations are
 not factored across different query programs.
 
 Each round visits the initial graph, changes it, and restores it. The witness
