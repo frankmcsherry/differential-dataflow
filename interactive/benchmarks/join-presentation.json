@@ -1,0 +1,221 @@
+{
+  "base_revision": "0b41ba7198048d7455d6d96c6021ee6c83f22a81",
+  "corgi_revision": "41e873124a850772a9c4f7df88be94e3163512ef",
+  "machine": "Apple M4, arm64, 16 GiB, macOS 26.1",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "join": {
+    "boundary": "Presentation pass including bridge checks over prebuilt native chunks, scalar u64 time, System allocator; 50000 keys, two values/key, 21 timed repetitions per run, three alternating before/after runs",
+    "runs": {
+      "before": [
+        [
+          {
+            "values": "int",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 68.5,
+            "allocation_calls": 100112,
+            "allocations_per_key": 2.0022
+          },
+          {
+            "values": "int",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 167.9,
+            "allocation_calls": 100126,
+            "allocations_per_key": 2.0025
+          },
+          {
+            "values": "pair",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 62.9,
+            "allocation_calls": 100140,
+            "allocations_per_key": 2.0028
+          },
+          {
+            "values": "pair",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 337.8,
+            "allocation_calls": 200238,
+            "allocations_per_key": 4.0048
+          }
+        ],
+        [
+          {
+            "values": "int",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 71.1,
+            "allocation_calls": 100112,
+            "allocations_per_key": 2.0022
+          },
+          {
+            "values": "int",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 174.9,
+            "allocation_calls": 100126,
+            "allocations_per_key": 2.0025
+          },
+          {
+            "values": "pair",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 63.7,
+            "allocation_calls": 100140,
+            "allocations_per_key": 2.0028
+          },
+          {
+            "values": "pair",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 338.8,
+            "allocation_calls": 200238,
+            "allocations_per_key": 4.0048
+          }
+        ],
+        [
+          {
+            "values": "int",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 69.8,
+            "allocation_calls": 100112,
+            "allocations_per_key": 2.0022
+          },
+          {
+            "values": "int",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 167.7,
+            "allocation_calls": 100126,
+            "allocations_per_key": 2.0025
+          },
+          {
+            "values": "pair",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 64.3,
+            "allocation_calls": 100140,
+            "allocations_per_key": 2.0028
+          },
+          {
+            "values": "pair",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 319.7,
+            "allocation_calls": 200238,
+            "allocations_per_key": 4.0048
+          }
+        ]
+      ],
+      "after": [
+        [
+          {
+            "values": "int",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 55.7,
+            "allocation_calls": 112,
+            "allocations_per_key": 0.0022
+          },
+          {
+            "values": "int",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 166.3,
+            "allocation_calls": 126,
+            "allocations_per_key": 0.0025
+          },
+          {
+            "values": "pair",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 50.2,
+            "allocation_calls": 140,
+            "allocations_per_key": 0.0028
+          },
+          {
+            "values": "pair",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 310.2,
+            "allocation_calls": 252,
+            "allocations_per_key": 0.005
+          }
+        ],
+        [
+          {
+            "values": "int",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 55.8,
+            "allocation_calls": 112,
+            "allocations_per_key": 0.0022
+          },
+          {
+            "values": "int",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 162.9,
+            "allocation_calls": 126,
+            "allocations_per_key": 0.0025
+          },
+          {
+            "values": "pair",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 49.8,
+            "allocation_calls": 140,
+            "allocations_per_key": 0.0028
+          },
+          {
+            "values": "pair",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 306.4,
+            "allocation_calls": 252,
+            "allocations_per_key": 0.005
+          }
+        ],
+        [
+          {
+            "values": "int",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 55.6,
+            "allocation_calls": 112,
+            "allocations_per_key": 0.0022
+          },
+          {
+            "values": "int",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 163.3,
+            "allocation_calls": 126,
+            "allocations_per_key": 0.0025
+          },
+          {
+            "values": "pair",
+            "chunks": 1,
+            "keys": 50000,
+            "median_ns_per_key": 49.9,
+            "allocation_calls": 140,
+            "allocations_per_key": 0.0028
+          },
+          {
+            "values": "pair",
+            "chunks": 4,
+            "keys": 50000,
+            "median_ns_per_key": 309.5,
+            "allocation_calls": 252,
+            "allocations_per_key": 0.005
+          }
+        ]
+      ]
+    },
+    "before_binary_sha256": "f8ad87de30d4557a531d2aac97f316c50395209b55c4d7a158f320684dec05fd",
+    "after_binary_sha256": "15c66799b5379579446418bd9f9b3e0fd188fe2971419bab9b119b8a19bf9381"
+  }
+}
