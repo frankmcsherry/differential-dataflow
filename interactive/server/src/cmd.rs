@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use interactive::ir::{eval, Diff, Value};
+use interactive::ingest::ColumnBatch;
 use interactive::scope_ir::{Program, Source};
 use interactive::server::{Command as ServerCommand, InputUpdate, OuterTime};
 
@@ -77,6 +78,10 @@ pub enum Cmd {
         input: usize,
         updates: Vec<InputUpdate>,
     },
+    /// Header for an exact-length binary column frame, read by the session transport.
+    ColumnFrame { prog: String, input: usize, bytes: usize },
+    FeedColumns { prog: String, input: usize, batch: ColumnBatch },
+    ColumnFile { prog: String, input: usize, path: String },
     /// Fill one program input from a source the server reads itself — a recipe
     /// (`random:…`, `iota:N`) or a file of integer rows — each worker taking its
     /// shard, so no row crosses the wire. `feed <prog> <in#> from <source>`.
@@ -171,6 +176,9 @@ pub fn prepare(command: Cmd) -> Result<PreparedCommand, String> {
             input,
             updates,
         },
+        Cmd::ColumnFrame { .. } => return Err("columns: binary payload required (WebSocket: send header and payload in one binary message)".into()),
+        Cmd::FeedColumns { prog, input, batch } => ServerCommand::FeedColumns { prog, input, batch },
+        Cmd::ColumnFile { prog, input, path } => ServerCommand::LoadColumns { prog, input, path, max_batch_bytes: max_feed_bytes() },
         Cmd::Source { prog, input, source } => ServerCommand::Load { prog, input, source },
         Cmd::Bind { trace, prog, input } => ServerCommand::Bind { trace, prog, input },
         Cmd::Unbind { trace, prog, input } => ServerCommand::Unbind { trace, prog, input },
@@ -283,11 +291,18 @@ fn max_program_bytes() -> usize {
 
 /// A framed feed is accumulated on its session thread before admission. Keep
 /// that buffering bounded while allowing the 100k-row performance regime.
-fn max_feed_bytes() -> usize {
+pub fn max_feed_bytes() -> usize {
     std::env::var("DDIR_MAX_FEED_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(16 * 1024 * 1024)
+}
+
+/// Decode a complete session payload off the worker threads.
+pub fn column_payload(prog: String, input: usize, bytes: &[u8]) -> Result<Cmd, String> {
+    let batch = ColumnBatch::decode(bytes)?;
+    batch.check_declared_rows(max_feed_bytes() as u64)?;
+    Ok(Cmd::FeedColumns { prog, input, batch })
 }
 
 struct PendingLoad {
@@ -621,6 +636,18 @@ fn parse_cmd(cmd: &str, args: &[&str]) -> ParseOutcome {
             }
         }
         "feed" => {
+            if let [prog, input, "columns", "from", path] = args {
+                return match input.parse() {
+                    Ok(input) => ParseOutcome::Cmd(Cmd::ColumnFile { prog: (*prog).into(), input, path: (*path).into() }),
+                    Err(_) => ParseOutcome::Err("columns: input must be a number".into()),
+                };
+            }
+            if let [prog, input, "columns", bytes] = args {
+                return match (input.parse(), bytes.parse()) {
+                    (Ok(input), Ok(bytes)) => ParseOutcome::Cmd(Cmd::ColumnFrame { prog: (*prog).into(), input, bytes }),
+                    _ => ParseOutcome::Err("columns: input and byte count must be nonnegative integers".into()),
+                };
+            }
             if let [prog, input, "begin"] = args {
                 let input = match input.parse() {
                     Ok(input) => input,

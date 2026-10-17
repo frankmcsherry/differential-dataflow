@@ -13,7 +13,8 @@
 //! reaches a worker. This does not make execution safe for arbitrary data:
 //! violating an input/import shape ascription panics inside a dataflow operator
 //! on either backend and can take down the shared server, disconnecting other
-//! clients. Feed acknowledgements do not check these contracts, and there is
+//! clients. Compatibility row feeds do not check these contracts at admission; native
+//! column feeds check their shape at the batch boundary. There is
 //! no per-program failure isolation. [`Command`] is serializable so worker 0
 //! can broadcast one ordered command stream to the whole worker group.
 //!
@@ -63,6 +64,7 @@ use timely::worker::Worker;
 use crate::backend::corgi::render_tree_rows;
 use crate::backend::vec::render_tree_arranged;
 use crate::ir::{Diff, Value};
+use crate::ingest::ColumnBatch;
 use crate::scope_ir as st;
 
 /// The host (outer) timestamp shared across all installed programs.
@@ -482,6 +484,10 @@ pub enum Command {
         input: usize,
         updates: Vec<InputUpdate>,
     },
+    /// Native columns, staged at the current epoch. Shard before worker transport.
+    FeedColumns { prog: String, input: usize, batch: ColumnBatch },
+    /// A local stream of DDIRCOL1 batches. Collective, with bounded per-batch memory.
+    LoadColumns { prog: String, input: usize, path: String, max_batch_bytes: usize },
     /// Fill positional `input` of `prog` from `source` — a recipe name or a
     /// file path — at the current epoch. Collective: every worker feeds its
     /// own shard of the rows (see [`Server::load`]).
@@ -1218,6 +1224,55 @@ impl Server {
             handle.update_at((update.key, update.val), time, update.diff);
         }
         Ok(())
+    }
+
+    /// Stage native columns at the current epoch. Requires an input shape ascription, checked
+    /// at the batch boundary before staging. The Corgi backend takes ownership without creating rows;
+    /// the Vec reference backend converts at this boundary. Does not advance time.
+    pub fn feed_columns(&mut self, prog: &str, input: usize, batch: ColumnBatch) -> Result<(), String> {
+        let time = self.epoch;
+        self.validate_feed(prog, input, time)?;
+        let installed = self.programs.get_mut(&canonical_source_name(prog)).unwrap();
+        let expected = installed.input_shapes.get(&input)
+            .ok_or("native columns require an input shape ascription")?;
+        let shape = batch.shape();
+        if shape != *expected {
+            return Err(format!("input {input}: columns have shape {}, expected {}", fmt_shape(&shape), fmt_shape(expected)));
+        }
+        let container = batch.into_container(time);
+        match installed.inputs.get_mut(&input).unwrap() {
+            ServerInput::Columns(handle) => handle.give(container),
+            ServerInput::Rows(handle) => {
+                for (row, _, diff) in container.into_updates() { handle.update_at(row, time, diff); }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a local file of concatenated column batches at the current epoch. Every worker reads
+    /// the same immutable file and feeds its own shard. Each batch is checked before feeding it.
+    /// If a later batch fails, the complete prefix remains staged; the error reports that prefix.
+    /// As with streaming session batches, only a subsequent tick makes staged input complete.
+    pub fn load_columns(&mut self, worker: &Worker, prog: &str, input: usize, path: &str, max_batch_bytes: usize) -> Result<u64, String> {
+        self.validate_feed(prog, input, self.epoch)?;
+        let file = std::fs::File::open(path).map_err(|e| format!("column file {path:?}: {e}"))?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut rows = 0usize;
+        loop {
+            let result = ColumnBatch::read_next(&mut reader, max_batch_bytes).and_then(|batch| {
+                if let Some(batch) = batch {
+                    let n = batch.len();
+                    let shard = if worker.peers() == 1 { batch } else { batch.shard(worker.index(), worker.peers(), rows) };
+                    self.feed_columns(prog, input, shard)?;
+                    Ok(Some(n))
+                } else { Ok(None) }
+            });
+            match result {
+                Ok(Some(n)) => rows += n,
+                Ok(None) => return Ok(rows as u64),
+                Err(e) => return Err(format!("column file {path:?}: {e}; {rows} complete rows staged before failure")),
+            }
+        }
     }
 
     /// Bulk-load rows into positional `input` of `prog` at the current epoch.

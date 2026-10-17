@@ -96,6 +96,9 @@ For the full command vocabulary — `load`, `feed`, `tick`, `peek`, `tail`, and 
 [`examples/server/README.md`](examples/server/README.md), and `server/README.md` for the
 protocol and configuration.
 
+For native column batches from sessions, local files, or an embedding, see
+[Native ingress](INGEST.md).
+
 ## Status
 
 This is a research project, primarily for personal learning at this point.

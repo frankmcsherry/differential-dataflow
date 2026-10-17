@@ -13,16 +13,16 @@ defaults. Diagnostics are disabled by default so an idle server can park;
 `DDIR_DIAG_PORT` (default 51371). `DDIR_WORKERS` selects the number of worker
 threads (default 1), and `DDIR_BACKEND=vec|corgi` selects the renderer for installed
 programs (default `vec`). With the Corgi backend, exports are kept as traces of
-Corgi chunks rather than rows (less memory); `peek`, `tail`, `bind` and other
-programs' imports still read them as rows. `DDIR_COLUMNAR_EXPORTS=0` keeps row traces.
+Corgi chunks. Imports reuse the producer's arrangement, and `bind` carries
+columnar changes into its target input. `peek` and `tail` materialize rows for
+the text protocol. `DDIR_COLUMNAR_EXPORTS=0` keeps row traces;
+`DDIR_ARRANGED_IMPORTS=0` disables arrangement reuse as an attribution control.
 
-One backend is selected for the whole server. The current registry is a
-transitional row-speaking bridge: inputs and imports convert from `Value` rows
-to Corgi columns at a program boundary, and exports convert back before they
-become shareable traces. A Corgi program stays columnar between those
-boundaries, but a production Corgi server should replace the bridge with native
-columnar inputs and traces. Columnar exports are the first step on the export side:
-the published trace is columnar, and rows are made only when it is read.
+One backend is selected for the whole server. Text feeds still parse `Value`
+rows and convert them to columns at ingress. Generated sources produce native
+columns. With the default Corgi settings, inputs, inter-program imports,
+exports, and bindings stay columnar inside the dataflow; clients requesting
+text answers pay the row conversion at egress.
 
 Worker 0 admits one FIFO control stream and routes one ordered record to every
 worker. Small commands are replicated; framed input batches are partitioned by
@@ -120,6 +120,15 @@ recursive view, see `demo/txn.txt`). Racing writes settle identically on
 every replay. Identity is convention, not enforcement: we are not defending
 against adversarial clients yet, and server-side attribution is deliberately
 deferred until a deployment needs it.
+
+## Native columnar input
+
+[Native ingress](../INGEST.md) accepts key/value/difference columns through
+`Server::feed_columns`, binary TCP/stdin/WebSocket uploads, and local files of
+column batches (`feed <prog> <in#> columns from <path>`). Inputs declare their
+shapes, and the current epoch applies to the whole batch. Corgi receives the
+columns directly; the Vec reference backend converts at ingress. A following
+`tick` still establishes completion.
 
 ## Requests as input rows
 

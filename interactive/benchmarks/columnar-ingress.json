@@ -1,0 +1,115 @@
+{
+  "base_revision": "0b41ba7198048d7455d6d96c6021ee6c83f22a81",
+  "corgi_revision": "41e873124a850772a9c4f7df88be94e3163512ef",
+  "machine": "Apple M4, arm64, 16 GiB, macOS 26.1",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "native_ingress_followup": {
+    "rows": 6001215,
+    "batches": 92,
+    "rows_per_batch": 65536,
+    "revenue_1e4": 1231410782283,
+    "binary_sha256": "f3d1737db36dbe16af68e2dae349025910591bc1100fcc7f4b6657cc93cf4810",
+    "source_sha256": "7ced2f0b485c847d2fd2641abcad487e1655e5c0a953e6cee865f34ce70f7403",
+    "projection_sha256": "02c1a9093474ae77009921e64b143f949954b2ce6581d21bcd6bfd679497cb96",
+    "column_file_sha256": "9d58d2a4cc0324e28111206a3bcc1aa09c1f2271b0f0e8e2a280a708d3713580",
+    "allocator": "System; same process/allocator for text-file, column-file and native controls",
+    "timing": "1 warmup + 7 measured repetitions. Plan install, snapshots and teardown excluded. Native columns/difference vectors prepared before timing; timestamp construction included. File read/decode included. Warm file cache. One worker.",
+    "runs": {
+      "weighted": {
+        "native_columns": {
+          "samples_ms": [
+            15.433667,
+            15.462333,
+            15.443208,
+            15.414541999999999,
+            15.377125,
+            15.426,
+            15.407792
+          ],
+          "median_ms": 15.426
+        },
+        "column_file": {
+          "samples_ms": [
+            31.425874999999998,
+            31.217583,
+            31.031042,
+            31.232375,
+            31.997584000000003,
+            31.622958,
+            31.428749999999997
+          ],
+          "median_ms": 31.425874999999998
+        },
+        "text_file": {
+          "samples_ms": [
+            635.421167,
+            626.054333,
+            620.371125,
+            617.8412500000001,
+            608.67425,
+            628.883833,
+            631.5805
+          ],
+          "median_ms": 626.054333
+        }
+      },
+      "segmented": {
+        "native_columns": {
+          "samples_ms": [
+            19.871583,
+            19.328416,
+            19.374084,
+            19.32475,
+            19.341333,
+            19.198541,
+            19.448334000000003
+          ],
+          "median_ms": 19.341333
+        },
+        "text_file": {
+          "samples_ms": [
+            639.109458,
+            621.191417,
+            630.339209,
+            626.761166,
+            621.523958,
+            611.457458,
+            610.432833
+          ],
+          "median_ms": 621.523958
+        }
+      },
+      "collect": {
+        "native_columns": {
+          "samples_ms": [
+            43.41375,
+            42.780167,
+            42.811084,
+            43.008625,
+            43.598625,
+            43.654125,
+            43.318208
+          ],
+          "median_ms": 43.318208
+        },
+        "text_file": {
+          "samples_ms": [
+            667.0967089999999,
+            653.4424170000001,
+            636.958792,
+            642.51175,
+            639.49925,
+            638.5487079999999,
+            661.22525
+          ],
+          "median_ms": 642.51175
+        }
+      }
+    },
+    "ldbc_4_workers": {
+      "mixed": "passed: 41 reads, both backends",
+      "maintained": "passed: 41 reads, both backends"
+    },
+    "rust_checks": "cargo test -p interactive -p ddir-server passed; existing ignored tests remain ignored"
+  }
+}

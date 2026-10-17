@@ -54,6 +54,23 @@ impl Work {
     fn distribute(self, peers: usize) -> Vec<(u64, Work)> {
         match self {
             Work::Request {
+                token, reqid, connection_id,
+                command: Ok(PreparedCommand::Server(ServerCommand::FeedColumns { prog, input, batch })),
+                ..
+            } => {
+                let logical_count = batch.len();
+                if peers == 1 {
+                    return vec![(0, Work::Request { token, reqid, connection_id, logical_count: Some(logical_count),
+                        command: Ok(PreparedCommand::Server(ServerCommand::FeedColumns { prog, input, batch })) })];
+                }
+                (0..peers).map(|target| (target as u64, Work::Request {
+                    token, reqid: reqid.clone(), connection_id, logical_count: Some(logical_count),
+                    command: Ok(PreparedCommand::Server(ServerCommand::FeedColumns {
+                        prog: prog.clone(), input, batch: batch.shard(target, peers, 0),
+                    })),
+                })).collect()
+            }
+            Work::Request {
                 token,
                 reqid,
                 command:
@@ -337,6 +354,11 @@ fn dispatch(
                     server.epoch()
                 )
             }),
+            ServerCommand::FeedColumns { prog, input, batch } => server.feed_columns(&prog, input, batch)
+                .map(|()| format!("fed {} columnar rows to {:?} input {} at t={}", logical_count.unwrap(), prog, input, server.epoch())),
+            ServerCommand::LoadColumns { prog, input, path, max_batch_bytes } => server
+                .load_columns(worker, &prog, input, &path, max_batch_bytes)
+                .map(|rows| format!("loaded {rows} columnar rows into {prog:?} input {input}")),
             // Collective: every worker sources its own shard.
             ServerCommand::Load { prog, input, source } => server
                 .load(worker, &prog, input, &source)
@@ -538,4 +560,34 @@ fn send(sender: &Sender<String>, reqid: &str, kind: &str, body: String) {
         format!(" {}", body)
     };
     let _ = sender.send(format!("{} {}{}\n", reqid, kind, suffix));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use interactive::ingest::{Column, ColumnBatch};
+
+    #[test]
+    fn column_work_round_trips_and_is_sharded_before_transport() {
+        let batch = ColumnBatch::new(Column::i64((0..11).collect()), Column::Unit(11), (-5..6).collect()).unwrap();
+        let work = Work::Request { token: 7, reqid: "native".into(), connection_id: 3, logical_count: None,
+            command: Ok(PreparedCommand::Server(ServerCommand::FeedColumns { prog: "p".into(), input: 0, batch })) };
+        let decoded: Work = bincode::deserialize(&bincode::serialize(&work).unwrap()).unwrap();
+        let shards = decoded.distribute(4);
+        assert_eq!(shards.len(), 4);
+        let mut all = Vec::new();
+        for (target, work) in shards {
+            let decoded: Work = bincode::deserialize(&bincode::serialize(&work).unwrap()).unwrap();
+            let Work::Request { logical_count, command: Ok(PreparedCommand::Server(ServerCommand::FeedColumns { batch, .. })), .. } = decoded
+                else { panic!("expected column work") };
+            assert_eq!(logical_count, Some(11));
+            assert!(batch.len() <= 3);
+            for (&key, &diff) in batch.keys().as_i64("test").unwrap().iter().zip(batch.diffs()) {
+                assert_eq!(key as u64 % 4, target);
+                all.push((key, diff));
+            }
+        }
+        all.sort();
+        assert_eq!(all, (0..11).map(|k| (k, k - 5)).collect::<Vec<_>>());
+    }
 }

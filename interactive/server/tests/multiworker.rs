@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 struct ServerProcess {
     child: Child,
     stderr: Option<thread::JoinHandle<String>>,
+    ws_address: String,
 }
 
 impl ServerProcess {
@@ -110,6 +111,7 @@ fn start_server(backend: &str, workers: usize) -> (ServerProcess, TcpStream, Buf
         .unwrap();
     let stderr = child.stderr.take().expect("server stderr is piped");
     let (ready_tx, ready_rx) = sync_channel(1);
+    let (ws_tx, ws_rx) = sync_channel(1);
     let stderr = thread::spawn(move || {
         let mut output = String::new();
         for line in BufReader::new(stderr).lines() {
@@ -123,15 +125,20 @@ fn start_server(backend: &str, workers: usize) -> (ServerProcess, TcpStream, Buf
             if let Some(address) = line.strip_prefix("ddir_server: tcp listening on ") {
                 let _ = ready_tx.send(address.to_string());
             }
+            if let Some(address) = line.strip_prefix("ddir_server: ws listening on ") {
+                let _ = ws_tx.send(address.to_string());
+            }
             output.push_str(&line);
             output.push('\n');
         }
         output
     });
-    let server = ServerProcess {
+    let mut server = ServerProcess {
         child,
         stderr: Some(stderr),
+        ws_address: String::new(),
     };
+    server.ws_address = ws_rx.recv_timeout(Duration::from_secs(10)).expect("server did not announce WebSocket listener");
     let address = ready_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("server did not announce its TCP listener");
@@ -142,6 +149,108 @@ fn start_server(backend: &str, workers: usize) -> (ServerProcess, TcpStream, Buf
     let writer = stream.try_clone().unwrap();
     let reader = BufReader::new(stream);
     (server, writer, reader)
+}
+
+#[test]
+fn native_columns_over_websocket_binary_message() {
+    use interactive::ingest::{Column, ColumnBatch};
+    use tungstenite::Message;
+    let (server, writer, reader) = start_server("corgi", 4);
+    let stream = TcpStream::connect(&server.ws_address).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let (mut ws, _) = tungstenite::client(format!("ws://{}/", server.ws_address), stream).unwrap();
+    let mut command = |message: Message, reqid: &str| {
+        ws.send(message).unwrap();
+        let mut rows = Vec::new();
+        loop {
+            if let Message::Text(line) = ws.read().unwrap() {
+                if let Some(body) = line.strip_prefix(&format!("{reqid} data ")) { rows.push(body.to_string()); }
+                else if line.starts_with(&format!("{reqid} ok")) { return rows; }
+                else { assert!(!line.starts_with(&format!("{reqid} err")), "{line}"); }
+            }
+        }
+    };
+    command(Message::Text("l load p begin\nlet x = input 0 : ((int) ; ()); export \"x\" = x;\nl end-load".into()), "l");
+    let batch = ColumnBatch::new(Column::Prod(vec![Column::i64(vec![7, 9])]), Column::Unit(2), vec![1, -1]).unwrap().encode();
+    let mut message = format!("c feed p 0 columns {}\n", batch.len()).into_bytes();
+    message.extend(batch);
+    command(Message::Binary(message.into()), "c");
+    command(Message::Text("t tick".into()), "t");
+    assert_eq!(command(Message::Text("p peek x".into()), "p"), [
+        "diff=1 key=Tuple([Int(7)]) val=Tuple([])",
+        "diff=-1 key=Tuple([Int(9)]) val=Tuple([])",
+    ]);
+    drop(command);
+    ws.close(None).unwrap();
+    drop(reader);
+    drop(writer);
+    server.stop();
+}
+
+#[test]
+fn native_column_sessions_and_local_files() {
+    use interactive::ingest::{Column, ColumnBatch};
+    let make = |keys: Vec<i64>, diff| {
+        let n = keys.len();
+        ColumnBatch::new(Column::Prod(vec![Column::i64(keys)]), Column::Unit(n), vec![diff; n]).unwrap()
+    };
+    for backend in ["vec", "corgi"] {
+        for workers in [1, 4] {
+            let (server, mut writer, mut reader) = start_server(backend, workers);
+            request(&mut writer, &mut reader, "l", "l load p begin\nlet x = input 0 : ((int) ; ()); export \"x\" = x;\nl end-load\n");
+            let payload = make((0..11).collect(), 1).encode();
+            writer.write_all(format!("c feed p 0 columns {}\n", payload.len()).as_bytes()).unwrap();
+            // Network fragmentation does not change frame boundaries.
+            for part in payload.chunks(7) { writer.write_all(part).unwrap(); }
+            request(&mut writer, &mut reader, "c", "");
+            assert!(request(&mut writer, &mut reader, "p", "p peek x\n").is_empty());
+            request(&mut writer, &mut reader, "t", "t tick\n");
+            let expected: Vec<_> = (0..11).map(|k| format!("diff=1 key=Tuple([Int({k})]) val=Tuple([])")).collect();
+            assert_eq!(request(&mut writer, &mut reader, "p", "p peek x\n"), expected);
+
+            let path = std::env::temp_dir().join(format!("ddir-columns-{}-{backend}-{workers}.col", std::process::id()));
+            {
+                let mut file = std::fs::File::create(&path).unwrap();
+                // Several short batches, including one shorter than the worker count.
+                make((0..3).collect(), -1).write_to(&mut file).unwrap();
+                make((3..11).collect(), -1).write_to(&mut file).unwrap();
+            }
+            request(&mut writer, &mut reader, "f", &format!("f feed p 0 columns from {}\n", path.display()));
+            request(&mut writer, &mut reader, "t", "t tick\n");
+            assert!(request(&mut writer, &mut reader, "p", "p peek x\n").is_empty());
+
+            // A corrupt frame is rejected after consuming its exact body; the following text
+            // command is still aligned and no part of the bad frame was staged.
+            let mut corrupt = payload;
+            corrupt[0] = 0;
+            writer.write_all(format!("bad feed p 0 columns {}\n", corrupt.len()).as_bytes()).unwrap();
+            writer.write_all(&corrupt).unwrap();
+            writer.flush().unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("bad err "), "{line}");
+            request(&mut writer, &mut reader, "t", "t tick\n");
+            assert!(request(&mut writer, &mut reader, "p", "p peek x\n").is_empty());
+
+            // A file is a batch stream: an invalid suffix does not erase its complete prefix.
+            {
+                let mut file = std::fs::File::create(&path).unwrap();
+                make(vec![100], 1).write_to(&mut file).unwrap();
+                file.write_all(b"DDIRCOL1").unwrap();
+            }
+            writer.write_all(format!("badfile feed p 0 columns from {}\n", path.display()).as_bytes()).unwrap();
+            writer.flush().unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with("badfile err ") && line.contains("1 complete rows staged"), "{line}");
+            request(&mut writer, &mut reader, "t", "t tick\n");
+            assert_eq!(request(&mut writer, &mut reader, "p", "p peek x\n"), ["diff=1 key=Tuple([Int(100)]) val=Tuple([])"]);
+            std::fs::remove_file(path).unwrap();
+            drop(reader);
+            drop(writer);
+            server.stop();
+        }
+    }
 }
 
 fn assert_backend(backend: &str) {

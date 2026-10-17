@@ -260,7 +260,7 @@ where
 /// announces the session's end through the same control FIFO so the workers
 /// can tear down any tails this session initiated.
 fn run_session<R: BufRead, W: Write + Send + 'static>(
-    input: R,
+    mut input: R,
     output: W,
     control: ControlHandle,
     connection_id: ConnectionId,
@@ -279,17 +279,36 @@ fn run_session<R: BufRead, W: Write + Send + 'static>(
     });
 
     let mut parser = LineParser::new();
-    for line in input.lines() {
-        let Ok(line) = line else {
-            break;
-        };
+    loop {
+        let mut line = String::new();
+        if input.read_line(&mut line).map_or(true, |n| n == 0) { break; }
         if let Some(parsed) = parser.feed(&line) {
+            let mut end_session = false;
+            let parsed = match parsed {
+                (reqid, Ok(cmd::Cmd::ColumnFrame { prog, input: target, bytes })) => {
+                    let command = if bytes > cmd::max_feed_bytes() {
+                        // The body cannot be mistaken for command lines. End this session after
+                        // reporting the bound, rather than buffering/draining an unbounded body.
+                        end_session = true;
+                        Err(format!("columns: {bytes} bytes exceeds DDIR_MAX_FEED_BYTES"))
+                    } else {
+                        let mut payload = vec![0; bytes];
+                        match input.read_exact(&mut payload) {
+                            Ok(()) => cmd::column_payload(prog, target, &payload),
+                            Err(e) => { end_session = true; Err(format!("columns: incomplete payload: {e}")) }
+                        }
+                    };
+                    (reqid, command)
+                }
+                parsed => parsed,
+            };
             // For stdin, `exit` terminates the whole server; for TCP, it
             // terminates only this session. Either way the reader stops.
             match dispatch(parsed, &control, &resp_tx, connection_id) {
                 Dispatch::Continue => {}
                 Dispatch::Exit | Dispatch::Disconnected => break,
             }
+            if end_session { break; }
         }
     }
     // The reader loop is done — the client is gone (or asked to exit).
@@ -388,6 +407,31 @@ fn run_ws_session(stream: TcpStream, control: ControlHandle) -> Result<(), tungs
         }
 
         match ws.read() {
+            Ok(tungstenite::Message::Binary(frame)) => {
+                // One binary message is exactly one header line followed by its column frame.
+                // Existing text load/feed bodies retain their line-oriented framing.
+                let parsed = if parser.awaiting_body() {
+                    ("columns".into(), Err("columns: finish the pending text body first".into()))
+                } else if let Some(newline) = frame.iter().position(|&b| b == b'\n') {
+                    let mut header_parser = LineParser::new();
+                    let header = std::str::from_utf8(&frame[..newline]);
+                    match header.ok().and_then(|h| header_parser.feed(h)) {
+                        Some((reqid, Ok(cmd::Cmd::ColumnFrame { prog, input, bytes }))) => {
+                            let payload = &frame[newline + 1..];
+                            let result = if bytes != payload.len() || bytes > cmd::max_feed_bytes() {
+                                Err("columns: binary message length mismatch or exceeds DDIR_MAX_FEED_BYTES".into())
+                            } else { cmd::column_payload(prog, input, payload) };
+                            (reqid, result)
+                        }
+                        Some((reqid, _)) => (reqid, Err("columns: expected a feed columns header".into())),
+                        None => ("columns".into(), Err("columns: expected a UTF-8 header".into())),
+                    }
+                } else { ("columns".into(), Err("columns: missing header line".into())) };
+                match dispatch(parsed, &control, &resp_tx, connection_id) {
+                    Dispatch::Continue => {},
+                    Dispatch::Exit | Dispatch::Disconnected => should_exit = true,
+                }
+            }
             Ok(tungstenite::Message::Text(text)) => {
                 // One WS message may carry multiple lines (e.g., a
                 // multi-line load body sent as a single message). Split
@@ -409,7 +453,7 @@ fn run_ws_session(stream: TcpStream, control: ControlHandle) -> Result<(), tungs
                 }
             }
             Ok(tungstenite::Message::Close(_)) => break,
-            Ok(_) => {} // ping/pong/binary/frame — ignore for v0
+            Ok(_) => {} // ping/pong/frame
             Err(tungstenite::Error::Io(e))
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
