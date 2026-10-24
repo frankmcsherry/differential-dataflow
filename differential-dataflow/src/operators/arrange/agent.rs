@@ -244,6 +244,23 @@ impl<Tr: TraceReader> TraceAgent<Tr> {
         |context| { let trace = context.trace::<Tr>(); Self::new(trace, context.info, context.logger) }
     }
 
+    /// A factory for an agent that is never imported: the same type as an importable one, but
+    /// with no listener queues, so its writer, like a [`TraceLocal`]'s, does not need the writing
+    /// operator to run on frontier advances that bring no data.
+    ///
+    /// For callers that hold arrangements of one type, some published and some not. Importing a
+    /// trace built this way is a logic error: the importer would hear of no new spans.
+    pub fn local_factory() -> impl FnOnce(ArrangeContext) -> (Self, TraceWriter<Tr>)
+    where
+        Tr: Trace,
+    {
+        |context| {
+            let trace = context.trace::<Tr>();
+            let (inner, writer) = TraceLocal::build(trace, context.info, context.logger, None);
+            (TraceAgent { inner, queues: Weak::new() }, writer)
+        }
+    }
+
     /// Attaches a new shared queue to the trace.
     ///
     /// The queue is first populated with existing batches from the trace,
