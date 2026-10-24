@@ -42,7 +42,9 @@ pub(crate) trait Backend {
 
     /// `shape` is the input's row shape, as install inferred it.
     fn linear<'s>(c: Collection<'s, Time, Self::Container>, ops: Vec<LinearOp>, level: usize, shape: st::RowShape) -> Collection<'s, Time, Self::Container>;
-    fn arrange<'s>(c: Collection<'s, Time, Self::Container>) -> Self::Arr<'s>;
+    /// `published` arrangements can be imported by other programs, so their operators run on
+    /// every frontier advance; the others run only when they have data.
+    fn arrange<'s>(c: Collection<'s, Time, Self::Container>, published: bool) -> Self::Arr<'s>;
     /// Bring an arrangement into a child region. Regions share the timestamp, so this shares
     /// the trace rather than rebuilding it.
     fn enter_region<'s, 'r>(a: Self::Arr<'s>, region: Scope<'r, Time>) -> Self::Arr<'r>;
@@ -53,7 +55,7 @@ pub(crate) trait Backend {
     /// as data; `shapes` are the stream's and the arrangement's row shapes.
     fn half_join<'s>(stream: Collection<'s, Time, Self::Container>, arrangement: Self::Arr<'s>, strict: bool, projection: &Lambda, level: usize, shapes: (st::RowShape, st::RowShape)) -> Collection<'s, Time, Self::Container>;
     /// `shape` is the input's row shape.
-    fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer, shape: st::RowShape) -> Self::Arr<'s>;
+    fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer, shape: st::RowShape, published: bool) -> Self::Arr<'s>;
     fn inspect<'s>(c: Collection<'s, Time, Self::Container>, label: String) -> Collection<'s, Time, Self::Container>;
     fn leave_dynamic<'s>(c: Collection<'s, Time, Self::Container>, depth: usize) -> Collection<'s, Time, Self::Container>;
 }
@@ -111,10 +113,15 @@ impl<'s, B: Backend> Rendered<'s, B> {
             Rendered::Arrangement(a) => B::as_collection(a.clone()),
         }
     }
+    /// The value as an arrangement, arranged here if it is a collection, for this scope's own use.
     pub(crate) fn arrange(&self) -> B::Arr<'s> {
+        self.arrange_as(false)
+    }
+    /// As `arrange`, publishing the arrangement it builds if `published`.
+    pub(crate) fn arrange_as(&self, published: bool) -> B::Arr<'s> {
         match self {
             Rendered::Arrangement(a) | Rendered::Both(a, _) => a.clone(),
-            Rendered::Collection(c) => B::arrange(c.clone()),
+            Rendered::Collection(c) => B::arrange(c.clone(), published),
         }
     }
 }
@@ -215,6 +222,17 @@ pub(crate) fn render_scope<'s, B: Backend>(
         var_cols.push(col);
     }
 
+    // The root's exported items are published: those an export names, and through an `arrange`
+    // of an arrangement (which returns it as it is) the item that built it. Everything else,
+    // and everything in a child scope, is the program's own.
+    let mut published = vec![false; s.items.len()];
+    if depth == 0 {
+        let mut pending: Vec<usize> = s.exports.iter().filter_map(|e| match e.value { st::Ref::Local(i) => Some(i), _ => None }).collect();
+        while let Some(i) = pending.pop() {
+            if std::mem::replace(&mut published[i], true) { continue; }
+            if let st::Item::Op(st::Node::Arrange(st::Ref::Local(j))) = &s.items[i] { pending.push(*j); }
+        }
+    }
     let labels = (s.labels.len() == s.items.len()).then_some(&s.labels);
     let label_logger = labels.and_then(|_| scope.worker().logger_for::<LabelEventBuilder>("ddir/labels"));
     let mut items: Vec<RItem<'s, B>> = Vec::new();
@@ -232,7 +250,7 @@ pub(crate) fn render_scope<'s, B: Backend>(
                         for r in &refs[1..] { c = c.concat(resolve(&items, &imports, &var_cols, r).collection()); }
                         Rendered::Collection(c)
                     },
-                    st::Node::Arrange(r) => Rendered::Arrangement(resolve(&items, &imports, &var_cols, r).arrange()),
+                    st::Node::Arrange(r) => Rendered::Arrangement(resolve(&items, &imports, &var_cols, r).arrange_as(published[index])),
                     st::Node::Join { left, right, projection } => {
                         let l = resolve(&items, &imports, &var_cols, left).arrange();
                         let r = resolve(&items, &imports, &var_cols, right).arrange();
@@ -250,12 +268,12 @@ pub(crate) fn render_scope<'s, B: Backend>(
                         let c = resolve(&items, &imports, &var_cols, input).collection();
                         let rekeyed = B::linear(c, vec![LinearOp::Project(record_key())], depth, (key.clone(), val.clone()));
                         let record = ::corgi::Shape::Prod(vec![key, val]);
-                        let present = B::reduce(B::arrange(rekeyed), &Reducer::Distinct, (record.clone(), ::corgi::Shape::Unit));
+                        let present = B::reduce(B::arrange(rekeyed, false), &Reducer::Distinct, (record.clone(), ::corgi::Shape::Unit), false);
                         Rendered::Collection(B::linear(B::as_collection(present), vec![LinearOp::Project(record_unkey())], depth, (record, ::corgi::Shape::Unit)))
                     },
                     st::Node::Reduce { input, reducer } => {
                         let a = resolve(&items, &imports, &var_cols, input).arrange();
-                        Rendered::Arrangement(B::reduce(a, reducer, shape_of(input)))
+                        Rendered::Arrangement(B::reduce(a, reducer, shape_of(input), published[index]))
                     },
                     st::Node::Inspect { input, label } => {
                         let c = resolve(&items, &imports, &var_cols, input).collection();

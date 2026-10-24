@@ -15,10 +15,10 @@ use timely::progress::{Antichain, Timestamp};
 use differential_dataflow::AsCollection;
 use differential_dataflow::Collection;
 use differential_dataflow::operators::join::join_with_tactic;
-use differential_dataflow::operators::reduce::reduce_with_tactic;
+use differential_dataflow::operators::reduce::reduce_with_tactic_with;
 use differential_dataflow::trace::Span;
 use differential_dataflow::trace::chunk::ChunkBatch;
-use differential_dataflow::operators::arrange::arrangement::arrange_core;
+use differential_dataflow::operators::arrange::arrangement::arrange_core_with;
 use differential_dataflow::operators::arrange::{Arranged, TraceAgent};
 use differential_dataflow::trace::chunk::{Chunk, ChunkBatcher};
 
@@ -254,6 +254,12 @@ impl<'scope> Arr<'scope> {
     }
 }
 
+/// The agent factory for an arrangement the program builds: importable if it is published, and
+/// otherwise local, so that its operator is not scheduled on frontier advances without data.
+fn agent(published: bool) -> Box<dyn FnOnce(differential_dataflow::operators::arrange::ArrangeContext) -> (TraceAgent<CTrace>, differential_dataflow::operators::arrange::TraceWriter<CTrace>)> {
+    if published { Box::new(TraceAgent::<CTrace>::factory()) } else { Box::new(TraceAgent::<CTrace>::local_factory()) }
+}
+
 /// The time each coordinate of `t` less one, at least zero: the half join's compaction of its
 /// arrangement. Every later stream time is at or beyond some such frontier element, and advancing
 /// arranged times to it keeps their order against those stream times, strict and not.
@@ -334,7 +340,7 @@ impl Backend for CorgiBackend {
             .as_collection()
     }
 
-    fn arrange<'s>(c: Collection<'s, Time, CC>) -> Self::Arr<'s> {
+    fn arrange<'s>(c: Collection<'s, Time, CC>, published: bool) -> Self::Arr<'s> {
         // This is the backend's ONE inter-worker data movement. `CorgiPact` partitions each
         // container by the structural hash of its key column and gathers each destination's rows
         // into fresh contiguous columns, so every update for a key reaches one worker and both
@@ -346,11 +352,12 @@ impl Backend for CorgiBackend {
         // Column-native ingest: `CorgiChunker` sort-consolidates each input `CorgiContainer`'s
         // columns straight into a `CorgiChunk` (no drain-to-rows), then the standard chunk batcher +
         // builder. No columns→rows→columns round-trip at the arrangement boundary.
-        Arr::built(arrange_core::<_, CC, _, CTrace>(
+        Arr::built(arrange_core_with(
             c.inner,
             CorgiPact,
             "CorgiArrange",
             ChunkBatcher::<CorgiChunker<Time, Diff>, _>::new,
+            agent(published),
         ))
     }
 
@@ -396,14 +403,14 @@ impl Backend for CorgiBackend {
         let yielding = |_timer: std::time::Instant, count: usize| count > 1_000_000;
         half_join_with_tactic(stream.inner, arranged, CorgiPact, step_back, yielding, HalfJoinBatcher::new(strict, level + 1), ProxyHalfJoinTactic::new(backend, strict)).as_collection()
     }
-    fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer, shape: st::RowShape) -> Self::Arr<'s> {
+    fn reduce<'s>(a: Self::Arr<'s>, reducer: &Reducer, shape: st::RowShape, published: bool) -> Self::Arr<'s> {
         // Amortize columnar corrections while reusing sweep scratch across wide presentations.
         let backend = CorgiReduceBackend::new(reducer.clone(), shape);
         // An import is read as of its time; the output is the program's own, read as it is.
         // As for the join, the wrapper at the minimum is one comparison per unit.
         let Arr { arranged, since } = a;
         let backend = BackendFrontier::new(backend, Antichain::from_elem(since));
-        Arr::built(reduce_with_tactic::<_, CTrace, _>(arranged, "CorgiReduce", ProxyReduceTactic::new(backend).with_key_batch_size(256)))
+        Arr::built(reduce_with_tactic_with(arranged, "CorgiReduce", ProxyReduceTactic::new(backend).with_key_batch_size(256), agent(published)))
     }
 
     fn inspect<'s>(c: Collection<'s, Time, CC>, label: String) -> Collection<'s, Time, CC> {
@@ -506,7 +513,7 @@ pub(crate) fn render_program<'s>(
         let first = scope.worker().peek_identifier();
         // A re-exported import is the producer's arrangement; its own readers import it as of
         // the times they start.
-        let arranged = r.arrange().arranged;
+        let arranged = r.arrange_as(true).arranged;
         if let Some(logger) = &logger {
             let end = scope.worker().peek_identifier();
             logger.log(crate::backend::LabelEvent { first, end, label: format!("export {}", export.name) });
@@ -522,7 +529,7 @@ pub(crate) type ExportTrace = TraceAgent<CTrace>;
 
 /// Arrange a collection as a published trace.
 pub(crate) fn arrange_export<'s>(c: Collection<'s, Time, CC>) -> Arranged<'s, ExportTrace> {
-    CorgiBackend::arrange(c).arranged
+    CorgiBackend::arrange(c, true).arranged
 }
 
 /// The batches an export's arrangement has produced on this worker, not yet taken.
