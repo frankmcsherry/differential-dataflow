@@ -501,19 +501,33 @@ pub(crate) fn render_program<'s>(
     shapes: &crate::shapes::ScopeShapes,
 ) -> Vec<Arranged<'s, ExportTrace>> {
     assert_eq!(s.imports.len(), imports.len());
-    let imports = imports.into_iter().map(|imp| match imp {
+    let imports: Vec<crate::backend::Rendered<'s, CorgiBackend>> = imports.into_iter().map(|imp| match imp {
         CorgiImport::Columns(c) => crate::backend::Rendered::Collection(c),
         CorgiImport::Export(a) => crate::backend::Rendered::Arrangement(a),
     }).collect();
-    let rendered = crate::backend::render_scope::<CorgiBackend>(s, scope, 0, imports, shapes);
-    // An export that is not already an arrangement is arranged here, after its statement has
-    // rendered: label those operators with the export, for diagnostics.
+    // The program renders in a region of its own, and its exports are arranged as published traces
+    // outside it. A published arrangement runs on every frontier advance, and a region runs when
+    // any operator in it would; with the published ones outside, the region holds only operators
+    // that run when they have data, and is not scheduled on an advance that brings it none.
+    let left: Vec<Option<Collection<'s, Time, CC>>> = scope.region_named("program", |region| {
+        let entered = imports.iter().map(|imp| imp.enter(region)).collect();
+        let rendered = crate::backend::render_scope::<CorgiBackend>(s, region, 0, entered, shapes);
+        rendered.iter().zip(&s.exports).map(|(r, export)| match reexported(s, &export.value) {
+            // A re-exported import is the producer's arrangement, published already.
+            Some(_) => None,
+            None => Some(r.collection().leave(scope)),
+        }).collect()
+    });
+    // An export arranged here is labelled with the export, for diagnostics.
     let logger = scope.worker().logger_for::<crate::backend::LabelEventBuilder>("ddir/labels");
-    let arranged = rendered.iter().zip(&s.exports).map(|(r, export)| {
+    let arranged = left.into_iter().zip(&s.exports).map(|(c, export)| {
         let first = scope.worker().peek_identifier();
-        // A re-exported import is the producer's arrangement; its own readers import it as of
-        // the times they start.
-        let arranged = r.arrange_as(true).arranged;
+        let arranged = match (c, reexported(s, &export.value)) {
+            (Some(c), _) => CorgiBackend::arrange(c, true).arranged,
+            // Its own readers import it as of the times they start.
+            (None, Some(k)) => imports[k].arrange_as(true).arranged,
+            (None, None) => unreachable!("only a re-exported import leaves no collection"),
+        };
         if let Some(logger) = &logger {
             let end = scope.worker().peek_identifier();
             logger.log(crate::backend::LabelEvent { first, end, label: format!("export {}", export.name) });
@@ -522,6 +536,18 @@ pub(crate) fn render_program<'s>(
     }).collect();
     if let Some(logger) = &logger { logger.flush(); }
     arranged
+}
+
+/// The import an export is, directly or as an `arrange` of it: the producer's trace, re-published.
+fn reexported(s: &st::Scope, value: &st::Ref) -> Option<usize> {
+    match value {
+        st::Ref::Import(k) => Some(*k),
+        st::Ref::Local(i) => match &s.items[*i] {
+            st::Item::Op(st::Node::Arrange(st::Ref::Import(k))) => Some(*k),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A published export: a trace of corgi chunks at the program time, as the program built it.

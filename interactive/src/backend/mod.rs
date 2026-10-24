@@ -126,6 +126,31 @@ impl<'s, B: Backend> Rendered<'s, B> {
     }
 }
 
+/// The root items that are an `arrange` an export names and nothing else reads.
+fn export_only_arranges(s: &st::Scope) -> Vec<bool> {
+    let mut read = vec![false; s.items.len()];
+    let mut mark = |r: &st::Ref| if let st::Ref::Local(i) | st::Ref::ChildExport(i, _) = r { read[*i] = true; };
+    for item in &s.items {
+        match item {
+            st::Item::Op(node) => match node {
+                st::Node::Linear { input, .. } | st::Node::Reduce { input, .. } | st::Node::Inspect { input, .. } | st::Node::Arrange(input) => mark(input),
+                st::Node::Concat(refs) => refs.iter().for_each(&mut mark),
+                st::Node::Join { left, right, .. } => { mark(left); mark(right); }
+                st::Node::HalfJoin { stream, arrangement, .. } => { mark(stream); mark(arrangement); }
+            },
+            st::Item::Sub(child) => child.imports.iter().for_each(|imp| if let st::Source::Parent(r) = &imp.from { mark(r) }),
+        }
+    }
+    s.binds.iter().for_each(|b| mark(&b.value));
+    let mut only = vec![false; s.items.len()];
+    for e in &s.exports {
+        if let st::Ref::Local(i) = e.value {
+            only[i] = !read[i] && matches!(s.items[i], st::Item::Op(st::Node::Arrange(_)));
+        }
+    }
+    only
+}
+
 /// `(k, v)` to `((k, v), ())`: the record as the key, for `distinct` over values that aren't `()`.
 fn record_key() -> Lambda {
     Lambda::new("let (k, v) = input in ((k, v), ())".into(), &::corgi::Scope::default())
@@ -222,17 +247,10 @@ pub(crate) fn render_scope<'s, B: Backend>(
         var_cols.push(col);
     }
 
-    // The root's exported items are published: those an export names, and through an `arrange`
-    // of an arrangement (which returns it as it is) the item that built it. Everything else,
-    // and everything in a child scope, is the program's own.
-    let mut published = vec![false; s.items.len()];
-    if depth == 0 {
-        let mut pending: Vec<usize> = s.exports.iter().filter_map(|e| match e.value { st::Ref::Local(i) => Some(i), _ => None }).collect();
-        while let Some(i) = pending.pop() {
-            if std::mem::replace(&mut published[i], true) { continue; }
-            if let st::Item::Op(st::Node::Arrange(st::Ref::Local(j))) = &s.items[i] { pending.push(*j); }
-        }
-    }
+    // At the root, an export that is only an `arrange` of a collection is left a collection: the
+    // driver arranges each export, as a published trace, outside the region the program renders
+    // in, so that the region holds only arrangements that run when they have data.
+    let export_only: Vec<bool> = if depth == 0 { export_only_arranges(s) } else { vec![false; s.items.len()] };
     let labels = (s.labels.len() == s.items.len()).then_some(&s.labels);
     let label_logger = labels.and_then(|_| scope.worker().logger_for::<LabelEventBuilder>("ddir/labels"));
     let mut items: Vec<RItem<'s, B>> = Vec::new();
@@ -250,7 +268,10 @@ pub(crate) fn render_scope<'s, B: Backend>(
                         for r in &refs[1..] { c = c.concat(resolve(&items, &imports, &var_cols, r).collection()); }
                         Rendered::Collection(c)
                     },
-                    st::Node::Arrange(r) => Rendered::Arrangement(resolve(&items, &imports, &var_cols, r).arrange_as(published[index])),
+                    st::Node::Arrange(r) => match resolve(&items, &imports, &var_cols, r) {
+                        Rendered::Collection(c) if export_only[index] => Rendered::Collection(c),
+                        value => Rendered::Arrangement(value.arrange()),
+                    },
                     st::Node::Join { left, right, projection } => {
                         let l = resolve(&items, &imports, &var_cols, left).arrange();
                         let r = resolve(&items, &imports, &var_cols, right).arrange();
@@ -273,7 +294,7 @@ pub(crate) fn render_scope<'s, B: Backend>(
                     },
                     st::Node::Reduce { input, reducer } => {
                         let a = resolve(&items, &imports, &var_cols, input).arrange();
-                        Rendered::Arrangement(B::reduce(a, reducer, shape_of(input), published[index]))
+                        Rendered::Arrangement(B::reduce(a, reducer, shape_of(input), false))
                     },
                     st::Node::Inspect { input, label } => {
                         let c = resolve(&items, &imports, &var_cols, input).collection();

@@ -168,3 +168,22 @@ fn peek_by_key_reads_reference_keys() {
         assert!(rows("tuple(1)").is_err());
     });
 }
+
+/// An export that arranges an input is published like any other: the program renders in a
+/// region of its own and its exports are arranged outside it, and an arrangement of an input
+/// must be the published kind there, not the program's own.
+#[test]
+fn arranged_input_export_is_published() {
+    timely::execute_directly(|worker| {
+        let mut server = Server::new();
+        install(&mut server, worker, "let rows = input 0 : ((int), (int)); let same = rows; export \"rows\" = same | arrange;");
+        server.feed("world", 0, "1 val=10\n2 val=20", None).unwrap();
+        server.tick(worker);
+        assert_eq!(
+            server.snapshot(worker, "rows").unwrap().rows(),
+            vec![(tup(&[1]), tup(&[10]), 1), (tup(&[2]), tup(&[20]), 1),]
+        );
+        server.tick(worker);
+        assert_eq!(server.snapshot(worker, "rows").unwrap().rows().len(), 2);
+    });
+}
