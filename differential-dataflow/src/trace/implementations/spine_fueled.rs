@@ -349,7 +349,29 @@ impl<B: SpineBatch+Clone+'static> Trace for Spine<B> {
 
         self.upper.clone_from(span.upper());
 
-        // TODO: Consolidate or discard spans with no updates.
+        // Fuse an update-free span onto a preceding update-free span still pending, so that a
+        // reader that holds physical compaction back while nothing arrives, as one that runs only
+        // on data does, has at most one pending span per span with updates. Readers advance their
+        // frontiers by received spans and by `advance_upper`, which sees the fused span as one
+        // interval; both lead to spans with updates, which are not fused.
+        if !span.has_updates() {
+            if let Some(last) = self.pending.last_mut() {
+                if !last.has_updates() {
+                    *last = Span::empty(last.lower().clone(), span.upper().clone());
+                    // Logged as a merge of two update-free batches, so that batch counts balance.
+                    self.logger.as_ref().map(|l| l.log(crate::logging::MergeEvent {
+                        operator: self.operator.global_id,
+                        scale: 0,
+                        length1: 0,
+                        length2: 0,
+                        complete: Some(0),
+                    }));
+                    self.consider_merges();
+                    return;
+                }
+            }
+        }
+
         self.pending.push(span);
         self.consider_merges();
     }
