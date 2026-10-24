@@ -37,7 +37,9 @@ use crate::trace::{self, Description, SpanOf, Trace, TraceReader, Navigable, Bui
 
 use trace::wrappers::enter::{TraceEnter, enter_span};
 
-use super::TraceAgent;
+use super::{Agent, ArrangeContext, TraceAgent, Writer};
+use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
+use timely::dataflow::operators::generic::OutputBuilder;
 
 /// An arranged collection of `(K,V)` values.
 ///
@@ -319,6 +321,29 @@ where
     Ba: Batcher<C, Time = Tr::Time, Output: Into<Tr::Batch>> + 'static,
     Tr: Trace+'static,
 {
+    arrange_core_with(stream, pact, name, batcher, TraceAgent::<Tr>::factory())
+}
+
+/// As [`arrange_core`], returning the agent the supplied factory builds.
+///
+/// The factory is called once, as the operator is built, and produces the agent the operator
+/// returns and the writer it feeds. [`TraceAgent::factory`] reproduces `arrange_core`;
+/// [`TraceLocal::factory`](super::TraceLocal::factory) builds an arrangement that cannot be imported into other dataflows,
+/// whose operator in exchange runs on a frontier advance only while it holds capabilities.
+pub fn arrange_core_with<'scope, P, C, Ba, A, F>(
+    stream: Stream<'scope, A::Time, C>,
+    pact: P,
+    name: &str,
+    batcher: impl FnOnce(Option<Logger>, usize) -> Ba,
+    factory: F,
+) -> Arranged<'scope, A>
+where
+    C: Container + Clone + 'static,
+    P: ParallelizationContract<A::Time, C>,
+    Ba: Batcher<C, Time = A::Time, Output: Into<A::Batch>> + 'static,
+    A: Agent,
+    F: FnOnce(ArrangeContext) -> (A, A::Writer),
+{
     // The `Arrange` operator is tasked with reacting to an advancing input
     // frontier by producing the sequence of batches whose lower and upper
     // bounds are those frontiers, containing updates at times greater or
@@ -334,38 +359,32 @@ where
     // held by the batcher, which may prevents the operator from sending an
     // empty batch.
 
-    let mut reader: Option<TraceAgent<Tr>> = None;
-
-    // fabricate a data-parallel operator that holds capabilities and consults its input frontier.
-    let reader_ref = &mut reader;
+    // Build the operator by hand, so that its frontier interest can be the writer's.
     let scope = stream.scope();
+    let mut builder = OperatorBuilder::new(name.to_owned(), scope);
+    let info = builder.operator_info();
+    let mut input = builder.new_input(stream, pact);
+    let (output, stream) = builder.new_output();
+    let mut output = OutputBuilder::from(output);
 
-    let stream = stream.unary_frontier(pact, name, move |_capability, info| {
+    let context = ArrangeContext::new(&scope, info);
+    // Where we will deposit received updates, and from which we extract batches.
+    let mut batcher = batcher(context.logger.clone(), context.info.global_id);
+    let (reader, mut writer) = factory(context);
+    builder.set_notify_for(0, writer.frontier_interest());
 
-        // Acquire a logger for arrange events.
-        let logger = scope.worker().logger_for::<crate::logging::DifferentialEventBuilder>("differential/arrange").map(Into::into);
-
-        // Where we will deposit received updates, and from which we extract batches.
-        let mut batcher = batcher(logger.clone(), info.global_id);
+    builder.build(move |_capabilities| {
 
         // Capabilities for the lower envelope of updates in `batcher`.
-        let mut capabilities = Antichain::<Capability<Tr::Time>>::new();
-
-        let activator = Some(scope.activator_for(std::rc::Rc::clone(&info.address)));
-        let mut empty_trace = Tr::new(info.clone(), logger.clone(), activator);
-        // If there is default exertion logic set, install it.
-        if let Some(exert_logic) = scope.worker().config().get::<trace::ExertionLogic>("differential/default_exert_logic").cloned() {
-            empty_trace.set_exert_logic(exert_logic);
-        }
-
-        let (reader_local, mut writer) = TraceAgent::new(empty_trace, info, logger);
-
-        *reader_ref = Some(reader_local);
+        let mut capabilities = Antichain::<Capability<A::Time>>::new();
 
         // Initialize to the minimal input frontier.
-        let mut prev_frontier = Antichain::from_elem(Tr::Time::minimum());
+        let mut prev_frontier = Antichain::from_elem(<A::Time as Timestamp>::minimum());
 
-        move |(input, frontier), output| {
+        move |frontiers| {
+
+            let frontier = &frontiers[0];
+            let mut output = output.activate();
 
             // As we receive data, we need to (i) stash the data and (ii) keep *enough* capabilities.
             // We don't have to keep all capabilities, but we need to be able to form output messages
@@ -419,7 +438,7 @@ where
                     let description = Description::new(
                         prev_frontier.clone(),
                         frontier.frontier().to_owned(),
-                        Antichain::from_elem(Tr::Time::minimum()),
+                        Antichain::from_elem(<A::Time as Timestamp>::minimum()),
                     );
                     let (extracted, retained) = batcher.extract(frontier.frontier());
 
@@ -462,5 +481,5 @@ where
         }
     });
 
-    Arranged { stream, trace: reader.unwrap() }
+    Arranged { stream, trace: reader }
 }

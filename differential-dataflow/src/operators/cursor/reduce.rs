@@ -5,8 +5,8 @@ use std::marker::PhantomData;
 use timely::progress::{Antichain, Timestamp};
 
 use crate::Data;
-use crate::operators::arrange::{Arranged, TraceAgent};
-use crate::operators::reduce::{ReduceTactic, reduce_with_tactic, sort_dedup};
+use crate::operators::arrange::{Agent, ArrangeContext, Arranged, TraceAgent};
+use crate::operators::reduce::{ReduceTactic, reduce_with_tactic, reduce_with_tactic_with, sort_dedup};
 use crate::trace::{Span, BatchCursor, BatchDiff, BatchVal, BatchValOwn, Builder, Cursor, Description, Navigable, Trace, TraceReader};
 use crate::trace::cursor::cursor_list;
 use crate::trace::implementations::containers::BatchContainer;
@@ -40,6 +40,25 @@ where
     P: FnMut(&mut Bu::Input, KC::ReadItem<'_>, &mut Vec<(BatchValOwn<Tr2>, Tr2::Time, BatchDiff<Tr2>)>) + 'static,
 {
     reduce_with_tactic(trace, name, CursorTactic::<Tr1::Batch, Tr2::Batch, Bu, L, P>::new(logic, push))
+}
+
+/// As [`reduce_trace`], returning the agent the supplied factory builds for the output trace.
+///
+/// See [`arrange_core_with`](crate::operators::arrange::arrangement::arrange_core_with) for the factory.
+pub fn reduce_trace_with<'scope, Tr1, Bu, A, KC, L, P, F>(trace: Arranged<'scope, Tr1>, name: &str, logic: L, push: P, factory: F) -> Arranged<'scope, A>
+where
+    Tr1: TraceReader<Batch: Navigable> + 'static,
+    A: Agent<Batch: Navigable, Time = Tr1::Time> + 'static,
+    F: FnOnce(ArrangeContext) -> (A, A::Writer),
+    KC: BatchContainer,
+    BatchCursor<Tr1>: Cursor<Time = Tr1::Time, KeyContainer = KC>,
+    for<'a> BatchCursor<Tr1>: Cursor<Key<'a> = KC::ReadItem<'a>>,
+    for<'a> BatchCursor<A>: Cursor<Key<'a> = KC::ReadItem<'a>, ValOwn: Data, Time = A::Time>,
+    Bu: Builder<Time=A::Time, Output: Into<A::Batch>, Input: Default> + 'static,
+    L: FnMut(KC::ReadItem<'_>, &[(BatchVal<'_, Tr1>, BatchDiff<Tr1>)], &mut Vec<(BatchValOwn<A>, BatchDiff<A>)>, &mut Vec<(BatchValOwn<A>, BatchDiff<A>)>)+'static,
+    P: FnMut(&mut Bu::Input, KC::ReadItem<'_>, &mut Vec<(BatchValOwn<A>, A::Time, BatchDiff<A>)>) + 'static,
+{
+    reduce_with_tactic_with(trace, name, CursorTactic::<Tr1::Batch, A::Batch, Bu, L, P>::new(logic, push), factory)
 }
 /// The conventional cursor-based [`ReduceTactic`].
 ///

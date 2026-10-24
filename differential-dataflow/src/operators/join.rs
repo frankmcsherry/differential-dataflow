@@ -10,9 +10,11 @@ use timely::container::NoopBuilder;
 use timely::order::PartialOrder;
 use timely::progress::Timestamp;
 use timely::dataflow::Stream;
-use timely::dataflow::operators::generic::{Operator, OutputBuilderSession};
+use timely::dataflow::operators::generic::{OutputBuilder, OutputBuilderSession};
+use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::CapabilitySet;
+use timely::progress::operate::FrontierInterest;
 
 use crate::lattice::Lattice;
 use crate::operators::arrange::Arranged;
@@ -64,7 +66,23 @@ where
     let mut trace2 = arranged2.trace;
 
     let scope = arranged1.stream.scope();
-    arranged1.stream.binary_frontier(arranged2.stream, Pipeline, Pipeline, name, move |capability, info| {
+    let mut builder = OperatorBuilder::new(name.to_owned(), scope);
+    let info = builder.operator_info();
+    let mut input1 = builder.new_input(arranged1.stream, Pipeline);
+    let mut input2 = builder.new_input(arranged2.stream, Pipeline);
+    // A frontier advance without a batch gives the operator nothing to join: its only work then is
+    // to relax the compaction of its traces, and compaction is a permission, not an obligation,
+    // whose delay costs nothing but the opportunity. The deferred work it holds capabilities for is
+    // what it must be woken for, and `IfCapability` wakes it exactly then. Section 3 below has the
+    // detail, and `Spine::insert` fuses the update-free spans an idle reader would otherwise hold.
+    builder.set_notify_for(0, FrontierInterest::IfCapability);
+    builder.set_notify_for(1, FrontierInterest::IfCapability);
+    let (output, stream) = builder.new_output();
+    let mut output = OutputBuilder::<Tr1::Time, NoopBuilder<C>>::from(output);
+
+    builder.build(move |mut capabilities| {
+
+        let capability = capabilities.pop().expect("one output capability");
 
         // Acquire an activator to reschedule the operator when it has unfinished work.
         use timely::scheduling::Activator;
@@ -149,7 +167,11 @@ where
         let mut trace1_option = Some(trace1);
         let mut trace2_option = Some(trace2);
 
-        move |(input1, frontier1), (input2, frontier2), output| {
+        move |frontiers| {
+
+            let (frontier1, frontier2) = (&frontiers[0], &frontiers[1]);
+            let mut output = output.activate();
+            let output = &mut output;
 
             // 1. Consuming input.
             //
@@ -326,6 +348,16 @@ where
             // For example, if we dropped `trace2` we would not be able to use `advance_upper`
             // to keep `acknowledged2` up to date wrt empty batches, and would hold back logical
             // compaction of `trace1`.
+            //
+            // The operator runs on a frontier advance only while it holds capabilities, so this
+            // maintenance can lag behind the frontiers while it is idle. That is safe: a compaction
+            // frontier is a permission the trace may use later, and a stale one permits less, never
+            // more. Logical compaction catches up on the next batch, before any merge of that batch
+            // completes, so at most one merge compacts to a frontier one idle period old. Physical
+            // compaction holds back only update-free spans while the operator is idle, and the
+            // spine fuses those into one, so nothing accumulates. When the inputs close, timely
+            // schedules the operator once more, whether or not it holds capabilities, so the traces
+            // are dropped as before.
 
             // Maintain `trace1`. Drop if `input2` is empty, or advance based on future needs.
             if let Some(trace1) = trace1_option.as_mut() {
@@ -357,5 +389,7 @@ where
                 }
             }
         }
-    })
+    });
+
+    stream
 }

@@ -68,7 +68,7 @@ pub mod arrangement;
 
 pub mod upsert;
 
-pub use self::writer::TraceWriter;
-pub use self::agent::{TraceAgent, ShutdownButton};
+pub use self::writer::{TraceWriter, Writer};
+pub use self::agent::{Agent, ArrangeContext, TraceAgent, TraceLocal, ShutdownButton};
 
 pub use self::arrangement::Arranged;
