@@ -407,6 +407,10 @@ impl<T: Lanes> differential_dataflow::operators::int_proxy::TimeColumn<T> for Co
             _ => self.beyond(since).into_iter().all(|b| b),
         }
     }
+    fn advance_by(&mut self, since: AntichainRef<T>) {
+        let rows = self.len;
+        ColTimes::advance_by(self, since, rows)
+    }
     fn owned_get(&self, i: usize) -> T { self.get(i) }
     fn owned_push(&mut self, t: &T) { self.push(t) }
 }

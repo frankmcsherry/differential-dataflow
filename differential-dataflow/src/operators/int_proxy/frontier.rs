@@ -184,15 +184,12 @@ where
 }
 
 /// Scaffolding: a join bridge's rows, with owned times.
-///
-/// Public, with [`from_rows`], so that a wrapper for a backend trait defined outside this crate
-/// reads its column bridges as of `since` the one way: dogs3's half-join wrapper does.
-pub fn to_rows<T, C: TimeColumn<T>, R: Clone, K: Copy, V: Copy>(bridge: &JoinBridge<C, R, K, V>) -> ProxyBridge<T, R, K, V> {
+fn to_rows<T, C: TimeColumn<T>, R: Clone, K: Copy, V: Copy>(bridge: &JoinBridge<C, R, K, V>) -> ProxyBridge<T, R, K, V> {
     (0..bridge.len()).map(|i| ((bridge.keys[i], bridge.vals[i]), bridge.times.owned_get(i), bridge.diffs[i].clone())).collect()
 }
 
 /// Scaffolding: replace a join bridge's rows with `rows`.
-pub fn from_rows<T, C: TimeColumn<T>, R, K, V>(rows: ProxyBridge<T, R, K, V>, bridge: &mut JoinBridge<C, R, K, V>) {
+fn from_rows<T, C: TimeColumn<T>, R, K, V>(rows: ProxyBridge<T, R, K, V>, bridge: &mut JoinBridge<C, R, K, V>) {
     bridge.clear::<T>();
     for ((key, val), time, diff) in rows {
         bridge.keys.push(key);

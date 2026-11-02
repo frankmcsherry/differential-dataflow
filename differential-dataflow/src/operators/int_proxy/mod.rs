@@ -97,6 +97,8 @@ pub trait TimeColumn<T>: Default {
     fn extend_join_pairs(&mut self, a: &Self, b: &Self, pairs: &[(usize, usize)]);
     /// Whether every time is at or beyond `since`.
     fn all_beyond(&self, since: AntichainRef<T>) -> bool;
+    /// Advance every time by `since`, in place.
+    fn advance_by(&mut self, since: AntichainRef<T>);
 
     // Scaffolding: the owned exits, to delete once nothing calls them.
     /// The time at `i`, owned.
@@ -123,6 +125,9 @@ impl<T: Lattice + Ord + Clone> TimeColumn<T> for Vec<T> {
         self.extend(pairs.iter().map(|&(i, j)| a[i].join(&b[j])));
     }
     fn all_beyond(&self, since: AntichainRef<T>) -> bool { self.iter().all(|t| since.less_equal(t)) }
+    fn advance_by(&mut self, since: AntichainRef<T>) {
+        for t in self.iter_mut() { t.advance_by(since); }
+    }
     fn owned_get(&self, i: usize) -> T { self[i].clone() }
     fn owned_push(&mut self, t: &T) { self.push(t.clone()) }
 }

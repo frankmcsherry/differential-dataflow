@@ -3,7 +3,7 @@
 //!
 //! The wrapper reads the arranged side as of `since`: every arranged time the inner backend
 //! presents that is not already beyond `since` is advanced by it, and the bridge is consolidated
-//! if any moved ([`read_as_of`]). The stream side is the operator's own input and is left alone.
+//! if any moved, in column operations ([`TimeColumn::advance_by`], then [`settle`]). The stream side is the operator's own input and is left alone.
 //! `stage` and `cross` pass through, and `cross` sees the advanced times, since the tactic hands
 //! it the presented sides back: the data time `data ∨ time2` is taken over the advanced `time2`,
 //! which for a data time beyond `since` equals the stored one's (`s ∨ t2 = s ∨ advance(t2)` for
@@ -21,16 +21,15 @@
 //! each pair exactly once only if both paths compare the same times. So there is no unit-level
 //! shortcut; the shortcut is per block, one column pass ([`TimeColumn::all_beyond`]) over the
 //! presented arranged times, which moves nothing at a program time. Only a block that holds an
-//! import's history, at times before `since`, is advanced and consolidated, through the owned
-//! exits.
+//! import's history, at times before `since`, is advanced and consolidated.
 //!
 //! No key intersection is needed, unlike the join: the tactic skips keys found on one side alone.
 
 use timely::progress::Timestamp;
 
+use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::int_proxy::{read_as_of, BackendFrontier, KeyPosition, TimeColumn};
-use differential_dataflow::operators::int_proxy::frontier::{from_rows, to_rows};
+use differential_dataflow::operators::int_proxy::{BackendFrontier, KeyPosition, TimeColumn};
 use differential_dataflow::operators::int_proxy::join::JoinBridge;
 
 use super::proxy::{HalfJoinInstance, HalfJoinMatches, HalfJoinStream, ProxyHalfJoinBackend};
@@ -61,9 +60,8 @@ where
     ) {
         self.inner_mut().advance(instance, from, stream, arranged);
         if self.since().is_empty() || arranged.times.all_beyond(self.since().borrow()) { return; }
-        // Scaffolding: read the bridge as rows of owned times, and write it back.
-        let mut rows = to_rows(arranged);
-        if read_as_of(&mut rows, self.since()) { from_rows(rows, arranged); }
+        arranged.times.advance_by(self.since().borrow());
+        settle(arranged);
     }
 
     fn cross(
@@ -76,4 +74,35 @@ where
     ) {
         self.inner_mut().cross(instance, stream, arranged, matches, output)
     }
+}
+
+/// Restore a bridge whose times have moved to sorted and consolidated: each `(key, val)` run in
+/// time order, equal times summed and zeros dropped. Advancing changes no key, value or diff, so a
+/// bridge whose runs are still strictly in time order is left as it is.
+fn settle<T, C: TimeColumn<T>, R: Semigroup, K: Copy + Eq, V: Copy + Eq>(bridge: &mut JoinBridge<C, R, K, V>) {
+    let (kept, diffs) = {
+        let JoinBridge { keys, vals, times, diffs } = &*bridge;
+        let run = |i: usize, j: usize| keys[i] == keys[j] && vals[i] == vals[j];
+        let mut order: Vec<usize> = (0..bridge.len()).collect();
+        let mut moved = false;
+        for range in order.chunk_by_mut(|&a, &b| run(a, b)) {
+            if range.windows(2).all(|w| times.cmp_cross(w[0], times, w[1]).is_lt()) { continue; }
+            range.sort_by(|&a, &b| times.cmp_cross(a, times, b));
+            moved = true;
+        }
+        if !moved { return; }
+        let (mut kept, mut summed) = (Vec::with_capacity(order.len()), Vec::with_capacity(order.len()));
+        for group in order.chunk_by(|&a, &b| run(a, b) && times.cmp_cross(a, times, b).is_eq()) {
+            let mut diff = diffs[group[0]].clone();
+            for &i in &group[1..] { diff.plus_equals(&diffs[i]); }
+            if !diff.is_zero() { kept.push(group[0]); summed.push(diff); }
+        }
+        (kept, summed)
+    };
+    let mut times = C::default();
+    times.extend_gather(&bridge.times, &kept);
+    bridge.keys = kept.iter().map(|&i| bridge.keys[i]).collect();
+    bridge.vals = kept.iter().map(|&i| bridge.vals[i]).collect();
+    bridge.times = times;
+    bridge.diffs = diffs;
 }
