@@ -90,7 +90,7 @@ impl<T> ColTimes<T> {
 
     /// Coordinate `j` of row `i`, zero beyond the column's width.
     #[inline]
-    fn at(&self, j: usize, i: usize) -> u64 {
+    pub(crate) fn at(&self, j: usize, i: usize) -> u64 {
         self.lanes.get(j).map_or(0, |lane| lane[i])
     }
 
@@ -161,6 +161,17 @@ impl<T> ColTimes<T> {
         self.len += e - s;
     }
 
+    /// Append one row per element of `rows`, lane by lane, `width` lanes: coordinate `j` of the
+    /// row for `p` is `coord(j, p)`.
+    pub(crate) fn extend_lanes<P: Copy>(&mut self, width: usize, rows: &[P], mut coord: impl FnMut(usize, P) -> u64) {
+        self.widen(width);
+        for (j, lane) in self.lanes.iter_mut().enumerate() {
+            if j < width { lane.extend(rows.iter().map(|&p| coord(j, p))); }
+            else { lane.resize(lane.len() + rows.len(), 0); }
+        }
+        self.len += rows.len();
+    }
+
     /// Keep the first `len` rows.
     pub(crate) fn truncate_rows(&mut self, len: usize) {
         for lane in &mut self.lanes { lane.truncate(len); }
@@ -176,17 +187,6 @@ impl<T> ColTimes<T> {
     /// The owned time at row `i`. Reserve for boundaries where DD wants a timestamp.
     pub fn get(&self, i: usize) -> T where T: Lanes {
         T::from_coordinates(self.lanes.iter().map(|lane| lane[i]))
-    }
-
-    /// The owned time at row `i` joined with `lower`: `get(i).join(lower)`, as the lane-wise
-    /// maximum built into one timestamp rather than through an intermediate one.
-    pub(crate) fn get_joined(&self, i: usize, lower: &T) -> T where T: Lanes {
-        let mut stored = self.lanes.iter();
-        let mut bounds = lower.coordinates();
-        T::from_coordinates(std::iter::from_fn(|| match (stored.next(), bounds.next()) {
-            (None, None) => None,
-            (lane, bound) => Some(lane.map_or(0, |lane| lane[i]).max(bound.unwrap_or(0))),
-        }))
     }
 
     /// Materialize the whole column to `Vec<T>`.
@@ -371,6 +371,42 @@ impl<T: Lanes> differential_dataflow::operators::int_proxy::TimeColumn<T> for Co
         // A column is as wide as its widest row: drop coordinates no row of these blocks carries.
         while self.lanes.last().is_some_and(|lane| lane.iter().all(|&x| x == 0)) { self.lanes.pop(); }
     }
+    fn cmp_cross(&self, i: usize, other: &Self, j: usize) -> Ordering { ColTimes::cmp_cross(self, i, other, j) }
+    fn extend_gather(&mut self, src: &Self, rows: &[usize]) {
+        self.widen(src.lanes.len());
+        for (j, lane) in self.lanes.iter_mut().enumerate() {
+            match src.lanes.get(j) {
+                Some(x) => lane.extend(rows.iter().map(|&i| x[i])),
+                None => lane.resize(lane.len() + rows.len(), 0),
+            }
+        }
+        self.len += rows.len();
+    }
+    /// The lane-wise max is the join in a product of chains.
+    fn extend_join_pairs(&mut self, a: &Self, b: &Self, pairs: &[(usize, usize)]) {
+        self.widen(a.lanes.len().max(b.lanes.len()));
+        for (j, lane) in self.lanes.iter_mut().enumerate() {
+            match (a.lanes.get(j), b.lanes.get(j)) {
+                (Some(x), Some(y)) => lane.extend(pairs.iter().map(|&(i, k)| x[i].max(y[k]))),
+                (Some(x), None) => lane.extend(pairs.iter().map(|&(i, _)| x[i])),
+                (None, Some(y)) => lane.extend(pairs.iter().map(|&(_, k)| y[k])),
+                (None, None) => lane.resize(lane.len() + pairs.len(), 0),
+            }
+        }
+        self.len += pairs.len();
+        // A column is as wide as its widest row, as for `extend_cross_join`.
+        while self.lanes.last().is_some_and(|lane| lane.iter().all(|&x| x == 0)) { self.lanes.pop(); }
+    }
+    /// One pass per coordinate of a one-element `since`, which is how DDIR reads imports.
+    fn all_beyond(&self, since: AntichainRef<T>) -> bool {
+        match &since[..] {
+            [s] => s.coordinates().enumerate().all(|(j, bound)| bound == 0 || match self.lanes.get(j) {
+                Some(lane) => lane.iter().all(|&x| bound <= x),
+                None => self.len == 0,
+            }),
+            _ => self.beyond(since).into_iter().all(|b| b),
+        }
+    }
     fn owned_get(&self, i: usize) -> T { self.get(i) }
     fn owned_push(&mut self, t: &T) { self.push(t) }
 }
@@ -421,7 +457,6 @@ mod tests {
         let narrow: ColTimes<T> = times[..5].iter().cloned().collect();
         for i in 0..times.len() {
             for j in 0..times.len() {
-                assert_eq!(store.get_joined(i, &times[j]), times[i].join(&times[j]));
                 assert_eq!(times[i].cmp(&times[j]), store.cmp(i, j), "{:?} vs {:?}", times[i], times[j]);
                 if j < 5 {
                     assert_eq!(times[i].cmp(&times[j]), store.cmp_cross(i, &narrow, j));

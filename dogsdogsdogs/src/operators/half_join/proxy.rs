@@ -1,7 +1,7 @@
 //! The proxy half-join tactic: differential's `int_proxy` recipe, for the half join.
 //!
 //! This lives in dogs3 rather than in differential's `int_proxy` module on purpose: it is built
-//! from that module's public surface ([`ProxyBridge`], [`KeyPosition`], the bridge check), as any
+//! from that module's public surface ([`JoinBridge`], [`TimeColumn`], [`KeyPosition`], the bridge check), as any
 //! other implementor of a tactic over proxies would build theirs, and the needs it has of that
 //! surface are the measure of whether others are allowed to use the parts.
 //!
@@ -18,12 +18,16 @@
 //! share a key, their value proxies, and the output containers built from matched rows.
 //!
 //! A match is reported as a pair of positions in the block's two sides, with its diff. Its output
-//! time is the update's own time, `stream[a].1.time`, and its data time is the update's data time
-//! joined with the arranged time *as presented*, [`data_time`]`(&stream[a].1, &arranged[b].1)`.
-//! The tactic states that rule and the backend evaluates it in its own layout, column-wise if it
-//! likes: materializing a time per match in the tactic was measured at a third of the operator's
+//! time is the update's own time, `stream.times[a]`, and its data time is the update's data time
+//! joined with the arranged time *as presented*, `stream.data[a] ∨ arranged.times[b]`.
+//! The tactic states that rule ([`match_times`]) and the backend calls it on the pairs it keeps:
+//! materializing a time per match in the tactic was measured at a third of the operator's
 //! time, and the rule reads the presented arranged time either way, which is what a wrapper that
 //! reads the arrangement as of a frontier moves.
+//!
+//! Both sides are columns, with times in the backend's [`TimeColumn`], and the tactic only
+//! compares them: every time operation is the column's, and no owned time is built on the
+//! common path.
 //!
 //! # Times
 //!
@@ -48,23 +52,48 @@ use timely::progress::{Antichain, Timestamp};
 
 use differential_dataflow::difference::{Multiply, Semigroup};
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::int_proxy::{debug_assert_sorted_bridge, KeyPosition, ProxyBridge};
+use differential_dataflow::operators::int_proxy::{KeyPosition, TimeColumn};
+use differential_dataflow::operators::int_proxy::join::{debug_assert_sorted_join_bridge, JoinBridge};
 
 use super::HalfJoinTactic;
 
-/// A lifted update's two times: its own, and the one it carries as data, at or beyond its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Lifted<T> {
-    /// The update's own time, at which its outputs are produced.
-    pub time: T,
-    /// The time it carries as data, which its outputs carry joined with the arranged time.
-    pub data: T,
+/// A block of released updates as columns: row `i` is `((keys[i], vals[i]), times[i], data[i],
+/// diffs[i])`, in key order.
+///
+/// Each lifted update carries two times: its own, at which its outputs are produced, and the one
+/// it carries as data, at or beyond its own, which its outputs carry joined with the arranged time.
+/// Rows need not be consolidated; the half join is linear in both inputs.
+pub struct HalfJoinStream<C, R, K = u64, V = u64> {
+    /// The key of each row.
+    pub keys: Vec<K>,
+    /// The value proxy of each row.
+    pub vals: Vec<V>,
+    /// The update's own time.
+    pub times: C,
+    /// The time the update carries as data.
+    pub data: C,
+    /// The diff of each row.
+    pub diffs: Vec<R>,
 }
 
-/// A block of released updates: `((key, val), lifted times, diff)`, in key order.
-///
-/// Rows need not be consolidated; the half join is linear in both inputs.
-pub type HalfJoinStream<T, R, K = u64, V = u64> = Vec<((K, V), Lifted<T>, R)>;
+impl<C: Default, R, K, V> Default for HalfJoinStream<C, R, K, V> {
+    fn default() -> Self { HalfJoinStream { keys: Vec::new(), vals: Vec::new(), times: C::default(), data: C::default(), diffs: Vec::new() } }
+}
+
+impl<C, R, K, V> HalfJoinStream<C, R, K, V> {
+    /// The number of rows.
+    pub fn len(&self) -> usize { self.keys.len() }
+    /// Whether there are no rows.
+    pub fn is_empty(&self) -> bool { self.keys.is_empty() }
+    /// Remove every row, keeping the allocations.
+    pub fn clear<T>(&mut self) where C: TimeColumn<T> {
+        self.keys.clear();
+        self.vals.clear();
+        self.times.clear();
+        self.data.clear();
+        self.diffs.clear();
+    }
+}
 
 /// A type that can interpret and retire released updates against a list of batches, joined by keys.
 ///
@@ -88,6 +117,8 @@ pub trait ProxyHalfJoinBackend<T, B, C0> {
     type Output;
     /// The released updates of one unit, in the form the backend reads them a block at a time.
     type Stream;
+    /// The column both sides present their times in.
+    type Times: TimeColumn<T>;
 
     /// Put one unit's released containers in the form `advance` reads: sorted by key, say.
     fn stage(&mut self, chunks: Vec<C0>) -> Self::Stream;
@@ -98,29 +129,29 @@ pub trait ProxyHalfJoinBackend<T, B, C0> {
     /// the block's exclusive upper bound as `At(key)`, or `End` when exhausted. Each call must
     /// strictly advance `from`. Both sides are in key order, and each must hold all the rows of
     /// every key it mentions that the other side holds too: the tactic skips keys found on one
-    /// side alone. The arranged side is a [`ProxyBridge`] like the join's and the reduce's:
-    /// sorted and consolidated by `((key, val), time)`, so equal values share one proxy. The
+    /// side alone. The arranged side is a [`JoinBridge`] like the join's: sorted and consolidated
+    /// by `((key, val), time)`, so equal values share one proxy. The
     /// stream side is in key order only. Arranged times are presented as stored (see the module
     /// documentation).
     fn advance(
         &mut self,
         instance: &HalfJoinInstance<B, Self::Stream>,
         from: &mut KeyPosition<Self::Key>,
-        stream: &mut HalfJoinStream<T, Self::R0, Self::Key, Self::V0>,
-        arranged: &mut ProxyBridge<T, Self::R1, Self::Key, Self::V1>,
+        stream: &mut HalfJoinStream<Self::Times, Self::R0, Self::Key, Self::V0>,
+        arranged: &mut JoinBridge<Self::Times, Self::R1, Self::Key, Self::V1>,
     );
 
     /// Interpret the matches of the immediately preceding [`Self::advance`] call, between the
-    /// sides it presented, and place them in `output`. Each output row's time is its update's own
-    /// time, and its data time is [`data_time`] of the two presented rows. The tactic calls
+    /// sides it presented, and place them in `output`. The times of the matches it keeps are
+    /// [`match_times`]'s: the update's own time, and the data time over the presented rows. The tactic calls
     /// `cross` before another `advance`, so a backend may keep block-local interpretation state
     /// between the two calls. `cross` is skipped when the block produced no matches, in which
     /// case the next `advance` may overwrite that state.
     fn cross(
         &mut self,
         instance: &HalfJoinInstance<B, Self::Stream>,
-        stream: &HalfJoinStream<T, Self::R0, Self::Key, Self::V0>,
-        arranged: &ProxyBridge<T, Self::R1, Self::Key, Self::V1>,
+        stream: &HalfJoinStream<Self::Times, Self::R0, Self::Key, Self::V0>,
+        arranged: &JoinBridge<Self::Times, Self::R1, Self::Key, Self::V1>,
         matches: &mut HalfJoinMatches<Self::ROut>,
         output: &mut Vec<Self::Output>,
     );
@@ -158,11 +189,20 @@ impl<R> HalfJoinMatches<R> {
     }
 }
 
-/// The data time of a match: the update's time as data joined with the arranged row's time, as
-/// presented. The one definition; a backend evaluating it column-wise must agree with it.
-#[inline]
-pub fn data_time<T: Lattice>(lifted: &Lifted<T>, arranged: &T) -> T {
-    lifted.data.join(arranged)
+/// The times of the matches `pairs` between the presented sides, appended to `times` and `data`:
+/// each output's time is its update's own, `stream.times[a]`, and its data time is the update's
+/// time as data joined with the arranged row's time, as presented, `stream.data[a] ∨
+/// arranged.times[b]`. The one definition, in column operations.
+pub fn match_times<T, C: TimeColumn<T>, R0, R1, K, V0, V1>(
+    stream: &HalfJoinStream<C, R0, K, V0>,
+    arranged: &JoinBridge<C, R1, K, V1>,
+    pairs: &[(usize, usize)],
+    times: &mut C,
+    data: &mut C,
+) {
+    let rows: Vec<usize> = pairs.iter().map(|&(a, _)| a).collect();
+    times.extend_gather(&stream.times, &rows);
+    data.extend_join_pairs(&stream.data, &arranged.times, pairs);
 }
 
 /// A proxy-space [`HalfJoinTactic`]: meets released updates with the arranged rows of their key
@@ -212,8 +252,8 @@ where
             lower,
             strict: self.strict,
             from: KeyPosition::Start,
-            stream: Vec::new(),
-            arranged: Vec::new(),
+            stream: HalfJoinStream::default(),
+            arranged: JoinBridge::default(),
             matches: HalfJoinMatches::default(),
             ready: Vec::new(),
             order: TimeOrder::default(),
@@ -240,8 +280,8 @@ where
     /// Progress through the key space, from `Start` through inclusive key bounds to `End`.
     from: KeyPosition<Bk::Key>,
     /// The current block's two sides, which one `next` consumes entirely.
-    stream: HalfJoinStream<T, Bk::R0, Bk::Key, Bk::V0>,
-    arranged: ProxyBridge<T, Bk::R1, Bk::Key, Bk::V1>,
+    stream: HalfJoinStream<Bk::Times, Bk::R0, Bk::Key, Bk::V0>,
+    arranged: JoinBridge<Bk::Times, Bk::R1, Bk::Key, Bk::V1>,
     /// The block's matched pairs, held across blocks to keep their allocations.
     matches: HalfJoinMatches<Bk::ROut>,
     /// The last block's containers, in reverse, served from the back one `next` at a time.
@@ -276,8 +316,8 @@ where
 {
     /// Draw the next block from the backend.
     fn refill(&mut self) {
-        self.stream.clear();
-        self.arranged.clear();
+        self.stream.clear::<T>();
+        self.arranged.clear::<T>();
         let before = self.from;
         self.backend.borrow_mut().advance(&self.instance, &mut self.from, &mut self.stream, &mut self.arranged);
         // Without progress the iterator would never retire, so this guards liveness as well as contract.
@@ -286,26 +326,26 @@ where
             "advance must either strictly increase `from` or report the iteration complete",
         );
         debug_assert!(
-            self.stream.windows(2).all(|w| w[0].0.0 <= w[1].0.0),
+            self.stream.keys.windows(2).all(|w| w[0] <= w[1]),
             "advance must present the stream in key order",
         );
-        debug_assert_sorted_bridge(&self.arranged, "advance (arranged)");
+        debug_assert_sorted_join_bridge(&self.arranged, "advance (arranged)");
         // A key outside `[before, from)` belongs to an earlier or later block, and a key split
         // across blocks would meet only part of the other side.
         debug_assert!(
             {
-                let mut keys = self.stream.iter().map(|r| r.0.0).chain(self.arranged.iter().map(|r| r.0.0));
-                keys.all(|k| before <= KeyPosition::At(k) && KeyPosition::At(k) < self.from)
+                let mut keys = self.stream.keys.iter().chain(self.arranged.keys.iter());
+                keys.all(|&k| before <= KeyPosition::At(k) && KeyPosition::At(k) < self.from)
             },
             "advance must report a key entirely within the block that first mentions it",
         );
         // The lifted invariant and the driver's bound, checked on what the backend presents.
         debug_assert!(
-            self.stream.iter().all(|(_, lifted, _)| lifted.time.less_equal(&lifted.data)),
+            (0..self.stream.len()).all(|i| self.stream.times.owned_get(i).less_equal(&self.stream.data.owned_get(i))),
             "a lifted update's time as data must be at or beyond its own time",
         );
         debug_assert!(
-            self.stream.iter().all(|(_, lifted, _)| self.lower.less_equal(&lifted.time)),
+            (0..self.stream.len()).all(|i| self.lower.less_equal(&self.stream.times.owned_get(i))),
             "every released update must be at or beyond the unit's lower bound",
         );
     }
@@ -313,19 +353,20 @@ where
     /// Match the whole of the current block into the match buffers.
     fn work(&mut self) {
         let (stream, arranged) = (&self.stream, &self.arranged);
+        let (k0, k1) = (&stream.keys, &arranged.keys);
         let (mut i, mut j) = (0usize, 0usize);
-        while i < stream.len() && j < arranged.len() {
-            let (ki, kj) = (stream[i].0.0, arranged[j].0.0);
+        while i < k0.len() && j < k1.len() {
+            let (ki, kj) = (k0[i], k1[j]);
             // A key on one side alone meets nothing.
             match ki.cmp(&kj) {
-                Ordering::Less => { while i < stream.len() && stream[i].0.0 == ki { i += 1; } }
-                Ordering::Greater => { while j < arranged.len() && arranged[j].0.0 == kj { j += 1; } }
+                Ordering::Less => { while i < k0.len() && k0[i] == ki { i += 1; } }
+                Ordering::Greater => { while j < k1.len() && k1[j] == kj { j += 1; } }
                 Ordering::Equal => {
                     let mut e0 = i;
-                    while e0 < stream.len() && stream[e0].0.0 == ki { e0 += 1; }
+                    while e0 < k0.len() && k0[e0] == ki { e0 += 1; }
                     let mut e1 = j;
-                    while e1 < arranged.len() && arranged[e1].0.0 == ki { e1 += 1; }
-                    half_join_key(stream, i..e0, arranged, j..e1, self.strict, &mut self.order, &mut self.matches);
+                    while e1 < k1.len() && k1[e1] == ki { e1 += 1; }
+                    half_join_key::<T, _, _, _, _, _, _, _>(stream, i..e0, arranged, j..e1, self.strict, &mut self.order, &mut self.matches);
                     i = e0;
                     j = e1;
                 }
@@ -342,11 +383,11 @@ where
     }
 }
 
-/// Whether an arranged time precedes an update's own, in the total order: strictly, or also when
-/// equal unless `strict`.
+/// Whether the arranged time at `b` precedes the update's own at `a`, in the total order:
+/// strictly, or also when equal unless `strict`.
 #[inline]
-fn precedes<T: Ord>(arranged: &T, time: &T, strict: bool) -> bool {
-    match arranged.cmp(time) {
+fn precedes<T, C: TimeColumn<T>>(arranged: &C, b: usize, times: &C, a: usize, strict: bool) -> bool {
+    match arranged.cmp_cross(b, times, a) {
         Ordering::Less => true,
         Ordering::Equal => !strict,
         Ordering::Greater => false,
@@ -365,27 +406,27 @@ struct TimeOrder {
 /// If either side is small, every pair is compared. Otherwise both sides are put in time order,
 /// and the arranged rows preceding each update form a prefix that only grows along the stream:
 /// the comparisons are then linear in the rows, and the work is the matches themselves.
-fn half_join_key<T, R0, R1, RO, K: Copy + Ord, V0: Copy + Ord, V1: Copy + Ord>(
-    stream: &HalfJoinStream<T, R0, K, V0>,
+fn half_join_key<T, C: TimeColumn<T>, R0, R1, RO, K, V0, V1>(
+    stream: &HalfJoinStream<C, R0, K, V0>,
     r0: std::ops::Range<usize>,
-    arranged: &ProxyBridge<T, R1, K, V1>,
+    arranged: &JoinBridge<C, R1, K, V1>,
     r1: std::ops::Range<usize>,
     strict: bool,
     order: &mut TimeOrder,
     matches: &mut HalfJoinMatches<RO>,
 ) where
-    T: Lattice + Timestamp,
     R0: Semigroup + Multiply<R1, Output = RO> + Clone,
     R1: Semigroup + Clone,
 {
+    let (t0, t1) = (&stream.times, &arranged.times);
     let mut emit = |a: usize, b: usize| {
         matches.pairs.push((a, b));
-        matches.diffs.push(stream[a].2.clone().multiply(&arranged[b].2));
+        matches.diffs.push(stream.diffs[a].clone().multiply(&arranged.diffs[b]));
     };
     if r0.len() < 16 || r1.len() < 16 {
         for a in r0 {
             for b in r1.clone() {
-                if precedes(&arranged[b].1, &stream[a].1.time, strict) { emit(a, b); }
+                if precedes(t1, b, t0, a, strict) { emit(a, b); }
             }
         }
     }
@@ -393,13 +434,13 @@ fn half_join_key<T, R0, R1, RO, K: Copy + Ord, V0: Copy + Ord, V1: Copy + Ord>(
         let TimeOrder { stream: order0, arranged: order1 } = order;
         order0.clear();
         order0.extend(r0);
-        order0.sort_unstable_by(|&a, &b| stream[a].1.time.cmp(&stream[b].1.time));
+        order0.sort_unstable_by(|&a, &b| t0.cmp_cross(a, t0, b));
         order1.clear();
         order1.extend(r1);
-        order1.sort_unstable_by(|&a, &b| arranged[a].1.cmp(&arranged[b].1));
+        order1.sort_unstable_by(|&a, &b| t1.cmp_cross(a, t1, b));
         let mut prefix = 0;
         for &a in order0.iter() {
-            while prefix < order1.len() && precedes(&arranged[order1[prefix]].1, &stream[a].1.time, strict) { prefix += 1; }
+            while prefix < order1.len() && precedes(t1, order1[prefix], t0, a, strict) { prefix += 1; }
             for &b in &order1[..prefix] { emit(a, b); }
         }
     }

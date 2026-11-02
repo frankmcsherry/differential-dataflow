@@ -36,7 +36,7 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use differential_dataflow::operators::int_proxy::{extend_cross_product, KeyPosition, JoinInstance, ProxyBridge, ProxyJoinBackend, TimeColumn};
+use differential_dataflow::operators::int_proxy::{extend_cross_product, KeyPosition, JoinInstance, ProxyJoinBackend, TimeColumn};
 use differential_dataflow::operators::int_proxy::join::JoinBlock;
 use differential_dataflow::trace::chunk::{Chunk, ChunkBatch};
 
@@ -51,7 +51,7 @@ use crate::lambda::compile_projection;
 use crate::ir::{Diff, Lambda};
 
 mod lanes;
-use lanes::{LaneBridge, Staging};
+pub(super) use lanes::{stage_side, LaneBridge, Staging};
 
 type CBatch<T> = Rc<ChunkBatch<CorgiChunk<T, Diff>>>;
 
@@ -488,155 +488,6 @@ impl<'a, T: ColTime> RunRef<'a, T> {
     }
 }
 
-/// Per-key staging for one side: consolidated `(token, time, diff)` entries, built in scratch
-/// so a side that nets to zero suppresses the key before anything reaches the bridges.
-pub(super) struct SideScratch<T> {
-    pub(super) entries: Vec<(u64, T, Diff)>,
-    /// `(time, diff)` scratch for one value's cross-chunk merge.
-    tds: Vec<(T, Diff)>,
-    /// Cross-chunk value-merge heads, reused across keys.
-    heads: Vec<(usize, usize)>,
-    /// Row indices sorted by projected value, reused across keys.
-    idx: Vec<(u32, u32)>,
-}
-
-impl<T: ColTime> SideScratch<T> {
-    pub(super) fn new() -> Self {
-        SideScratch { entries: Vec::new(), tds: Vec::new(), heads: Vec::new(), idx: Vec::new() }
-    }
-
-    fn push(&mut self, coord: u64, time: T, diff: Diff) {
-        match self.entries.last_mut() {
-            Some((lc, lt, ld)) if *lc == coord && *lt == time => *ld += diff,
-            _ => self.entries.push((coord, time, diff)),
-        }
-    }
-
-    /// Stage one key's records from `runs` (its equal-key row ranges, one per chunk holding it):
-    /// primitive values identify themselves; other values share their least occurrence's
-    /// coordinate across chunks. Times are advanced by `lower`, consolidated, zeros dropped.
-    /// Entries end sorted by `(token, time)`.
-    pub(super) fn stage_runs(&mut self, runs: &[RunRef<'_, T>], lower: &T) {
-        self.entries.clear();
-        let Some(first) = runs.first() else { return };
-        if primitive_values(first.chunk) {
-            for run in runs {
-                let ids = int_lane(run.chunk.vals()).unwrap();
-                // An unread primitive value is one token (`cross` never reads it back).
-                let collapse = run.kind == ProjKind::Collapse;
-                self.entries.extend((run.s..run.e).map(|row| {
-                    let time = run.chunk.times().get_joined(row, lower);
-                    (if collapse { 0 } else { ids[row] as u64 }, time, run.chunk.diffs()[row])
-                }));
-            }
-            differential_dataflow::consolidation::consolidate_updates(&mut self.entries);
-            return;
-        }
-        if first.kind == ProjKind::Ungrouped && (runs.len() != 1 || first.e - first.s > 1) {
-            // The stored order does not group equal projected values: sort the key's rows by
-            // projected value, then consolidate each value's times. The canonical coordinate
-            // is the least contributing (chunk, row).
-            // Move the scratch out while `push` borrows `self`, then return its capacity.
-            let mut idx = std::mem::take(&mut self.idx);
-            idx.clear();
-            for (i, run) in runs.iter().enumerate() { idx.extend((run.s..run.e).map(|row| (i as u32, row as u32))); }
-            idx.sort_unstable_by(|a, b| runs[a.0 as usize].val_cmp(a.1 as usize, &runs[b.0 as usize], b.1 as usize));
-            let mut start = 0;
-            while start < idx.len() {
-                let (ri, row) = (idx[start].0 as usize, idx[start].1 as usize);
-                let mut end = start + 1;
-                while end < idx.len() && runs[idx[end].0 as usize].val_eq(idx[end].1 as usize, &runs[ri], row) { end += 1; }
-                let mut coord = u64::MAX;
-                self.tds.clear();
-                for &(i, r) in &idx[start..end] {
-                    let run = &runs[i as usize];
-                    coord = coord.min(((run.cid as u64) << COORD_BITS) | r as u64);
-                    self.tds.push((run.chunk.times().get_joined(r as usize, lower), run.chunk.diffs()[r as usize]));
-                }
-                self.tds.sort_by(|a, b| a.0.cmp(&b.0));
-                let tds = std::mem::take(&mut self.tds);
-                for (time, diff) in tds.iter() { self.push(coord, time.clone(), *diff); }
-                self.tds = tds;
-                start = end;
-            }
-            self.idx = idx;
-            self.entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-            self.entries.retain(|(_, _, d)| *d != 0);
-            return;
-        }
-        if let [run] = runs {
-            // Single-chunk run: values are grouped and coordinates of successive value
-            // runs ascend. Joining product times need not preserve their total order,
-            // so adjacent consolidation suffices only if advanced times stay ordered.
-            let coord_hi = (run.cid as u64) << COORD_BITS;
-            let mut v_start = run.s;
-            for row in run.s..run.e {
-                if row > v_start && !run.val_eq(row, run, v_start) {
-                    v_start = row;
-                }
-                let time = run.chunk.times().get_joined(row, lower);
-                self.push(coord_hi | v_start as u64, time, run.chunk.diffs()[row]);
-            }
-            if self.entries.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 > w[1].1) {
-                differential_dataflow::consolidation::consolidate_updates(&mut self.entries);
-            }
-        } else {
-            // Cross-chunk merge by value content: heads are (run index, row); each step takes
-            // the least value among heads, drains every chunk's sub-run of it into `tds`,
-            // and consolidates. The canonical coordinate is the least contributing (chunk, row).
-            // Move the scratch out while `push` borrows `self`, then return its capacity.
-            let mut heads = std::mem::take(&mut self.heads);
-            heads.clear();
-            heads.extend(runs.iter().enumerate().map(|(i, r)| (i, r.s)));
-            while !heads.is_empty() {
-                let mut min = 0usize;
-                for h in 1..heads.len() {
-                    if runs[heads[h].0].val_less(heads[h].1, &runs[heads[min].0], heads[min].1) {
-                        min = h;
-                    }
-                }
-                let (ri_min, row_min) = heads[min];
-                self.tds.clear();
-                let mut coord = u64::MAX;
-                let mut h = 0usize;
-                while h < heads.len() {
-                    let (ri, row) = heads[h];
-                    let run = &runs[ri];
-                    if run.val_eq(row, &runs[ri_min], row_min) {
-                        let r_end = run.val_run_end(row);
-                        for r in row..r_end {
-                            let time = run.chunk.times().get_joined(r, lower);
-                            self.tds.push((time, run.chunk.diffs()[r]));
-                        }
-                        coord = coord.min(((run.cid as u64) << COORD_BITS) | row as u64);
-                        if r_end < run.e { heads[h] = (ri, r_end); h += 1; } else { heads.swap_remove(h); }
-                    } else {
-                        h += 1;
-                    }
-                }
-                self.tds.sort_by(|a, b| a.0.cmp(&b.0));
-                let tds = std::mem::take(&mut self.tds);
-                for (time, diff) in tds.iter() {
-                    self.push(coord, time.clone(), *diff);
-                }
-                self.tds = tds;
-                self.tds.clear();
-            }
-            self.heads = heads;
-            // Canonical coordinates interleave chunks; restore bridge order.
-            self.entries.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-        }
-        self.entries.retain(|(_, _, d)| *d != 0);
-    }
-
-    /// Move the staged entries into `bridge` under group token `k`.
-    pub(super) fn emit(&mut self, k: i64, bridge: &mut ProxyBridge<T, Diff, i64>) -> usize {
-        let n = self.entries.len();
-        bridge.extend(self.entries.drain(..).map(|(coord, t, d)| ((k, coord), t, d)));
-        n
-    }
-}
-
 /// The identifier column of a chunk's keys, as a sorted `i64` slice. Every arrangement key
 /// leads with its identifier ([`present_key`](crate::runtime::chunk::present_key)), so this is
 /// always available and always ordered — no gather, no copy.
@@ -770,55 +621,6 @@ impl<'a, T: ColTime> Probe<'a, T> {
             kind: self.kind,
         })
     }
-}
-
-/// Stage a colliding identifier without allowing equal values from different real keys to
-/// consolidate together. Each real key is staged independently, but all retain the identifier as
-/// their proxy token; `cross` uses the coordinates to discard unequal-key pairs afterward.
-pub(super) fn stage_collision<T: ColTime>(
-    runs: &[RunRef<'_, T>],
-    lower: &T,
-    token: i64,
-    bridge: &mut ProxyBridge<T, Diff, i64>,
-) {
-    let mut positions: Vec<usize> = runs.iter().map(|run| run.s).collect();
-    let mut scratch = SideScratch::new();
-    let mut staged = Vec::new();
-    loop {
-        let Some(min) = positions
-            .iter()
-            .enumerate()
-            .filter(|(index, position)| **position < runs[*index].e)
-            .min_by(|(ai, ap), (bi, bp)| {
-                compare_at(runs[*ai].chunk.keys(), **ap, runs[*bi].chunk.keys(), **bp)
-            })
-            .map(|(index, _)| index)
-        else {
-            break;
-        };
-        let (reference, row) = (runs[min].chunk.keys(), positions[min]);
-        let mut equal_runs = Vec::new();
-        for (index, run) in runs.iter().enumerate() {
-            let start = positions[index];
-            if start == run.e
-                || compare_at(run.chunk.keys(), start, reference, row) != Ordering::Equal
-            {
-                continue;
-            }
-            let end = start
-                + (start..run.e)
-                    .position(|candidate| {
-                        compare_at(run.chunk.keys(), candidate, reference, row) != Ordering::Equal
-                    })
-                    .unwrap_or(run.e - start);
-            equal_runs.push(RunRef { chunk: run.chunk, cid: run.cid, s: start, e: end, vals: run.vals, pcol: run.pcol, kind: run.kind });
-            positions[index] = end;
-        }
-        scratch.stage_runs(&equal_runs, lower);
-        staged.extend(scratch.entries.drain(..).map(|(coord, time, diff)| ((token, coord), time, diff)));
-    }
-    staged.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    bridge.extend(staged);
 }
 
 /// Blockwise `advance` over every arrangement key shape: group token = the leading identifier
@@ -1318,9 +1120,6 @@ mod tests {
             vec![1, 1, -1],
         );
         let runs = [RunRef { chunk: &chunk, cid: 0, s: 0, e: 3, vals: None, pcol: None, kind: ProjKind::Whole }];
-        let mut scratch = SideScratch::new();
-        scratch.stage_runs(&runs, &t(1, 0));
-        assert_eq!(scratch.entries, vec![(11, t(1, 0), 1)]);
         assert_eq!(lane_staged(&runs, &t(1, 0)), vec![(11, t(1, 0), 1)]);
     }
 
@@ -1334,9 +1133,6 @@ mod tests {
             vec![1, 1, -1],
         );
         let runs = [RunRef { chunk: &chunk, cid: 0, s: 0, e: 3, vals: None, pcol: None, kind: ProjKind::Whole }];
-        let mut scratch = SideScratch::new();
-        scratch.stage_runs(&runs, &t(1, 0));
-        assert_eq!(scratch.entries, vec![(0, t(1, 0), 1)]);
         assert_eq!(lane_staged(&runs, &t(1, 0)), vec![(0, t(1, 0), 1)]);
     }
 

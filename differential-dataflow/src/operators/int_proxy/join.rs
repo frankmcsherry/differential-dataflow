@@ -118,7 +118,10 @@ impl<C, R, K, V> JoinBridge<C, R, K, V> {
 }
 
 /// Debug check that a presented [`JoinBridge`] is consolidated.
-fn debug_assert_sorted_join_bridge<T: Ord, C: TimeColumn<T>, R, K: Copy + Ord, V: Copy + Ord>(bridge: &JoinBridge<C, R, K, V>, who: &str) {
+///
+/// Public so that a tactic built outside this crate over the same bridges, such as dogs3's proxy
+/// half join, checks the contract its backends owe with the same test.
+pub fn debug_assert_sorted_join_bridge<T: Ord, C: TimeColumn<T>, R, K: Copy + Ord, V: Copy + Ord>(bridge: &JoinBridge<C, R, K, V>, who: &str) {
     debug_assert!(
         (1..bridge.len()).all(|i| {
             ((bridge.keys[i-1], bridge.vals[i-1]), bridge.times.owned_get(i-1)) < ((bridge.keys[i], bridge.vals[i]), bridge.times.owned_get(i))

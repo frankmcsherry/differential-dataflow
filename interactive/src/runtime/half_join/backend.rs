@@ -3,27 +3,28 @@
 //! and states the output's times; the matched pairs are gathered into columns and projected, and
 //! their data times evaluated lane by lane over the presented times.
 //!
-//! The arranged side is staged as the join backend stages its sides: one key's rows across
+//! The arranged side is staged as the join backend stages its sides, on lanes: one key's rows across
 //! chunks are merged by projected value, equal projections share one token (the value itself for read integer
 //! values under integer keys, else the coordinate of its first occurrence), and the records are
 //! consolidated. Identifiers that hold more than one real key are recorded, and only pairs under
-//! those have their real keys compared.
+//! those have their real keys compared. The stream side's two times are gathered into lanes from
+//! the runs, and no owned time is built on either side.
 
 use std::borrow::Cow;
 
 use timely::progress::Timestamp;
 
-use differential_dataflow::operators::int_proxy::{KeyPosition, ProxyBridge};
-use differential_dogs3::operators::half_join::proxy::{data_time, HalfJoinInstance, HalfJoinMatches, HalfJoinStream, Lifted, ProxyHalfJoinBackend};
+use differential_dataflow::operators::int_proxy::KeyPosition;
+use differential_dogs3::operators::half_join::proxy::{match_times, HalfJoinInstance, HalfJoinMatches, HalfJoinStream, ProxyHalfJoinBackend};
 use differential_dataflow::trace::chunk::Chunk;
 
 use corgi::arrange::{compare_at, equal_idx, gather_lanes};
 use corgi::{shape_of_value, Demand, Graph, NumOp, Shape, Value as CValue};
 
 use crate::runtime::chunk::{colliding_keys, ident, key_is_hashed, recover_key_ref, rewrap, CorgiChunk};
-use crate::runtime::col_times::{ColTimes, Lanes};
+use crate::runtime::col_times::ColTimes;
 use crate::runtime::container::CorgiContainer;
-use crate::runtime::join::{demanded, primitive_values, stage_collision, Probe, Reads, RunRef, SideProj, SideScratch, COORD_BITS};
+use crate::runtime::join::{demanded, primitive_values, stage_side, LaneBridge, Probe, Reads, RunRef, SideProj, Staging, COORD_BITS};
 use crate::lambda::compile_projection;
 use crate::ir::{Diff, Lambda, Time};
 
@@ -120,6 +121,7 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
     type ROut = Diff;
     type Output = CC;
     type Stream = Vec<Run>;
+    type Times = ColTimes<Time>;
 
     /// The batcher releases runs already in identifier order.
     fn stage(&mut self, runs: Vec<Run>) -> Vec<Run> {
@@ -134,8 +136,8 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
         &mut self,
         instance: &HalfJoinInstance<NativeBatch, Vec<Run>>,
         from: &mut KeyPosition<i64>,
-        stream: &mut HalfJoinStream<Time, Diff, i64, u64>,
-        arranged: &mut ProxyBridge<Time, Diff, i64, u64>,
+        stream: &mut HalfJoinStream<ColTimes<Time>, Diff, i64, u64>,
+        arranged: &mut LaneBridge<Time>,
     ) {
         let next = match *from {
             KeyPosition::Start => i64::MIN,
@@ -160,14 +162,15 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
             rows.extend((starts[r]..ends[r]).map(|u| (ids[u], r as u32, u as u32)));
         }
         let lanes: Vec<Vec<Cow<'_, [i64]>>> = runs.iter().map(|run| data_lanes(run, self.width)).collect();
+        // The presented rows' runs and positions, from which both time columns are gathered.
+        let mut presented: Vec<(usize, usize)> = Vec::new();
         let mut push = |(id, r, u): (i64, u32, u32), diff| {
             if diff == 0 { return; }
             let (r, u) = (r as usize, u as usize);
-            let lifted = Lifted {
-                time: runs[r].times().get(u),
-                data: Time::from_coordinates(lanes[r].iter().map(|lane| lane[u] as u64)),
-            };
-            stream.push(((id, ((r as u64) << COORD_BITS) | u as u64), lifted, diff));
+            stream.keys.push(id);
+            stream.vals.push(((r as u64) << COORD_BITS) | u as u64);
+            stream.diffs.push(diff);
+            presented.push((r, u));
         };
         if self.project_stream {
             // The released runs are only in identifier order. Sort on the projected value,
@@ -193,12 +196,15 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
             for &row in &rows { push(row, runs[row.1 as usize].diffs()[row.2 as usize]); }
         }
         if stream.is_empty() { return; }
+        let width = runs.iter().map(|run| run.times().width()).max().unwrap_or(0);
+        stream.times.extend_lanes(width, &presented, |j, (r, u)| runs[r].times().at(j, u));
+        stream.data.extend_lanes(self.width, &presented, |j, (r, u)| lanes[r][j][u] as u64);
 
         // The arranged rows of the block's identifiers: one batched probe of each chunk that
         // can hold any of them.
         // Needles come from the consolidated stream, so identifiers whose rows all cancelled
         // are neither probed nor staged. The stream is in identifier order.
-        let mut needles: Vec<i64> = stream.iter().map(|((id, _), _, _)| *id).collect();
+        let mut needles: Vec<i64> = stream.keys.clone();
         needles.dedup();
         let (first, last) = (needles[0], needles[needles.len() - 1]);
         let chunks = arranged_chunks(&instance.batches);
@@ -238,31 +244,26 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
         // Stage each identifier's arranged rows as the join stages a side: merged by value across
         // chunks, consolidated, equal values under one token. Nothing is advanced: the bound the
         // join's staging joins times with is the minimum here, which leaves them as stored.
-        let mut scratch = SideScratch::new();
+        let mut staging = Staging::new(&Time::minimum());
         let mut refs: Vec<RunRef<'_, Time>> = Vec::new();
         for (n, &id) in needles.iter().enumerate() {
             if !matched[n] { continue; }
             refs.clear();
             refs.extend(probes.iter().filter_map(|p| p.run_ref(n)));
-            if hashed && collisions[n] {
-                self.colliding.push(id);
-                stage_collision(&refs, &Time::minimum(), id, arranged);
-            } else {
-                scratch.stage_runs(&refs, &Time::minimum());
-                scratch.emit(id, arranged);
-            }
+            let collision = hashed && collisions[n];
+            if collision { self.colliding.push(id); }
+            stage_side(id, &refs, &mut staging, arranged, collision);
         }
     }
 
     /// The matched pairs' keys, values and arranged values gathered into columns and projected;
-    /// pairs under a colliding identifier whose real keys differ are dropped first. The data times
-    /// are the tactic's rule, evaluated lane by lane: the presented times of the block's rows are
-    /// read into lanes once, and each match takes the lane-wise max.
+    /// pairs under a colliding identifier whose real keys differ are dropped first. The times are
+    /// the tactic's rule ([`match_times`]) over the presented columns, lane by lane.
     fn cross(
         &mut self,
         instance: &HalfJoinInstance<NativeBatch, Vec<Run>>,
-        stream: &HalfJoinStream<Time, Diff, i64, u64>,
-        arranged: &ProxyBridge<Time, Diff, i64, u64>,
+        stream: &HalfJoinStream<ColTimes<Time>, Diff, i64, u64>,
+        arranged: &LaneBridge<Time>,
         matches: &mut HalfJoinMatches<Diff>,
         output: &mut Vec<CC>,
     ) {
@@ -278,7 +279,7 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
         let mut cs: Vec<usize> = Vec::new();
         let mut js: Vec<usize> = Vec::new();
         for &(a, b) in matches.pairs.iter() {
-            let (c0, c1) = (stream[a].0.1, arranged[b].0.1);
+            let (c0, c1) = (stream.vals[a], arranged.vals[b]);
             rs.push((c0 >> COORD_BITS) as usize);
             us.push((c0 & mask) as usize);
             if primitive { tokens.push(c1 as i64); } else {
@@ -291,7 +292,7 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
         // Only pairs under a colliding identifier compare real keys, one batched comparison per
         // run and chunk. Colliding identifiers are hashed, so their tokens are coordinates.
         let kept: Option<Vec<usize>> = if self.colliding.is_empty() { None } else {
-            let mut suspect: Vec<usize> = (0..n).filter(|&i| self.colliding.binary_search(&stream[matches.pairs[i].0].0.0).is_ok()).collect();
+            let mut suspect: Vec<usize> = (0..n).filter(|&i| self.colliding.binary_search(&stream.keys[matches.pairs[i].0]).is_ok()).collect();
             suspect.sort_unstable_by_key(|&i| (rs[i], cs[i]));
             let mut keep = vec![true; n];
             let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -315,8 +316,6 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
                 js = kept.iter().map(|&i| js[i]).collect();
             }
         }
-        let pair = |i: usize| matches.pairs[kept.as_ref().map_or(i, |kept| kept[i])];
-
         // The projection over (key, val, arranged val), each projected to what it reads before
         // gathering; the collision checks above compared the original keys. The time as data
         // (the value's second field) is not the projection's to read: `advance` presented it.
@@ -338,35 +337,21 @@ impl ProxyHalfJoinBackend<Time, NativeBatch, Run> for CorgiHalfJoinBackend {
         let out_val = out.pop().unwrap();
         let out_key = out.pop().unwrap();
 
-        // The presented times as lanes, once per block: a time is as wide as its last nonzero
-        // coordinate, and the rest are zero.
-        let width = self.width;
-        let to_lanes = |times: &mut dyn Iterator<Item = &Time>, rows: usize| -> Vec<Vec<i64>> {
-            let mut lanes = vec![vec![0i64; rows]; width];
-            for (i, t) in times.enumerate() {
-                for (l, c) in t.coordinates().enumerate() {
-                    assert!(l < width, "half_join: a time wider than its scope");
-                    lanes[l][i] = c as i64;
-                }
-            }
-            lanes
-        };
-        let data = to_lanes(&mut stream.iter().map(|row| &row.1.data), stream.len());
-        let time2 = to_lanes(&mut arranged.iter().map(|row| &row.1), arranged.len());
-        // The data time of each match: the lane-wise max is the join in a product of chains.
-        let joined: Vec<CValue> = (0..width).map(|l| {
-            CValue::i64((0..rows).map(|i| { let (a, b) = pair(i); data[l][a].max(time2[l][b]) }).collect())
-        }).collect();
-        debug_assert!((0..rows).all(|i| {
-            let (a, b) = pair(i);
-            let t = data_time(&stream[a].1, &arranged[b].1);
-            let coords: Vec<i64> = t.coordinates().map(|c| c as i64).collect();
-            coords.iter().enumerate().all(|(l, &c)| joined[l].as_i64("lane").unwrap()[i] == c)
-        }), "half_join: the lane-wise data time must agree with the tactic's rule");
         // Each row keeps its update's own time, which the unit's capabilities cover: the driver
-        // ships the block stamped with all of them.
-        let mut times = ColTimes::new();
-        for (&r, &u) in rs.iter().zip(&us) { times.push_ref(runs[r].times(), u); }
+        // ships the block stamped with all of them. Its data time is `width` integer lanes, zero
+        // beyond the column's width.
+        let pairs: Cow<'_, [(usize, usize)]> = match &kept {
+            None => Cow::Borrowed(&matches.pairs),
+            Some(kept) => Cow::Owned(kept.iter().map(|&i| matches.pairs[i]).collect()),
+        };
+        let (mut times, mut data) = (ColTimes::new(), ColTimes::new());
+        match_times(stream, arranged, &pairs, &mut times, &mut data);
+        let width = self.width;
+        assert!(data.width() <= width, "half_join: a time wider than its scope");
+        let joined: Vec<CValue> = (0..width).map(|l| CValue::i64(match data.raw_lanes().get(l) {
+            Some(lane) => lane.iter().map(|&c| c as i64).collect(),
+            None => vec![0; rows],
+        })).collect();
         let diffs = match &kept {
             None => std::mem::take(&mut matches.diffs),
             Some(kept) => kept.iter().map(|&i| matches.diffs[i]).collect(),
@@ -417,7 +402,7 @@ mod tests {
             let lambda = Lambda::new("let (k, (a, _), (b, _)) = input in (k, (a, b))".into(), &corgi::Scope::default());
             let mut backend = CorgiHalfJoinBackend::new(&lambda, 2, [Shape::Int, pair.clone(), pair]);
             let instance = HalfJoinInstance { stream: vec![run], batches: vec![arranged] };
-            let (mut stream, mut arranged) = (Vec::new(), Vec::new());
+            let (mut stream, mut arranged) = (HalfJoinStream::default(), LaneBridge::default());
             backend.advance(&instance, &mut KeyPosition::Start, &mut stream, &mut arranged);
             assert_eq!(stream.len(), 2);
             assert!(arranged.is_empty());
@@ -533,10 +518,10 @@ mod tests {
         let pair = Shape::Prod(vec![Shape::Int, Shape::Int]);
         let mut backend = CorgiHalfJoinBackend::new(&pairing(), 2, [pair.clone(), Shape::Int, Shape::Int]);
         let instance = HalfJoinInstance { stream: backend.stage(vec![updates.clone()]), batches: arranged.clone() };
-        let (mut from, mut stream, mut arr) = (KeyPosition::Start, Vec::new(), Vec::new());
+        let (mut from, mut stream, mut arr) = (KeyPosition::Start, HalfJoinStream::default(), LaneBridge::default());
         backend.advance(&instance, &mut from, &mut stream, &mut arr);
         assert_eq!(backend.colliding, vec![0], "the one identifier holding two keys");
-        assert!(arr.windows(2).all(|w| (w[0].0, &w[0].1) < (w[1].0, &w[1].1)), "the arranged side is a consolidated bridge");
+        assert!((1..arr.len()).all(|i| ((arr.keys[i - 1], arr.vals[i - 1]), arr.times.get(i - 1)) < ((arr.keys[i], arr.vals[i]), arr.times.get(i))), "the arranged side is a consolidated bridge");
 
         let mut tactic = tactic(true, [pair, Shape::Int, Shape::Int]);
         let got: Vec<_> = tactic.prep(vec![updates], arranged, Antichain::from_elem(t(1, 0)))

@@ -2,14 +2,15 @@
 //! straight into the bridge, joined with `lower` as they are copied, so that no owned time is built
 //! per staged row. Each side of a key is then consolidated in place, sorting a row record of its
 //! token and first two time coordinates when the rows are out of order, and a key with an empty
-//! side is truncated off both bridges. The half join keeps the row staging of [`SideScratch`].
+//! side is truncated off both bridges. The half join stages its arranged side the same way, one
+//! side at a time ([`stage_side`]).
 
 use super::*;
 use differential_dataflow::operators::int_proxy::join::JoinBridge;
 use crate::runtime::col_times::ColTimes;
 
 /// The join's bridge, as DDIR fills it: `i64` group tokens, `u64` value tokens, times as lanes.
-pub(super) type LaneBridge<T> = JoinBridge<ColTimes<T>, Diff, i64>;
+pub(in crate::runtime) type LaneBridge<T> = JoinBridge<ColTimes<T>, Diff, i64>;
 
 /// Truncate `bridge` to its first `len` rows.
 fn truncate<T>(bridge: &mut LaneBridge<T>, len: usize) {
@@ -23,7 +24,7 @@ fn truncate<T>(bridge: &mut LaneBridge<T>, len: usize) {
 type Record = (u64, u64, u64, usize);
 
 /// Scratch for staging keys, reused across them.
-pub(super) struct Staging {
+pub(in crate::runtime) struct Staging {
     /// Cross-chunk value-merge heads.
     heads: Vec<(usize, usize)>,
     /// Row indices sorted by projected value.
@@ -35,7 +36,7 @@ pub(super) struct Staging {
 }
 
 impl Staging {
-    pub(super) fn new<T: ColTime>(lower: &T) -> Self {
+    pub(in crate::runtime) fn new<T: ColTime>(lower: &T) -> Self {
         Staging { heads: Vec::new(), idx: Vec::new(), records: Vec::new(), lower: lower.coordinates().collect() }
     }
 
@@ -79,9 +80,9 @@ impl Staging {
     }
 
     /// Append one key's records from `runs` (its equal-key row ranges, one per chunk holding it) to
-    /// `bridge` under group token `k`, with the tokens [`SideScratch::stage_runs`] mints: primitive
-    /// values identify themselves; other values share their least occurrence's coordinate across
-    /// chunks. Times are joined with `lower` as they are copied.
+    /// `bridge` under group token `k`: primitive values identify themselves; other values share
+    /// their least occurrence's coordinate across chunks. Times are joined with `lower` as they are
+    /// copied.
     fn append_runs<T: ColTime>(&mut self, bridge: &mut LaneBridge<T>, runs: &[RunRef<'_, T>], k: i64) {
         let Some(first) = runs.first() else { return };
         let lower = &self.lower[..];
@@ -169,10 +170,9 @@ impl Staging {
         bridge.keys.resize(bridge.vals.len(), k);
     }
 
-    /// Append a colliding identifier, as [`super::stage_collision`] does on rows: each real key is
-    /// appended on its own, so equal values from different real keys never share a token (their
-    /// coordinates differ), and all keep the identifier as their group token; `cross` discards
-    /// unequal-key pairs afterward.
+    /// Append a colliding identifier: each real key is appended on its own, so equal values from
+    /// different real keys never share a token (their coordinates differ), and all keep the
+    /// identifier as their group token; `cross` discards unequal-key pairs afterward.
     fn append_collision<T: ColTime>(&mut self, bridge: &mut LaneBridge<T>, runs: &[RunRef<'_, T>], k: i64) {
         let mut positions: Vec<usize> = runs.iter().map(|run| run.s).collect();
         loop {
@@ -234,6 +234,24 @@ pub(super) fn stage_pair<T: ColTime>(
         truncate(bridges.0, s0);
         truncate(bridges.1, s1);
     }
+}
+
+/// Stage one key of one side straight into `bridge`, consolidated in place: the half join's
+/// arranged side. A colliding key appends each real key apart. Returns whether any row remains.
+pub(in crate::runtime) fn stage_side<T: ColTime>(
+    token: i64,
+    runs: &[RunRef<'_, T>],
+    staging: &mut Staging,
+    bridge: &mut LaneBridge<T>,
+    collision: bool,
+) -> bool {
+    let start = bridge.len();
+    if collision {
+        staging.append_collision(bridge, runs, token);
+    } else {
+        staging.append_runs(bridge, runs, token);
+    }
+    staging.settle(bridge, start)
 }
 
 #[cfg(test)]

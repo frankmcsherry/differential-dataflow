@@ -44,7 +44,10 @@
 //! Both are welcome to efficiently notice that there have been no collisions and optimize,
 //! or to ignore the risk entirely and live dangerously.
 
+use std::cmp::Ordering;
 use std::ops::Range;
+
+use timely::progress::frontier::AntichainRef;
 
 use crate::difference::Multiply;
 use crate::lattice::Lattice;
@@ -86,6 +89,14 @@ pub trait TimeColumn<T>: Default {
     fn clear(&mut self);
     /// For each block `(r0, r1)`, append `a[i] ∨ b[j]` for `i` in `r0`, `j` in `r1`, `i` outer.
     fn extend_cross_join(&mut self, a: &Self, b: &Self, blocks: &[(Range<usize>, Range<usize>)]);
+    /// Order the time at `i` against `other`'s at `j`, in the total order `Ord` on times.
+    fn cmp_cross(&self, i: usize, other: &Self, j: usize) -> Ordering;
+    /// Append `src[i]` for each `i` in `rows`, in order.
+    fn extend_gather(&mut self, src: &Self, rows: &[usize]);
+    /// For each pair `(i, j)`, append `a[i] ∨ b[j]`.
+    fn extend_join_pairs(&mut self, a: &Self, b: &Self, pairs: &[(usize, usize)]);
+    /// Whether every time is at or beyond `since`.
+    fn all_beyond(&self, since: AntichainRef<T>) -> bool;
 
     // Scaffolding: the owned exits, to delete once nothing calls them.
     /// The time at `i`, owned.
@@ -94,7 +105,7 @@ pub trait TimeColumn<T>: Default {
     fn owned_push(&mut self, t: &T);
 }
 
-impl<T: Lattice + Clone> TimeColumn<T> for Vec<T> {
+impl<T: Lattice + Ord + Clone> TimeColumn<T> for Vec<T> {
     fn len(&self) -> usize { Vec::len(self) }
     fn clear(&mut self) { Vec::clear(self) }
     fn extend_cross_join(&mut self, a: &Self, b: &Self, blocks: &[(Range<usize>, Range<usize>)]) {
@@ -104,6 +115,14 @@ impl<T: Lattice + Clone> TimeColumn<T> for Vec<T> {
             }
         }
     }
+    fn cmp_cross(&self, i: usize, other: &Self, j: usize) -> Ordering { self[i].cmp(&other[j]) }
+    fn extend_gather(&mut self, src: &Self, rows: &[usize]) {
+        self.extend(rows.iter().map(|&i| src[i].clone()));
+    }
+    fn extend_join_pairs(&mut self, a: &Self, b: &Self, pairs: &[(usize, usize)]) {
+        self.extend(pairs.iter().map(|&(i, j)| a[i].join(&b[j])));
+    }
+    fn all_beyond(&self, since: AntichainRef<T>) -> bool { self.iter().all(|t| since.less_equal(t)) }
     fn owned_get(&self, i: usize) -> T { self[i].clone() }
     fn owned_push(&mut self, t: &T) { self.push(t.clone()) }
 }

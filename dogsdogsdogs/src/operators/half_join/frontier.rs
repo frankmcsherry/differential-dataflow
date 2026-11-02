@@ -19,16 +19,19 @@
 //! advance `(1, 5)` does not. That is the point: an import's rows appear once arranged, here, and
 //! once as a stream, read as of `since` by the operator that lifts them, and a delta query meets
 //! each pair exactly once only if both paths compare the same times. So there is no unit-level
-//! shortcut; the shortcut is per row, one `since.less_equal` per presented arranged row, which
-//! moves nothing at a program time. Only an import's history, at times before `since`, is
-//! advanced and consolidated.
+//! shortcut; the shortcut is per block, one column pass ([`TimeColumn::all_beyond`]) over the
+//! presented arranged times, which moves nothing at a program time. Only a block that holds an
+//! import's history, at times before `since`, is advanced and consolidated, through the owned
+//! exits.
 //!
 //! No key intersection is needed, unlike the join: the tactic skips keys found on one side alone.
 
 use timely::progress::Timestamp;
 
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::int_proxy::{read_as_of, BackendFrontier, KeyPosition, ProxyBridge};
+use differential_dataflow::operators::int_proxy::{read_as_of, BackendFrontier, KeyPosition, TimeColumn};
+use differential_dataflow::operators::int_proxy::frontier::{from_rows, to_rows};
+use differential_dataflow::operators::int_proxy::join::JoinBridge;
 
 use super::proxy::{HalfJoinInstance, HalfJoinMatches, HalfJoinStream, ProxyHalfJoinBackend};
 
@@ -45,6 +48,7 @@ where
     type ROut = Bk::ROut;
     type Output = Bk::Output;
     type Stream = Bk::Stream;
+    type Times = Bk::Times;
 
     fn stage(&mut self, chunks: Vec<C0>) -> Bk::Stream { self.inner_mut().stage(chunks) }
 
@@ -52,19 +56,21 @@ where
         &mut self,
         instance: &HalfJoinInstance<B, Bk::Stream>,
         from: &mut KeyPosition<Bk::Key>,
-        stream: &mut HalfJoinStream<T, Bk::R0, Bk::Key, Bk::V0>,
-        arranged: &mut ProxyBridge<T, Bk::R1, Bk::Key, Bk::V1>,
+        stream: &mut HalfJoinStream<Bk::Times, Bk::R0, Bk::Key, Bk::V0>,
+        arranged: &mut JoinBridge<Bk::Times, Bk::R1, Bk::Key, Bk::V1>,
     ) {
         self.inner_mut().advance(instance, from, stream, arranged);
-        if self.since().is_empty() { return; }
-        read_as_of(arranged, self.since());
+        if self.since().is_empty() || arranged.times.all_beyond(self.since().borrow()) { return; }
+        // Scaffolding: read the bridge as rows of owned times, and write it back.
+        let mut rows = to_rows(arranged);
+        if read_as_of(&mut rows, self.since()) { from_rows(rows, arranged); }
     }
 
     fn cross(
         &mut self,
         instance: &HalfJoinInstance<B, Bk::Stream>,
-        stream: &HalfJoinStream<T, Bk::R0, Bk::Key, Bk::V0>,
-        arranged: &ProxyBridge<T, Bk::R1, Bk::Key, Bk::V1>,
+        stream: &HalfJoinStream<Bk::Times, Bk::R0, Bk::Key, Bk::V0>,
+        arranged: &JoinBridge<Bk::Times, Bk::R1, Bk::Key, Bk::V1>,
         matches: &mut HalfJoinMatches<Bk::ROut>,
         output: &mut Vec<Bk::Output>,
     ) {

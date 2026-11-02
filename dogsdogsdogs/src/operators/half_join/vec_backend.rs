@@ -10,11 +10,12 @@ use differential_dataflow::Hashable;
 use differential_dataflow::consolidation::consolidate_updates;
 use differential_dataflow::difference::{Multiply, Semigroup};
 use differential_dataflow::lattice::Lattice;
-use differential_dataflow::operators::int_proxy::{KeyPosition, ProxyBridge};
+use differential_dataflow::operators::int_proxy::KeyPosition;
+use differential_dataflow::operators::int_proxy::join::JoinBridge;
 use differential_dataflow::trace::chunk::ChunkBatch;
 use differential_dataflow::trace::chunk::vec::VecChunk;
 
-use super::proxy::{data_time, HalfJoinInstance, HalfJoinMatches, HalfJoinStream, Lifted, ProxyHalfJoinBackend};
+use super::proxy::{match_times, HalfJoinInstance, HalfJoinMatches, HalfJoinStream, ProxyHalfJoinBackend};
 
 /// The batch type of a hash-keyed [`ChunkSpine`](differential_dataflow::trace::chunk::vec::ChunkSpine):
 /// updates `D` under their key's hash. Differential's `vec_backend` has the same alias, privately.
@@ -37,7 +38,7 @@ fn run_len<D, T, R>(slice: &[((u64, D), T, R)], key: u64) -> usize {
 /// reduce backend's is. Proxies are positions: a stream value's index in the staged, hash-sorted
 /// list, and an arranged value's index in a pool of distinct rows cloned for the current block,
 /// so that the arranged bridge is consolidated. A hash shared by several keys is matched in
-/// proxy space and told apart by comparing keys in `cross`.
+/// proxy space and told apart by comparing keys in `cross`. Times are a plain `Vec<T>` column.
 ///
 /// Arranged times are presented as stored; nothing advances them (see the half-join module).
 pub struct VecHalfJoinBackend<K, V, V2, T, R, L> {
@@ -80,6 +81,7 @@ where
     type ROut = R;
     type Output = Vec<((D, T), T, R)>;
     type Stream = Vec<((u64, (K, V, T)), T, R)>;
+    type Times = Vec<T>;
 
     /// The released updates, keyed by hash and sorted.
     fn stage(&mut self, chunks: Vec<Vec<((K, V, T), T, R)>>) -> Self::Stream {
@@ -94,8 +96,8 @@ where
         &mut self,
         instance: &HalfJoinInstance<VBatch<(K, V2), T, R>, Self::Stream>,
         from: &mut KeyPosition<u64>,
-        stream: &mut HalfJoinStream<T, R>,
-        arranged: &mut ProxyBridge<T, R>,
+        stream: &mut HalfJoinStream<Vec<T>, R>,
+        arranged: &mut JoinBridge<Vec<T>, R>,
     ) {
         let start = match *from { KeyPosition::Start => 0, KeyPosition::At(key) => key, KeyPosition::End => return };
         let staged = &instance.stream;
@@ -117,7 +119,11 @@ where
             let hash = staged[i].0.0;
             let end = i + run_len(&staged[i..], hash);
             for (index, ((_, (_, _, data)), time, diff)) in staged[i..end].iter().enumerate() {
-                stream.push(((hash, (i + index) as u64), Lifted { time: time.clone(), data: data.clone() }, diff.clone()));
+                stream.keys.push(hash);
+                stream.vals.push((i + index) as u64);
+                stream.times.push(time.clone());
+                stream.data.push(data.clone());
+                stream.diffs.push(diff.clone());
             }
             // Every arranged row of this hash, from every chunk of every batch, as stored.
             for batch in instance.batches.iter() {
@@ -137,28 +143,37 @@ where
         consolidate_updates(&mut self.staged);
         for ((hash, row), time, diff) in self.staged.drain(..) {
             if self.pool.last() != Some(&row) { self.pool.push(row); }
-            arranged.push(((hash, (self.pool.len() - 1) as u64), time, diff));
+            arranged.keys.push(hash);
+            arranged.vals.push((self.pool.len() - 1) as u64);
+            arranged.times.push(time);
+            arranged.diffs.push(diff);
         }
     }
 
     fn cross(
         &mut self,
         instance: &HalfJoinInstance<VBatch<(K, V2), T, R>, Self::Stream>,
-        stream: &HalfJoinStream<T, R>,
-        arranged: &ProxyBridge<T, R>,
+        stream: &HalfJoinStream<Vec<T>, R>,
+        arranged: &JoinBridge<Vec<T>, R>,
         matches: &mut HalfJoinMatches<R>,
         output: &mut Vec<Self::Output>,
     ) {
-        let mut out = Vec::with_capacity(matches.pairs.len());
-        for (&(a, b), diff) in matches.pairs.iter().zip(&matches.diffs) {
-            let ((_, v0), lifted, _) = &stream[a];
-            let ((_, v1), time2, _) = &arranged[b];
-            let (_, (key, val, _)) = &instance.stream[*v0 as usize].0;
-            let (key2, val2) = &self.pool[*v1 as usize];
-            // A shared hash is not a shared key.
-            if key != key2 { continue; }
-            out.push((((self.logic)(key, val, val2), data_time(lifted, time2)), lifted.time.clone(), diff.clone()));
+        // A shared hash is not a shared key.
+        let kept: Vec<usize> = (0..matches.pairs.len()).filter(|&m| {
+            let (a, b) = matches.pairs[m];
+            let (_, (key, _, _)) = &instance.stream[stream.vals[a] as usize].0;
+            key == &self.pool[arranged.vals[b] as usize].0
+        }).collect();
+        if kept.is_empty() { return; }
+        let pairs: Vec<(usize, usize)> = kept.iter().map(|&m| matches.pairs[m]).collect();
+        let (mut times, mut data) = (Vec::new(), Vec::new());
+        match_times(stream, arranged, &pairs, &mut times, &mut data);
+        let mut out = Vec::with_capacity(pairs.len());
+        for (((&(a, b), &m), time), data) in pairs.iter().zip(&kept).zip(times).zip(data) {
+            let (_, (key, val, _)) = &instance.stream[stream.vals[a] as usize].0;
+            let (_, val2) = &self.pool[arranged.vals[b] as usize];
+            out.push((((self.logic)(key, val, val2), data), time, matches.diffs[m].clone()));
         }
-        if !out.is_empty() { output.push(out); }
+        output.push(out);
     }
 }

@@ -698,7 +698,7 @@ fn fill<T>(bridge: &mut JoinBridge<Vec<T>, i64, u64, (u64, u64)>, rows: impl Ite
 }
 
 /// The rows `blocks` stand for, by the rule on [`JoinBlock`].
-fn crossed<T: Lattice + Clone>(bridge0: &JoinBridge<Vec<T>, i64, u64, (u64, u64)>, bridge1: &JoinBridge<Vec<T>, i64, u64, (u64, u64)>, blocks: &[JoinBlock]) -> Vec<((u64, ((u64, u64), (u64, u64))), T, i64)> {
+fn crossed<T: Lattice + Ord + Clone>(bridge0: &JoinBridge<Vec<T>, i64, u64, (u64, u64)>, bridge1: &JoinBridge<Vec<T>, i64, u64, (u64, u64)>, blocks: &[JoinBlock]) -> Vec<((u64, ((u64, u64), (u64, u64))), T, i64)> {
     let mut times = Vec::new();
     times.extend_cross_join(&bridge0.times, &bridge1.times, blocks);
     let mut diffs = Vec::new();
