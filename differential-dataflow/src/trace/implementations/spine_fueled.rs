@@ -476,15 +476,39 @@ impl<B: SpineBatch> Spine<B> {
             // Otherwise it is inserted normally at the end of the method.
             let mut batch = Some(self.pending.remove(0));
 
-            // If `batch` and the most recently inserted batch are both empty, we can just fuse them.
+            // If `batch` is empty and the most recently inserted span is alone in its layer, we can
+            // extend that span's description to cover `batch`: no merge, and no update moves. Spans
+            // reach `self.merging` only once the physical frontier passes them, so no reader can ask
+            // for the boundary this removes, as with any merge.
             // We can also replace a structurally empty batch with this empty batch, preserving the
             // apparent record count but now with non-trivial lower and upper bounds.
             if span_len(batch.as_ref().unwrap()) == 0 {
                 if let Some(position) = self.merging.iter().position(|m| !m.is_vacant()) {
-                    if self.merging[position].is_single() && self.merging[position].len() == 0 {
-                        self.insert_at(batch.take(), position);
-                        let merged = self.complete_at(position);
-                        self.merging[position] = MergeState::Single(merged);
+                    if let MergeState::Single(single) = &mut self.merging[position] {
+                        let empty = batch.take().unwrap();
+                        match single {
+                            None => { *single = Some(empty); }
+                            Some(span) => {
+                                assert!(span.upper() == empty.lower());
+                                // The `since` a merge of the two would bear.
+                                let since = span.desc.since().join(empty.desc.since()).join(&self.logical_frontier);
+                                span.desc = Description::new(span.lower().clone(), empty.upper().clone(), since);
+                                // Log the absorption as the merge it stands in for, begun and complete,
+                                // so that those counting spans see one fewer.
+                                if let Some(logger) = &self.logger {
+                                    let (length1, length2) = (span_len(span), span_len(&empty));
+                                    for complete in [None, Some(length1 + length2)] {
+                                        logger.log(crate::logging::MergeEvent {
+                                            operator: self.operator.global_id,
+                                            scale: position,
+                                            length1,
+                                            length2,
+                                            complete,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
