@@ -5,8 +5,10 @@ It says what exists, what was decided and why, what was measured, and which desi
 
 ## Where everything is
 
-- Branch `ddir-durable-names` (this branch): steps 1 and 2 below, in Rust. `interactive/src/storage.rs`, `interactive/server/src/durable.rs`, and the `save`, `unsave`, `restore` and `ledger` commands, with tests `saves_resume_on_one_worker` and `saves_resume_on_four_workers`.
-- Branch `ddir-durable-prototypes` (on master-next `379f0564`): the Python and DDIR prototypes behind everything else.
+Everything is on branch `ddir-durable-names`, on master-next.
+
+- Steps 1 and 2 below, in Rust: `interactive/src/storage.rs`, `interactive/server/src/durable.rs`, and the `save`, `unsave`, `restore` and `ledger` commands, with tests `saves_resume_on_one_worker` and `saves_resume_on_four_workers`.
+- The Python and DDIR prototypes behind everything else, under `interactive/bench/txn/`.
   - `interactive/bench/txn/storage/`: multi-shard compare-and-append on the transaction resolver.
   - `interactive/bench/txn/catalog/`: `SPEC.md`, the catalog and resolver programs, `run.py` (crash tests against a serial reference) and `pipeline.py` (pipelined ticks), and `sketches/` of directories and the ledger schema.
   - `interactive/bench/txn/control/`: the store and control services, provisioner, runner and client; etcd and S3 backends; `deploy/` notes for the minis.
