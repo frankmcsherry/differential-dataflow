@@ -47,7 +47,7 @@ Between commands, blank lines and `#` comment lines are skipped, so command
 scripts can be piped to stdin (see `demo/`).
 
 The useful commands are `load`, `drop`, `list`, `feed`, `bind`, `unbind`,
-`peek`, `tail`, `stop`, `tick`, and `exit`. `load <name> from <path>` installs
+`peek`, `tail`, `stop`, `save`, `unsave`, `restore`, `ledger`, `tick`, and `exit`. `load <name> from <path>` installs
 a program file (`.ddp`, pipe syntax); `load <name> from <path>
 explain` applies the explanation rewrite first (`explain=debug` also taps
 every demand collection with an inspect), after which the query input is
@@ -234,6 +234,36 @@ and bind the export `f(state) + (seed | negate)` to the feedback input; then
 `state(t) = f(state(t-1))`, while later seed feeds still inject as
 perturbations. A bound source cannot be dropped (it holds an importer), nor
 can the bound target (unbind first).
+
+## Durability: `save` and `restore`
+
+    save <trace> to <ledger>        unsave <ledger>
+    restore <prog> <in#> from <ledger>        ledger <ledger>
+
+A ledger is a named, durable changelog in the store that `DDIR_STORE` names, a directory
+(`interactive::storage`): a root holding its manifest, replaced only by compare-and-swap, and one
+blob per batch, each a frame of updates (the format `peek … as corgi` sends) named by its SHA-256.
+Every write is synced before it is used; on macOS that is `F_FULLFSYNC`.
+
+`save` follows a trace, as `tail` does, and at each `tick` appends the trace's changes before its
+frontier to the ledger as one batch, written by worker 0. `tick` answers only once its batches are
+durable. A save resumes its ledger rather than repeating it: its first batch is the trace's
+contents less what the ledger already holds, so a server rebuilt from its ledgers and saving the
+same traces again appends only what changes. If another writer appends to the ledger, the save
+stops writing and `ledger` reports the error. Saves outlive the session that started them, and a
+program whose export is being saved cannot be dropped until `unsave`.
+
+`restore` feeds a ledger's contents into an input at the current epoch, checked against the
+input's declared shape. `ledger` reports a ledger's version, upper, batch count and shape, and its
+save's progress. For example, with program `g` exporting `edges` and `reach`:
+
+    save edges to graph-edges        # from now on, every tick appends g's edges changes
+    save reach to graph-reach        # ... and its reach changes
+    # later, in a new server with g loaded again:
+    restore g 0 from graph-edges     # g's input 0 gets back the edges it had
+    tick
+    save edges to graph-edges        # resume both; nothing is appended until something changes
+    save reach to graph-reach
 
 ## Intake gates
 

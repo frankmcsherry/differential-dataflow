@@ -24,6 +24,7 @@ use timely::dataflow::operators::{CapabilitySet, Exchange, Probe};
 use timely::worker::Worker;
 
 use crate::cmd::{ConnectionId, Out, PreparedCommand, ReadFormat, Request};
+use crate::durable::{self, Save};
 use crate::ControlEvent;
 
 struct Tail {
@@ -151,6 +152,8 @@ pub fn run_worker(
     // instead (each importer re-arranges what it joins).
     server.set_arranged_imports(std::env::var("DDIR_ARRANGED_IMPORTS").map_or(true, |v| v != "0"));
     let mut tails: HashMap<TailKey, Tail> = HashMap::new();
+    // Standing saves, by ledger. They outlive the session that started them.
+    let mut saves: HashMap<String, Save> = HashMap::new();
     let mut responses: HashMap<u64, Sender<Out>> = HashMap::new();
     let mut next_token = 0u64;
     let mut intake_closed = false;
@@ -180,6 +183,7 @@ pub fn run_worker(
                         response,
                         &mut server,
                         &mut tails,
+                        &mut saves,
                         worker,
                         &mut shutdown,
                         logical_count,
@@ -250,6 +254,9 @@ pub fn run_worker(
     for (_, tail) in tails.drain() {
         worker.drop_dataflow(tail.dataflow_id);
     }
+    for ledger in saves.keys().cloned().collect::<Vec<_>>() {
+        let _ = durable::stop_save(&ledger, &mut saves, worker);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -260,6 +267,7 @@ fn dispatch(
     response: Option<Sender<Out>>,
     server: &mut Server,
     tails: &mut HashMap<TailKey, Tail>,
+    saves: &mut HashMap<String, Save>,
     worker: &mut Worker,
     shutdown: &mut bool,
     logical_count: Option<usize>,
@@ -271,17 +279,20 @@ fn dispatch(
                 .install(worker, &name, &program)
                 .map(|()| format!("installed {:?} ({} ops)", name, program.op_count())),
             ServerCommand::Drop { name } => {
-                if tails.values().any(|tail| {
+                let exports = |trace: &String| {
                     server
                         .program_info()
                         .iter()
                         .find(|program| program.name == name)
-                        .is_some_and(|program| program.exports.contains(&tail.trace))
-                }) {
+                        .is_some_and(|program| program.exports.contains(trace))
+                };
+                if tails.values().any(|tail| exports(&tail.trace)) {
                     Err(format!(
                         "cannot drop {:?}: a tail is reading one of its exports",
                         name
                     ))
+                } else if let Some((ledger, _)) = saves.iter().find(|(_, save)| exports(&save.trace)) {
+                    Err(format!("cannot drop {name:?}: one of its exports is being saved to ledger {ledger:?}; unsave first"))
                 } else {
                     // Every worker replays this drop in command order, but
                     // does not physically rendezvous. The typed process
@@ -379,7 +390,7 @@ fn dispatch(
             ServerCommand::Tick { n } => {
                 let timer = Instant::now();
                 for _ in 0..n {
-                    tick(server, tails, worker);
+                    tick(server, tails, saves, worker);
                 }
                 Ok(format!("t={} elapsed={:.2?}", server.epoch(), timer.elapsed()))
             }
@@ -435,6 +446,13 @@ fn dispatch(
             worker,
         )
         .map(|()| format!("tailing {:?} from t={}", name, server.epoch())),
+        Ok(PreparedCommand::Save { trace, ledger }) => durable::start_save(&trace, &ledger, server, saves, worker)
+            .map(|()| format!("saving {trace:?} to ledger {ledger:?} from t={}", server.epoch())),
+        Ok(PreparedCommand::Unsave { ledger }) => durable::stop_save(&ledger, saves, worker).map(|()| format!("stopped saving to ledger {ledger:?}")),
+        // Only worker 0 answers, so only it reads the store.
+        Ok(PreparedCommand::Ledger { name }) => {
+            if worker.index() == 0 { durable::describe(&name, saves) } else { Ok(String::new()) }
+        }
         Ok(PreparedCommand::Stop { tail_reqid }) => {
             let key = (connection_id, tail_reqid.clone());
             match tails.remove(&key) {
@@ -572,10 +590,14 @@ fn start_tail(
     Ok(())
 }
 
-fn tick(server: &mut Server, tails: &mut HashMap<TailKey, Tail>, worker: &mut Worker) {
+/// Close an epoch, and wait until every tail has sent, and every save has made durable, what the
+/// epoch closed.
+fn tick(server: &mut Server, tails: &mut HashMap<TailKey, Tail>, saves: &HashMap<String, Save>, worker: &mut Worker) {
     server.tick(worker);
     let epoch = server.epoch();
-    while tails.values().any(|tail| tail.probe.less_than(&host_time(epoch))) {
+    while tails.values().any(|tail| tail.probe.less_than(&host_time(epoch)))
+        || saves.values().any(|save| save.probe.less_than(&host_time(epoch)))
+    {
         worker.step();
     }
 }

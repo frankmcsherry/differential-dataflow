@@ -51,4 +51,7 @@ pub mod diag;
 // `Server`, `evaluate`, `generated_shape`, and the host's time and container types.
 pub mod server;
 
+// `FileStore`, `Shard`, `append`: content-named blobs, compare-and-swap roots, and shards on them.
+pub mod storage;
+
 mod level;

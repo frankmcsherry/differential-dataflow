@@ -113,7 +113,12 @@ fn request_observing(
 }
 
 fn start_server(workers: usize) -> (ServerProcess, TcpStream, BufReader<TcpStream>) {
+    start_server_with(workers, &[])
+}
+
+fn start_server_with(workers: usize, env: &[(&str, &str)]) -> (ServerProcess, TcpStream, BufReader<TcpStream>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ddir_server"))
+        .envs(env.iter().copied())
         .env("DDIR_WORKERS", workers.to_string())
         // The retired polling/tick knob must not reintroduce wall-clock
         // progress if it remains in an old deployment environment.
@@ -628,4 +633,99 @@ fn diagnostics_plan_uses_source_shapes_and_reports_the_legacy_knob() {
     let stages = report.lines().filter(|line| line.starts_with("p data === ")).count();
     assert!(stages > 0, "{report}");
     assert!(report.contains(&format!("p ok planned \"preview\" ({stages} stages)")), "{report}");
+}
+
+/// The `ok` line's body for `command`: its own words, which `request` discards.
+fn request_ok(writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, reqid: &str, command: &str) -> String {
+    let mut body = String::new();
+    request_observing(writer, reader, reqid, command, |line, _| {
+        if let Some(rest) = line.strip_prefix(reqid).and_then(|l| l.strip_prefix(" ok")) {
+            body = rest.trim().to_string();
+        }
+    });
+    body
+}
+
+/// A ledger's batches, each as its sorted rows `diff=<d> key=<k> val=<v>`, read from the store.
+fn ledger_batches(store: &std::path::Path, name: &str) -> Vec<Vec<String>> {
+    use interactive::storage::{read_ledger, Blobs, FileStore};
+    let store = FileStore::open(store).unwrap();
+    let (_, ledger) = read_ledger(&store, name).unwrap();
+    ledger.map_or(Vec::new(), |ledger| {
+        ledger.batches.iter().map(|(_, _, blob)| {
+            let mut rows = frame_rows(&store.get(blob).unwrap());
+            rows.sort();
+            rows
+        }).collect()
+    })
+}
+
+const GRAPH: &str = "let edges = input 0 : ((int), (int));\nexport \"edges\" = edges;\n\
+    let roots = edges | filter(((s), _) -> (s, 0) eq) | map(((s), _) -> ((s), ())) | distinct;\n\
+    reach: { let next = reached | join(edges, ((n), (), (m)) -> ((m), ())); set reached = (roots + next) | distinct; }\n\
+    export \"reach\" = reach::reached;\n";
+
+/// A server saves its traces to ledgers; a second server restores its input from them and saves
+/// again, appending only what changed; a writer that is not the save stops it.
+fn assert_saves_resume(workers: usize) {
+    let dir = std::env::temp_dir().join(format!("ddir-durable-{}-{workers}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = dir.to_str().unwrap();
+
+    let (server, mut w, mut r) = start_server_with(workers, &[("DDIR_STORE", store)]);
+    request(&mut w, &mut r, "a0", &format!("a0 load g begin\n{GRAPH}a0 end-load\n"));
+    request(&mut w, &mut r, "a1", "a1 feed g 0 begin\n0 val=1\n1 val=2\n5 val=6\na1 end-feed\n");
+    request(&mut w, &mut r, "a2", "a2 tick\n");
+    request(&mut w, &mut r, "a3", "a3 save edges to graph-edges\n");
+    request(&mut w, &mut r, "a4", "a4 save reach to graph-reach\n");
+    request(&mut w, &mut r, "a5", "a5 feed g 0 begin\n2 val=3\na5 end-feed\n");
+    request(&mut w, &mut r, "a6", "a6 tick\n");
+    let first = request_ok(&mut w, &mut r, "a7", "a7 ledger graph-reach\n");
+    assert!(first.contains("upper=2 batches=2") && first.contains("appended=2"), "{first}");
+    server.stop();
+    assert_eq!(ledger_batches(&dir, "graph-reach"), vec![
+        vec!["diff=1 key=tuple(0) val=tuple()", "diff=1 key=tuple(1) val=tuple()", "diff=1 key=tuple(2) val=tuple()"],
+        vec!["diff=1 key=tuple(3) val=tuple()"],
+    ]);
+
+    // A new server, restored from the ledger: saving the same traces again adds nothing until
+    // something changes, and then only the change.
+    let (second, mut w2, mut r2) = start_server_with(workers, &[("DDIR_STORE", store)]);
+    request(&mut w2, &mut r2, "b0", &format!("b0 load g begin\n{GRAPH}b0 end-load\n"));
+    request(&mut w2, &mut r2, "b1", "b1 restore g 0 from graph-edges\n");
+    request(&mut w2, &mut r2, "b2", "b2 tick\n");
+    request(&mut w2, &mut r2, "b3", "b3 save edges to graph-edges\n");
+    request(&mut w2, &mut r2, "b4", "b4 save reach to graph-reach\n");
+    let resumed = request_ok(&mut w2, &mut r2, "b5", "b5 ledger graph-reach\n");
+    assert!(resumed.contains("upper=2") && resumed.contains("appended=0"), "{resumed}");
+    request(&mut w2, &mut r2, "b6", "b6 feed g 0 begin\n3 val=4\nb6 end-feed\n");
+    request(&mut w2, &mut r2, "b7", "b7 tick\n");
+    assert_eq!(ledger_batches(&dir, "graph-reach").last().unwrap(), &vec!["diff=1 key=tuple(4) val=tuple()"]);
+    assert_eq!(ledger_batches(&dir, "graph-edges").len(), 3);
+
+    // Another writer appends to the ledger: the save refuses to write over it, and says so.
+    let other = interactive::storage::FileStore::open(&dir).unwrap();
+    let (version, _) = interactive::storage::read_ledger(&other, "graph-reach").unwrap();
+    interactive::storage::append(&other, "graph-reach", version, "((Int), ())", b"not ours").unwrap();
+    request(&mut w2, &mut r2, "b8", "b8 feed g 0 begin\n4 val=7\nb8 end-feed\n");
+    request(&mut w2, &mut r2, "b9", "b9 tick\n");
+    let fenced = request_ok(&mut w2, &mut r2, "b10", "b10 ledger graph-reach\n");
+    assert!(fenced.contains("upper=4") && fenced.contains("error="), "{fenced}");
+    let edges = request_ok(&mut w2, &mut r2, "b11", "b11 ledger graph-edges\n");
+    assert!(edges.contains("upper=4") && !edges.contains("error="), "{edges}");
+    request(&mut w2, &mut r2, "b12", "b12 unsave graph-reach\n");
+    request(&mut w2, &mut r2, "b13", "b13 unsave graph-edges\n");
+    request(&mut w2, &mut r2, "b14", "b14 drop g\n");
+    second.stop();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn saves_resume_on_one_worker() {
+    assert_saves_resume(1);
+}
+
+#[test]
+fn saves_resume_on_four_workers() {
+    assert_saves_resume(4);
 }

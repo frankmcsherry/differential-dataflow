@@ -24,6 +24,7 @@
 mod cmd;
 #[path = "loop_.rs"]
 mod control_loop;
+mod durable;
 
 use mimalloc::MiMalloc;
 

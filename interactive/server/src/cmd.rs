@@ -147,6 +147,16 @@ pub enum Cmd {
         prog: String,
         input: usize,
     },
+    /// Write a trace's changes to a durable ledger at each tick (see `durable`).
+    /// `save <trace> to <ledger>`.
+    Save { trace: String, ledger: String },
+    /// Stop a save. `unsave <ledger>`.
+    Unsave { ledger: String },
+    /// Feed a durable ledger's contents into `prog`'s positional `input`.
+    /// `restore <prog> <in#> from <ledger>`.
+    Restore { prog: String, input: usize, ledger: String },
+    /// Describe a durable ledger, and its save if it has one. `ledger <name>`.
+    Ledger { name: String },
     /// Advance ambient time by `n` (default 1).
     Tick { n: u64 },
     /// End the session.
@@ -163,6 +173,9 @@ pub enum PreparedCommand {
     Peek { name: String, key: Option<String>, format: ReadFormat },
     Tail { name: String, format: ReadFormat },
     Stop { tail_reqid: ReqId },
+    Save { trace: String, ledger: String },
+    Unsave { ledger: String },
+    Ledger { name: String },
 }
 
 /// The declared shapes of loaded programs' inputs, by program name, shared by every session so
@@ -233,6 +246,14 @@ pub fn prepare(command: Cmd, catalog: &Catalog) -> Result<PreparedCommand, Strin
         Cmd::Feed { prog, input, columns, time } => ServerCommand::Feed { prog, input, columns, time },
         Cmd::FeedColumns { prog, input, columns } => ServerCommand::FeedColumns { prog, input, columns },
         Cmd::Source { prog, input, source, diff } => ServerCommand::Load { prog, input, source, diff },
+        Cmd::Save { trace, ledger } => return Ok(PreparedCommand::Save { trace, ledger }),
+        Cmd::Unsave { ledger } => return Ok(PreparedCommand::Unsave { ledger }),
+        Cmd::Ledger { name } => return Ok(PreparedCommand::Ledger { name }),
+        // A restore is a feed of the ledger's contents, read here, at the input's declared shapes.
+        Cmd::Restore { prog, input, ledger } => {
+            let columns = crate::durable::contents(&ledger, &catalog.shape(&prog, input)?)?;
+            ServerCommand::FeedColumns { prog, input, columns }
+        }
         Cmd::Bind { trace, prog, input } => ServerCommand::Bind { trace, prog, input },
         Cmd::Unbind { trace, prog, input } => ServerCommand::Unbind { trace, prog, input },
         Cmd::Tick { n } => ServerCommand::Tick { n },
@@ -331,7 +352,7 @@ pub struct LineParser {
 /// instead of an explicit reqid, the parser synthesizes a reqid.
 const COMMAND_KEYWORDS: &[&str] = &[
     "load", "plan", "drop", "list", "peek", "tail", "stop", "tick", "exit", "feed", "bind",
-    "unbind",
+    "unbind", "save", "unsave", "restore", "ledger",
 ];
 
 /// Program-size gate: a `load` body larger than this is rejected at intake,
@@ -860,6 +881,25 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                 Err(_) => ParseOutcome::Err(format!("tick: bad count {:?}", n)),
             },
             _ => ParseOutcome::Err("tick: expected `[n]`".into()),
+        },
+        "save" => match args {
+            [trace, "to", ledger] => ParseOutcome::Cmd(Cmd::Save { trace: (*trace).to_string(), ledger: (*ledger).to_string() }),
+            _ => ParseOutcome::Err("save: expected `<trace> to <ledger>`".into()),
+        },
+        "unsave" => match args {
+            [ledger] => ParseOutcome::Cmd(Cmd::Unsave { ledger: (*ledger).to_string() }),
+            _ => ParseOutcome::Err("unsave: expected `<ledger>`".into()),
+        },
+        "restore" => match args {
+            [prog, input, "from", ledger] => match input.parse() {
+                Ok(input) => ParseOutcome::Cmd(Cmd::Restore { prog: (*prog).to_string(), input, ledger: (*ledger).to_string() }),
+                Err(_) => ParseOutcome::Err(format!("restore: <in#> must be a number, got {input:?}")),
+            },
+            _ => ParseOutcome::Err("restore: expected `<prog> <in#> from <ledger>`".into()),
+        },
+        "ledger" => match args {
+            [name] => ParseOutcome::Cmd(Cmd::Ledger { name: (*name).to_string() }),
+            _ => ParseOutcome::Err("ledger: expected `<name>`".into()),
         },
         "exit" => ParseOutcome::Cmd(Cmd::Exit),
         other => ParseOutcome::Err(format!("unknown command {:?}", other)),

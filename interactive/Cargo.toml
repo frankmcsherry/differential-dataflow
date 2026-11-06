@@ -18,8 +18,14 @@ corgi = { git = "https://github.com/frankmcsherry/WIP", rev = "2751e04e8501d47b3
 differential-dataflow = { workspace = true }
 differential-dogs3 = { path = "../dogsdogsdogs", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+# Content names for durable blobs (`storage`).
+sha2 = "0.10"
 smallvec = "1.15.1"
 timely = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# `flock`, which serializes a store's compare-and-swaps across processes (`storage`).
+libc = "0.2"
 
 [dev-dependencies]
 diagnostics = { path = "../diagnostics" }
