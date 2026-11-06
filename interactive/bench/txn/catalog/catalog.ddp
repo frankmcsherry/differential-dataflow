@@ -1,0 +1,68 @@
+-- A durable store's catalog: a map from ids to sets of batches, and the views
+-- that readers and mergers need (see SPEC.md).
+--
+-- This program holds the catalog in memory. It is fed only conclusions that are
+-- already durable, and after a crash it is rebuilt by feeding the durable log back.
+--
+-- `records` is ((key), (txn, value)), the compare-and-swap cells the resolver
+-- guards: key >= 0 is id `key`'s upper, key < 0 is id `-key-1`'s generation,
+-- which every merge advances. `txn` is the transaction that last wrote the cell.
+-- `batches` is ((id), (lower, upper, since, blob)): batch [lower, upper) of id,
+-- its times advanced to `since`, its contents in `blob`.
+-- HISTORY is how far behind its upper an id keeps readable history; the driver
+-- substitutes a number for it before loading.
+
+let records = input 0 : ((int), (int, int));
+let batches = input 1 : ((int), (int, int, int, int));
+-- Uppers and generations are exported apart: appends touch only uppers, so their
+-- arrangement is the one that changes each epoch and the one appends search, while
+-- generations change only with merges.
+export "records_up" = records | filter(((k), _) -> (k, 0) ge);
+export "records_gen" = records | filter(((k), _) -> (k, 0) lt);
+export "batches" = batches;
+
+let uppers = records | filter(((k), _) -> (k, 0) ge) | map(((k), (_, u)) -> ((k), (u)));
+
+-- Each id's retention frontier R = max(0, upper - HISTORY): reads at times >= R.
+let retain = uppers | map(((id), (u)) -> ((id), (((u, HISTORY) sub, 0) max)));
+
+-- Batches a read at R may use: those with since <= R, keyed by (id, lower) so
+-- that a chain can be extended from a batch's lower to its upper.
+let usable = batches | join(retain, ((id), (lo, hi, s, b), (r)) -> ((id, lo, hi, s, b), (r)))
+           | filter(((_, _, _, s, _), (r)) -> (s, r) le)
+           | map(((id, lo, hi, s, b), _) -> ((id, lo), (hi, s, b)));
+
+-- d(id, p): the fewest usable batches that chain from time 0 to time p.
+-- Shortest paths from 0 over the graph whose edges are batches, lower -> upper.
+-- Every batch has lower < upper, so the graph has no cycles and this terminates.
+let seeds = uppers | map(((id), _) -> ((id, 0), (0)));
+dist: {
+    let step = d | join(usable, ((id, _), (n), (hi, _, _)) -> ((id, hi), ((n, 1) add)));
+    set d = (seeds + step) | min;
+}
+let d = dist::d;
+
+-- best(id, p): of the usable batches ending at p, the one whose lower is fewest
+-- batches from 0 (ties: the least blob). Following `best` back from any reachable
+-- point gives a shortest chain.
+let best = usable | join(d, ((id, lo), (hi, s, b), (n)) -> ((id, hi), (n, b, lo, s))) | min;
+
+-- Walk back from each id's upper to 0 along `best`: the points of the reader's chain.
+let tops = uppers | filter((_, (u)) -> (u, 0) gt) | map(((id), (u)) -> ((id, u), ()));
+walk: {
+    let prev = pts | join(best, ((id, _), (), (_, _, lo, _)) -> ((id, lo), ()));
+    set pts = (tops + (prev | filter(((_, p), ()) -> (p, 0) gt))) | distinct;
+}
+-- The chain itself: the batch that ends at each point of the walk.
+let chain = walk::pts | join(best, ((id, hi), (), (_, b, lo, s)) -> ((id), (lo, hi, s, b)));
+
+-- Ids whose upper no usable chain reaches. The coverage invariant says this is
+-- always empty; the driver checks it every epoch.
+let reached = tops | join(d, ((id, _), (), _) -> ((id), ()));
+let uncovered = (tops | map(((id, _), ()) -> ((id), ()))) + (reached | negate);
+
+-- What a reader at time t >= R accumulates, and what a merger plans against.
+export "chain" = chain;
+export "uncovered" = uncovered;
+-- Batches no reader at or after R needs: what a merger may retire.
+export "retirable" = batches + (chain | negate);

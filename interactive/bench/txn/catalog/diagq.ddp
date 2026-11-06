@@ -1,0 +1,10 @@
+-- Scheduled time by (program, statement, operator name), over live and retired
+-- operators, from the server's diagnostics sources (see interactive/src/diag.rs).
+-- Counts are nanoseconds, summed over workers.
+let operator = import "diag.operator" : ((int, int), (List(int), List(int), List(int), List(int)));
+let time     = import "diag.time" : ((int, int), ());
+let retired  = import "diag.time_retired" : ((int, List(int), List(int), List(int)), ());
+let named = operator | map((key, (program, statement, name, _)) -> (key, (program, statement, name)));
+let live = time | join(named, (_, (), psn) -> (psn, ()));
+let dead = retired | map(((_, p, s, n), ()) -> ((p, s, n), ()));
+export "q.by_op" = (live + dead) | count;

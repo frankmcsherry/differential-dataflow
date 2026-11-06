@@ -1,0 +1,8 @@
+-- Nodes reachable from node 0, over the edges in input 0: ((src), (dst)).
+let edges = input 0 : ((int), (int));
+let roots = edges | filter(((s), _) -> (s, 0) eq) | map(((s), _) -> ((s), ())) | distinct;
+reach: {
+    let next = reached | join(edges, ((n), (), (m)) -> ((m), ()));
+    set reached = (roots + next) | distinct;
+}
+export "reach" = reach::reached;

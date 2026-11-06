@@ -1,0 +1,4 @@
+-- Sums frames of catalog updates: the log compactor's scratch program.
+-- An export is an arrangement, so reading it back gives each row once, with its total diff.
+export "log_records" = input 0 : ((int), (int, int));
+export "log_batches" = input 1 : ((int), (int, int, int, int));

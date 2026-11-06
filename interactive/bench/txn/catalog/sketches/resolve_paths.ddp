@@ -1,0 +1,24 @@
+-- What each name in a directory tree is bound to, and path lookup over the tree.
+type Entry = Blob int | Inline List(int) | Dir int | Mount List(int);
+
+-- (dir, name) -> (tag, number, bytes): 0 Blob(number), 1 Inline(bytes), 2 Dir(number), 3 Mount(bytes).
+-- Fed as a product here only because the test client cannot yet encode sums.
+let raw = input 0 : ((int, List(int)), (int, int, List(int)));
+let entries = raw | map((k, (t, n, b)) -> (k, (((t, 2) eq, n inject Dir, ((t, 0) eq, n inject Blob, ((t, 1) eq, b inject Inline, b inject Mount) select) select) select)));
+
+-- Paths to look up, one row per component: (query, depth) -> name.
+let paths = input 1 : ((int, int), (List(int)));
+let starts = paths | filter(((_, d), _) -> (d, 0) eq) | map(((q, d), (name)) -> ((0, name), (q, d)));
+
+walk: {
+    -- A component bound to a directory continues into it with the next component.
+    let dirs = reached
+        | filter((_, (e)) -> e match (Blob (_ -> 0), Inline (_ -> 0), Dir (_ -> 1), Mount (_ -> 0)))
+        | map(((q, d), (e)) -> ((q, (d, 1) add), (e match (Blob (_ -> -1), Inline (_ -> -1), Dir (x -> x), Mount (_ -> -1)))));
+    let next = dirs | join(paths, ((q, d), (dir), (name)) -> ((dir, name), (q, d)));
+    set reached = (starts + next) | join(entries, ((_, _), (q, d), (e)) -> ((q, d), (e)));
+}
+
+-- The answer is what the last component is bound to; a missing name gives no row.
+let last = paths | map(((q, d), _) -> ((q), (d neg))) | min | map(((q), (nd)) -> ((q, nd neg), ()));
+export "resolved" = last | join(walk::reached, ((q, _), (), (e)) -> ((q), (e)));

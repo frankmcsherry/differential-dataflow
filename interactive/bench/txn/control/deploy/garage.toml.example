@@ -1,0 +1,11 @@
+metadata_dir = "/Users/mcsherry/ddir-draft/garage/meta"
+data_dir = "/Users/mcsherry/ddir-draft/garage/data"
+db_engine = "sqlite"
+replication_factor = 3
+rpc_bind_addr = "0.0.0.0:3901"
+rpc_secret = "<openssl rand -hex 32, the same on every node>"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "0.0.0.0:3900"
+root_domain = ".s3.garage"

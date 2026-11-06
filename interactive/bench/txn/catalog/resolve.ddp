@@ -1,0 +1,101 @@
+-- One epoch of catalog transactions (see SPEC.md).
+--
+-- Installed for one epoch, fed that epoch's transactions, ticked once, read, and
+-- dropped. It imports the catalog's records (uppers and generations, exported
+-- apart) and changes nothing itself: its exports are the epoch's conclusions,
+-- which the driver makes durable and only then feeds back into the catalog.
+--
+-- A transaction is rows of two inputs, all sharing its id `txn`:
+--   input 0, intents, in maintained.ddp's row format, over the catalog's records:
+--     ((txn, 1, key), (expected))   a read: commit only if `key` holds `expected`,
+--     ((txn, 0, key), (value))      a write: set `key` to `value` if it commits.
+--   input 1, effects on the set of batches, applied only if it commits:
+--     ((txn, 1, id), (lower, upper, since, blob))   add this batch,
+--     ((txn, 0, id), (lower, upper, since, blob))   remove this batch.
+-- An append to an id reads and writes its upper and adds one batch. A merge reads
+-- the id's upper and gen, writes gen + 1, and adds a rollup and/or removes batches.
+--
+-- Transactions take effect in id order. Transaction T commits if each of its reads
+-- sees `expected` from the last write before T by a transaction that commits, or
+-- from the catalog if there is none. This is a recursive definition, because
+-- whether a write counts depends on whether its transaction commits; `res`
+-- iterates it to its fixed point.
+--
+-- Exports:
+--   `rollback`  ((txn), ())                         transactions that do not commit,
+--   `delta`     ((key), (txn, value))                the change to `records`,
+--   `adds`      ((id), (lower, upper, since, blob))  batches to add,
+--   `removes`   ((id), (lower, upper, since, blob))  batches to remove.
+
+let store_up = import "records_up" : ((int), (int, int));
+let store_gen = import "records_gen" : ((int), (int, int));
+let intents = input 0 : ((int, int, int), (int));
+let effects = input 1 : ((int, int, int), (int, int, int, int));
+
+-- ((txn, key), expected) for reads, and ((txn, key), value) for writes.
+let reads  = intents | filter(((_, r, _), _) -> (r, 1) eq) | map(((rid, _, k), (e)) -> ((rid, k), (e)));
+let wr_all = intents | filter(((_, r, _), _) -> (r, 0) eq) | map(((wid, _, k), (v)) -> ((wid, k), (v)));
+let wid = wr_all | map(((wid, k), (v)) -> ((wid), (k, v)));
+
+-- Everything is grouped by record key, as (tag, txn, value): tag 1 is a read and
+-- the value it expects, tag 0 is a write and the value it writes. The catalog's
+-- current row for each key read joins as a write by its last writer, whose id is
+-- older than any in this epoch, so every read has a write to compare against.
+-- The store is read here, outside the recursion, only at the keys this epoch reads.
+let read_entries = reads | map(((rid, k), (e)) -> ((k), (1, rid, e)));
+-- Each key looks only in its own half of the records: uppers (k >= 0) or generations.
+let read_up = read_entries | filter(((k), _) -> (k, 0) ge);
+let read_gen = read_entries | filter(((k), _) -> (k, 0) lt);
+let store_entries = (read_up | join(store_up, ((k), _, (sw, v)) -> ((k), (0, sw, v))))
+                  + (read_gen | join(store_gen, ((k), _, (sw, v)) -> ((k), (0, sw, v))));
+
+res: {
+    -- This epoch's writes, less those of transactions currently rolled back.
+    let wr_bad = wid | join(rollback, (wid, kv, ()) -> (wid, kv));
+    let writes = wid + (wr_bad | negate);
+    let write_entries = writes | map(((wid), (k, v)) -> ((k), (0, wid, v)));
+
+    -- One reduce per key. For each read i of the key, find the write with the
+    -- greatest id j < i (the fold, starting from "none" = (-1, -1)), and report i
+    -- if that write's value differs from what i expected. A key with no prior write
+    -- passes only a read expecting -1 ("absent"); the catalog seeds every key it
+    -- uses, so that case does not arise here.
+    let bad = (read_entries + store_entries + write_entries) | reduce((_, vals) ->
+        let entries = vals map ((e, _) -> e) in
+        let ws = (entries map ((t, _, _) -> (t, 0) eq), entries) zip filter in
+        let rs = (entries map ((t, _, _) -> (t, 1) eq), entries) zip filter in
+        let judged = (ws, rs) cap_list map ((ws, (_, i, x)) ->
+            let best = ((-1, -1), (i, ws) cap_list) fold (((bid, bv), (i, (_, j, y))) ->
+                (((j, i) lt, (j, bid) gt) and, (j, y), (bid, bv)) select) in
+            let (bid, bv) = best in
+            (((bid, -1) eq, (x, -1) ne, (bv, x) ne) select, ((i), 1))) in
+        (judged map ((b, _) -> b), judged map ((_, o) -> o)) zip filter);
+
+    -- A transaction rolls back if any one of its reads fails. Rolling a transaction
+    -- back removes its writes above, which can change other reads' verdicts, in
+    -- either direction; the iteration runs until nothing changes.
+    set rollback = bad | map((_, (rid)) -> ((rid), ())) | distinct;
+}
+
+let rb = res::rollback;
+let wbad = wid | join(rb, (wid, kv, ()) -> (wid, kv));
+let committed = wid + (wbad | negate);
+
+-- Each written key's last committed write this epoch (least negated id), as a new
+-- row, and the catalog's current row for it, retracted.
+let latest = committed | map(((wid), (k, v)) -> ((k), (wid neg, v))) | min;
+let new_rows = latest | map(((k), (nw, v)) -> ((k), (nw neg, v)));
+let old_rows = (latest | filter(((k), _) -> (k, 0) ge) | join(store_up, ((k), _, (sw, sv)) -> ((k), (sw, sv))))
+             + (latest | filter(((k), _) -> (k, 0) lt) | join(store_gen, ((k), _, (sw, sv)) -> ((k), (sw, sv))));
+
+-- Effects of transactions that commit, split into adds and removes.
+let eff = effects | map(((t, op, id), (lo, hi, s, b)) -> ((t), (op, id, lo, hi, s, b)));
+let eff_bad = eff | join(rb, ((t), e, ()) -> ((t), e));
+let eff_ok = eff + (eff_bad | negate);
+
+export "rollback" = rb;
+export "delta" = new_rows + (old_rows | negate);
+export "adds" = eff_ok | filter((_, (op, _, _, _, _, _)) -> (op, 1) eq)
+              | map((_, (_, id, lo, hi, s, b)) -> ((id), (lo, hi, s, b)));
+export "removes" = eff_ok | filter((_, (op, _, _, _, _, _)) -> (op, 0) eq)
+                 | map((_, (_, id, lo, hi, s, b)) -> ((id), (lo, hi, s, b)));

@@ -1,0 +1,11 @@
+-- Shard state for the multi-shard compare-and-append resolver
+-- (see resolve.ddp).
+--
+-- `uppers` is ((shard), (txn id, upper)): one row per shard, the transaction
+-- that last advanced it and its upper.
+-- `batches` is ((shard), (lower, upper, blob)): every appended batch, a chain
+-- of half-open intervals [lower, upper) per shard.
+let uppers = input 0 : ((int), (int, int));
+let batches = input 1 : ((int), (int, int, int));
+export "uppers" = uppers;
+export "batches" = batches;

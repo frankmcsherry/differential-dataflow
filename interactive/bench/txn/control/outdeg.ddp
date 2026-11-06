@@ -1,0 +1,3 @@
+-- Each node's out-degree, over the edges in input 0: ((src), (dst)).
+let edges = input 0 : ((int), (int));
+export "outdeg" = edges | map(((s), _) -> ((s), ())) | count;
