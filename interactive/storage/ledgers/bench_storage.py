@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Closed-loop multi-shard compare-and-append benchmark for the live DDIR server.
+"""Closed-loop multi-ledger compare-and-append benchmark for the live DDIR server.
 
-A transaction appends one batch to each of `width` shards, atomically: for each
-shard it reads the upper it expects and writes a new upper, and it names the
+A transaction appends one batch to each of `width` ledgers, atomically: for each
+ledger it reads the upper it expects and writes a new upper, and it names the
 blob holding the batch. Each cycle installs resolve.ddp for one epoch, admits
 the batch's intents and blobs, closes the epoch, reads `rollback` and
-`garbage`, feeds `delta` and `append` into shards.ddp, and drops the resolver.
+`garbage`, feeds `delta` and `append` into ledgers.ddp, and drops the resolver.
 
 Every cycle's rollbacks and garbage are checked against a serial reference, and
-at the end every shard's upper and batch chain are compared in full.
+at the end every ledger's upper and batch chain are compared in full.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parents[1] / "bench" / "txn"))
 from bench_txn import (  # noqa: E402
     DEFAULT_BINARY, INTENTS, Client, ServerProcess, comma_ints, percentile,
 )
@@ -37,7 +37,7 @@ UPPERS = (("prod", ["int"]), ("prod", ["int", "int"]))
 
 @dataclass(frozen=True)
 class Append:
-    """For each shard: (shard, expected upper, new upper, blob)."""
+    """For each ledger: (ledger, expected upper, new upper, blob)."""
 
     txn_id: int
     parts: tuple[tuple[int, int, int, int], ...]
@@ -60,8 +60,8 @@ class Sample:
                 + self.apply_ms + self.drop_ms)
 
 
-class Shards:
-    """The serial reference: each shard's upper and its batch chain."""
+class Ledgers:
+    """The serial reference: each ledger's upper and its batch chain."""
 
     def __init__(self, count: int):
         self.uppers = [0] * count
@@ -82,16 +82,16 @@ class Shards:
 
 
 def generate(rng: random.Random, first_id: int, first_blob: int, count: int, width: int,
-             shards: int, pattern: str, cycle: int, uppers: list[int]) -> list[Append]:
-    """Expected uppers are the shards' uppers as of the batch's start."""
+             ledgers: int, pattern: str, cycle: int, uppers: list[int]) -> list[Append]:
+    """Expected uppers are the ledgers' uppers as of the batch's start."""
     txns = []
     blob = first_blob
     for i in range(count):
         if pattern == "disjoint":
             base = (cycle * count + i) * width
-            chosen = [(base + j) % shards for j in range(width)]
+            chosen = [(base + j) % ledgers for j in range(width)]
         else:
-            chosen = rng.sample(range(shards), width)
+            chosen = rng.sample(range(ledgers), width)
         parts = []
         for s in chosen:
             parts.append((s, uppers[s], uppers[s] + 1, blob))
@@ -125,7 +125,7 @@ def keyset(client: Client, trace: str) -> tuple[set[int], float]:
     return out, ms
 
 
-def run_cycle(client: Client, txns: list[Append], ref: Shards, resolver: Path) -> Sample:
+def run_cycle(client: Client, txns: list[Append], ref: Ledgers, resolver: Path) -> Sample:
     expected_rollback, expected_garbage = ref.apply(txns)
     install_ms = client.load("res", resolver)
     ikeys, ivals, bkeys, bvals = [], [], [], []
@@ -145,13 +145,13 @@ def run_cycle(client: Client, txns: list[Append], ref: Shards, resolver: Path) -
                            f"extra={sorted(rollback - expected_rollback)[:10]}")
     if garbage != expected_garbage:
         raise RuntimeError("garbage mismatch")
-    apply_ms = feed_from(client, "shards", 0, "delta") + feed_from(client, "shards", 1, "append")
+    apply_ms = feed_from(client, "ledgers", 0, "delta") + feed_from(client, "ledgers", 1, "append")
     drop_ms = client.drop("res")
     return Sample(len(txns), len(txns) - len(expected_rollback), install_ms, submit_ms,
                   resolve_ms, observe_ms, apply_ms, drop_ms)
 
 
-def check_final(client: Client, ref: Shards) -> None:
+def check_final(client: Client, ref: Ledgers) -> None:
     client.tick()  # apply the last cycle's delta and append
     rows, _ = client.peek("uppers")
     uppers = {}
@@ -170,7 +170,7 @@ def check_final(client: Client, ref: Shards) -> None:
     for s, chain in batches.items():
         chain.sort()
         if any(a[1] != b[0] for a, b in zip(chain, chain[1:])):
-            raise RuntimeError(f"shard {s} batches do not chain: {chain[:5]}")
+            raise RuntimeError(f"ledger {s} batches do not chain: {chain[:5]}")
     if {s: sorted(c) for s, c in batches.items()} != {s: sorted(c) for s, c in ref.batches.items()}:
         raise RuntimeError("final batches differ from the serial reference")
 
@@ -182,8 +182,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--widths", type=comma_ints, default=[1, 2, 4, 8, 16, 32, 64])
     parser.add_argument("--appends", type=int, default=20_000,
-                        help="shard appends attempted per cycle; transactions = appends / width")
-    parser.add_argument("--shards", type=comma_ints, default=[1_000_000])
+                        help="ledger appends attempted per cycle; transactions = appends / width")
+    parser.add_argument("--ledgers", type=comma_ints, default=[1_000_000])
     parser.add_argument("--pattern", choices=["random", "disjoint"], default="random")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
@@ -193,25 +193,25 @@ def main() -> None:
     args = parser.parse_args()
     os.environ.setdefault("DDIR_MAX_FEED_BYTES", str(1 << 28))
 
-    print("shards    width  txns/cycle commit%  txns/s     commits/s  appends/s  "
+    print("ledgers   width  txns/cycle commit%  txns/s     commits/s  appends/s  "
           "cycle-p50/p95-ms  resolve-ms", flush=True)
     results = []
-    for shards in args.shards:
+    for ledgers in args.ledgers:
         for width in args.widths:
             if args.appends % width:
                 raise SystemExit("--appends must be divisible by every width")
             count = args.appends // width
             rng = random.Random(args.seed)
-            ref = Shards(shards)
+            ref = Ledgers(ledgers)
             samples = []
             with ServerProcess(args.binary.resolve(), args.workers, shlex.split(args.wrap), True) as client:
-                client.load("shards", HERE / "shards.ddp")
-                feed_frame(client, "shards", 0, UPPERS, [(s,) for s in range(shards)],
-                           [(0, 0)] * shards)
+                client.load("ledgers", HERE / "ledgers.ddp")
+                feed_frame(client, "ledgers", 0, UPPERS, [(s,) for s in range(ledgers)],
+                           [(0, 0)] * ledgers)
                 client.tick()
                 next_id, next_blob = 1, 1
                 for cycle in range(args.warmup + args.rounds):
-                    txns = generate(rng, next_id, next_blob, count, width, shards,
+                    txns = generate(rng, next_id, next_blob, count, width, ledgers,
                                     args.pattern, cycle, ref.uppers)
                     next_id += count
                     next_blob += count * width
@@ -223,7 +223,7 @@ def main() -> None:
             attempts = sum(s.attempts for s in samples)
             committed = sum(s.committed for s in samples)
             result = {
-                "shards": shards, "width": width, "txns_per_cycle": count,
+                "ledgers": ledgers, "width": width, "txns_per_cycle": count,
                 "pattern": args.pattern, "workers": args.workers,
                 "commit_rate": committed / attempts,
                 "attempted_tps": attempts / secs, "committed_tps": committed / secs,
@@ -236,7 +236,7 @@ def main() -> None:
                 "samples": [asdict(s) for s in samples],
             }
             results.append(result)
-            print(f"{shards:<9} {width:5d} {count:10d} {100 * result['commit_rate']:7.2f} "
+            print(f"{ledgers:<9} {width:5d} {count:10d} {100 * result['commit_rate']:7.2f} "
                   f"{result['attempted_tps']:9.0f} {result['committed_tps']:10.0f} "
                   f"{result['appends_per_s']:10.0f} "
                   f"{result['cycle_p50_ms']:8.1f}/{result['cycle_p95_ms']:.1f} "

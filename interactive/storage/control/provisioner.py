@@ -66,7 +66,7 @@ def main() -> None:
                 subprocess.Popen(args, stdout=open(f"/tmp/ddir-draft-runner-{i}.log", "a"),
                                  stderr=subprocess.STDOUT, start_new_session=True)
             else:
-                remote = (f"cd {a.remote_root} && nohup python3 interactive/bench/txn/control/runner.py "
+                remote = (f"cd {a.remote_root} && nohup python3 interactive/storage/control/runner.py "
                           f"--control {a.public_control} --store {a.public_store} --instance {i} "
                           f">> /tmp/ddir-draft-runner-{i}.log 2>&1 &")
                 subprocess.run(["ssh", "-o", "BatchMode=yes", machine, remote], check=False)

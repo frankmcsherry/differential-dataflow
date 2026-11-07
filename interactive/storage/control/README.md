@@ -31,7 +31,7 @@ Store, control and provisioner on mini-03; instances on mini-00, mini-01 and min
 
 ```console
 cargo build --release -p ddir-server
-D=interactive/bench/txn/control
+D=interactive/storage/control
 python3 $D/store.py --dir /tmp/cp/store &
 python3 $D/control.py --state /tmp/cp/control &
 python3 $D/provisioner.py --public-control http://mini-03:7802 --public-store http://mini-03:7801 &

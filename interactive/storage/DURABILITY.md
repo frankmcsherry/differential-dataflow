@@ -8,10 +8,10 @@ It says what exists, what was decided and why, what was measured, and which desi
 Everything is on branch `ddir-durable-names`, on master-next.
 
 - Steps 1 and 2 below, in Rust: `interactive/src/storage.rs`, `interactive/server/src/durable.rs`, and the `save`, `unsave`, `restore` and `ledger` commands, with tests `saves_resume_on_one_worker` and `saves_resume_on_four_workers`.
-- The Python and DDIR prototypes behind everything else, under `interactive/bench/txn/`.
-  - `interactive/bench/txn/storage/`: multi-shard compare-and-append on the transaction resolver.
-  - `interactive/bench/txn/catalog/`: `SPEC.md`, the catalog and resolver programs, `run.py` (crash tests against a serial reference) and `pipeline.py` (pipelined ticks), and `sketches/` of directories and the ledger schema.
-  - `interactive/bench/txn/control/`: the store and control services, provisioner, runner and client; etcd and S3 backends; `deploy/` notes for the minis.
+- The Python and DDIR prototypes behind everything else, under `interactive/storage/`; they share the server harness in `interactive/bench/txn/bench_txn.py`.
+  - `interactive/storage/ledgers/`: multi-ledger compare-and-append on the transaction resolver.
+  - `interactive/storage/catalog/`: `SPEC.md`, the catalog and resolver programs, `run.py` (crash tests against a serial reference) and `pipeline.py` (pipelined ticks), and `sketches/` of directories and the ledger schema.
+  - `interactive/storage/control/`: the store and control services, provisioner, runner and client; etcd and S3 backends; `deploy/` notes for the minis.
 - Shared write-ups:
   - [Multi-shard compare-and-append in DDIR](https://claude.ai/artifact/48f4cy3LbqiFRoWFruaVrW)
   - [A durable catalog on DDIR](https://claude.ai/artifact/9HmVSdNG23Zd3Nqcs16phn), with the programs annotated

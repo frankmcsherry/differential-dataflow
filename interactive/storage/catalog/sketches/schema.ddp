@@ -1,0 +1,19 @@
+-- The durable catalog's schema: names bind to ledger ids, and ledger ids own batches.
+type Content = Hash int | Inline List(int);           -- a batch's updates: a blob by hash, or in band
+type Binding = Ledger int | Dir int | Mount List(int);  -- what a name refers to
+
+-- (directory, name) -> binding. Renames and moves change only these rows.
+let names = input 0 : ((int, List(int)), (Binding));
+-- (ledger id) -> (declared shape, as text). Written once, at creation.
+let shapes = input 1 : ((int), (List(int)));
+-- (ledger id) -> (upper, since, generation). The compare-and-swap cells.
+let frontiers = input 2 : ((int), (int, int, int));
+-- (ledger id) -> (lower, upper, since, content). The batches.
+let batches = input 3 : ((int), (int, int, int, Content));
+
+-- A read: (directory, name) -> each batch of the ledger bound there, with its shape.
+let wanted = input 4 : ((int, List(int)), ());
+let ids = wanted | join(names, (_, (), (b)) -> ((b match (Ledger (i -> i), Dir (_ -> -1), Mount (_ -> -1))), ()))
+                 | filter(((i), ()) -> (i, 0) ge);
+export "ledger_batches" = ids | join(batches, ((i), (), (lo, hi, s, c)) -> ((i), (lo, hi, s, c)));
+export "ledger_shape" = ids | join(shapes, ((i), (), (t)) -> ((i), (t)));

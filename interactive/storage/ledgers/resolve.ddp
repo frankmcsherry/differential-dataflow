@@ -1,18 +1,18 @@
--- Multi-shard compare-and-append, as one epoch's transaction resolution.
+-- Multi-ledger compare-and-append, as one epoch's transaction resolution.
 --
--- A transaction appends one batch to each of several shards, atomically. For
--- each shard it reads the upper it expects and writes the new upper; it commits
--- if and only if every expected upper is the shard's upper just before it, in
+-- A transaction appends one batch to each of several ledgers, atomically. For
+-- each ledger it reads the upper it expects and writes the new upper; it commits
+-- if and only if every expected upper is the ledger's upper just before it, in
 -- id order. Uppers only advance, so equal uppers mean no intervening append.
 --
 -- Input 0 is the intents, in maintained.ddp's row format:
--- ((txn, 1, shard), (expected upper)) and ((txn, 0, shard), (new upper)).
--- Input 1 is each written shard's batch: ((txn, shard), (blob)).
+-- ((txn, 1, ledger), (expected upper)) and ((txn, 0, ledger), (new upper)).
+-- Input 1 is each written ledger's batch: ((txn, ledger), (blob)).
 --
 -- The resolution is resolve_by_key.ddp's. The exports:
 --   `rollback`  ((txn), ())                    transactions that do not commit,
---   `delta`     ((shard), (txn, upper))         the change to `uppers`,
---   `append`    ((shard), (lower, upper, blob)) the batches to add to `batches`,
+--   `delta`     ((ledger), (txn, upper))         the change to `uppers`,
+--   `append`    ((ledger), (lower, upper, blob)) the batches to add to `batches`,
 --   `garbage`   ((blob), ())                    blobs of rolled-back transactions.
 -- Nothing this program holds is ever retracted; dropping it frees it.
 
@@ -53,12 +53,12 @@ let rb = res::rollback;
 let wbad = wid | join(rb, (wid, kv, ()) -> (wid, kv));
 let committed = wid + (wbad | negate);
 
--- ((k), (-wid, v)): each written shard's latest committed upper this epoch.
+-- ((k), (-wid, v)): each written ledger's latest committed upper this epoch.
 let latest = committed | map(((wid), (k, v)) -> ((k), (wid neg, v))) | min;
 let new_rows = latest | map(((k), (nw, v)) -> ((k), (nw neg, v)));
 let old_rows = latest | join(store, ((k), _, (sw, sv)) -> ((k), (sw, sv)));
 
--- Each committed write's batch is [expected upper, new upper) of its shard.
+-- Each committed write's batch is [expected upper, new upper) of its ledger.
 let bounds = committed | map(((wid), (k, v)) -> ((wid, k), (v)))
            | join(reads, ((wid, k), (hi), (lo)) -> ((wid, k), (lo, hi)));
 let appended = bounds | join(blobs, ((_, k), (lo, hi), (b)) -> ((k), (lo, hi, b)));

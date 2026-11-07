@@ -33,19 +33,19 @@ With `--unguarded`, the test fails by epoch 4 in each of three seeds.
 Each epoch's outcomes are reported only after its commit returns, with `--sync full`: every file fsync'd, and the drive's cache flushed twice per commit.
 Apple M4 Mac mini, 4 workers, 12 measured epochs after 3 warmups, one transaction per append unless noted.
 
-| Shards | Appends per epoch | Committed per epoch | Commit p50 (p95) | Epoch p50 | Committed appends/s |
+| Ledgers | Appends per epoch | Committed per epoch | Commit p50 (p95) | Epoch p50 | Committed appends/s |
 |---:|---:|---:|---:|---:|---:|
 | 100,000 | 1,000 | 995 | 21 ms (43) | 24 ms | 34k |
 | 100,000 | 10,000 | 9,509 | 48 ms (62) | 66 ms | 133k |
 | 100,000 | 50,000 | 39,323 | 97 ms (268) | 281 ms | 133k |
 | 1,000,000 | 10,000 | 9,953 | 51 ms (75) | 66 ms | 145k |
-| 100,000 | 2,500 transactions of 1–4 shards | 5,693 | 39 ms (49) | 51 ms | 103k |
+| 100,000 | 2,500 transactions of 1–4 ledgers | 5,693 | 39 ms (49) | 51 ms | 103k |
 
 The commit is from sending the transactions to the root's second flush.
 The epoch adds the catalog absorbing the conclusions and updating its views, before the next epoch can start.
 Not counted: the writers writing their data blobs (in Python, one file each, about 150 µs per file here), the background log compaction and sweep (12–161 ms per epoch, run between epochs by this driver), and encoding and checking.
 
-At 100,000 shards and 10,000 appends per epoch, the flushes are most of the commit: 25 ms for the first (it flushes the epoch's 10,000 data blobs too) and 12.5 ms for the root's.
+At 100,000 ledgers and 10,000 appends per epoch, the flushes are most of the commit: 25 ms for the first (it flushes the epoch's 10,000 data blobs too) and 12.5 ms for the root's.
 Without them (`--sync none`) the commit is 14 ms and the epoch 36 ms, 261k appends/s; with fsync but no flush (`--sync fsync`), 15 ms and 37 ms.
 At 50,000 appends, the catalog's own update (179 ms) is most of the epoch.
 
@@ -53,7 +53,7 @@ At 50,000 appends, the catalog's own update (179 ms) is most of the epoch.
 
 [`pipeline.py`](pipeline.py) hands each tick's conclusions to a committer thread and starts the next tick at once; ticks that queue during a commit are committed together.
 Outcomes are still reported only after their commit.
-1M shards, single-shard appends, empty data token, no maintained views, `--sync full`, 35 measured ticks.
+1M ledgers, single-ledger appends, empty data token, no maintained views, `--sync full`, 35 measured ticks.
 
 | Appends per tick | Serial appends/s | Pipelined appends/s | Pipelined ms per tick | Pipelined latency p50 (p95) |
 |---:|---:|---:|---:|---:|
@@ -85,9 +85,9 @@ Data blobs stay at 1.7–3.3 MiB under the compacting policies: rollups advance 
 
 ```console
 cargo build --release -p ddir-server
-python3 interactive/bench/txn/catalog/run.py --dir /tmp/cat --epochs 200
-python3 interactive/bench/txn/catalog/run.py --dir /tmp/cat-crash --crash 0.15 --epochs 150 --ids 200
-python3 interactive/bench/txn/catalog/run.py --dir /tmp/cat-never --policy never --crash 0 --epochs 800 --report-every 100
+python3 interactive/storage/catalog/run.py --dir /tmp/cat --epochs 200
+python3 interactive/storage/catalog/run.py --dir /tmp/cat-crash --crash 0.15 --epochs 150 --ids 200
+python3 interactive/storage/catalog/run.py --dir /tmp/cat-never --policy never --crash 0 --epochs 800 --report-every 100
 ```
 
 `--dir` must not exist; it becomes the durable store.

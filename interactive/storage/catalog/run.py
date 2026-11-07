@@ -35,7 +35,7 @@ import sys
 import time
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parents[1] / "bench" / "txn"))
 from bench_txn import DEFAULT_BINARY, INTENTS, ServerProcess, percentile  # noqa: E402
 from client import decode, encode_frame  # noqa: E402
 
@@ -588,7 +588,7 @@ class Stats:
     # Seconds spent in each phase this epoch, and every measured epoch's phases.
     phase: Counter = field(default_factory=Counter)
     epochs_timed: list = field(default_factory=list)
-    shard_appends: int = 0
+    ledger_appends: int = 0
 
 
 def check(cat: Catalog, ref: Reference, args, rng, durable: Durable, stats: Stats, full=True) -> View | None:
@@ -904,10 +904,10 @@ def main() -> None:
         bench = dict(
             ids=args.ids, appends_per_epoch=args.appends, width=args.width, sync=args.sync, workers=args.workers,
             epochs_timed=len(timed),
-            shard_appends_committed_per_epoch=appended / len(timed),
+            ledger_appends_committed_per_epoch=appended / len(timed),
             ack_p50_ms=percentile(ack, 0.5), ack_p95_ms=percentile(ack, 0.95),
             period_p50_ms=percentile(period, 0.5),
-            committed_shard_appends_per_s=appended / (sum(period) / 1000),
+            committed_ledger_appends_per_s=appended / (sum(period) / 1000),
             phase_mean_ms={k: sum(ms(e, k) for e in timed) / len(timed)
                            for k in ("append blobs", "merge blobs", "submit", "resolve", "read conclusions",
                                      "durable commit", "commit: write blob", "commit: flush", "commit: root",

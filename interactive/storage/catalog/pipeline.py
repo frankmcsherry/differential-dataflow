@@ -216,7 +216,7 @@ def run(args, mode: str) -> dict:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dir", type=Path, required=True, help="must not exist")
-    p.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[4] / "target/release/ddir_server")
+    p.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[3] / "target/release/ddir_server")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--ids", type=int, default=1_000_000)
     p.add_argument("--appends", type=int, default=25_600)
