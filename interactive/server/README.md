@@ -145,6 +145,24 @@ queue-driven commit policy can seal an epoch as soon as the preceding epoch
 retires and intents are waiting; that decision should come from logical queue
 state, not elapsed wall-clock time.
 
+## Ledger sources through the Rust API
+
+`interactive::ledger::Cohort` creates and appends ledgers independently of programs and arrangements.
+For DDIR consumption, declare the ledger columns as `(key, val)` and encode raw updates with `interactive::server::encode_ledger_batch`, supplying one signed coordinate lane per declared time dimension.
+The current bridge requires nonnegative coordinates because DDIR timestamps use unsigned integers.
+
+Capture a `LedgerSnapshot` once from the committed store, then pass the same snapshot to every worker's `Server::publish_ledger` call.
+The named source can be imported by computations like any published trace.
+`refresh_ledger` consumes the newly committed suffix of a later snapshot; repeating a snapshot does not repeat its updates.
+An empty span advances the source frontier, and sealing releases all source capabilities.
+`unpublish_ledger` drops the consuming arrangement once its importers are gone, leaving the stored ledger intact.
+
+Use `install_with_root` for the declared time width, `wait_for_frontier` to settle committed progress, and `snapshot_as_of` to read at explicit points.
+The compatibility `tick` still assumes epoch-paced width-one sources and can wait indefinitely for an independently clocked ledger.
+It is not used to advance ledger sources.
+
+`cargo test -p interactive --test server_ledgers` exercises the bridge on one and four workers, including refresh, product timestamps, empty spans, sealing, and independent lifetimes.
+
 ## Writes: `feed`
 
     feed <prog> <in> <key> [val=<v>] [time=<t>] [diff=<d>]

@@ -88,6 +88,7 @@ mod read;
 mod sources;
 mod time;
 mod progress;
+mod ledgers;
 
 pub use self::evaluate::evaluate;
 pub use self::sources::gen_field_seeded;
@@ -95,6 +96,7 @@ pub use self::time::{host_dataflow, host_time, HostTime, OuterTime};
 use self::bind::Binding;
 use self::sources::{canonical_source_name, clock_rows, InputContainer, Recipe, ServerInput, COLUMN_BATCH};
 pub use self::sources::generated_shape;
+pub use self::ledgers::{encode_ledger_batch, LedgerSnapshot};
 
 /// The name an installed program's output is published under: `<program>::<output>`. Every
 /// program has its own namespace, so two programs may name their outputs alike, and one program
@@ -304,6 +306,8 @@ pub struct Server {
     export_taps: bool,
     /// Installed program name -> its handles and lifecycle bookkeeping.
     programs: HashMap<String, Installed>,
+    /// Arrangements consuming committed ledger snapshots, independent of program lifetimes.
+    ledger_sources: HashMap<String, ledgers::LedgerSource>,
     /// Published trace name -> the shape of its rows: inferred from its producer's program, or
     /// fixed by its recipe for a generated source.
     shapes: HashMap<String, RowShape>,
@@ -332,6 +336,7 @@ impl Server {
             taps: HashMap::new(),
             export_taps: false,
             programs: HashMap::new(),
+            ledger_sources: HashMap::new(),
             shapes: HashMap::new(),
             importers: HashMap::new(),
             bindings: Vec::new(),

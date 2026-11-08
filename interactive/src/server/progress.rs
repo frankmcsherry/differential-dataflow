@@ -78,6 +78,10 @@ impl Server {
     // Imports form a DAG (producers exist before consumers); the set avoids revisiting diamonds.
     pub(super) fn collect_frontier(&self, prog: &str, seen: &mut std::collections::HashSet<String>, frontier: &mut Antichain<HostTime>) {
         if !seen.insert(prog.to_string()) { return; }
+        if let Some(source) = self.ledger_sources.get(prog) {
+            for point in source.frontier().elements() { frontier.insert(point.clone()); }
+            return;
+        }
         let installed = &self.programs[prog];
         for input in installed.inputs.values() { frontier.insert(input.time().clone()); }
         for trace in &installed.imports { self.collect_frontier(&self.outputs[trace].owner, seen, frontier); }

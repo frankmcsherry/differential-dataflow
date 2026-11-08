@@ -33,7 +33,7 @@ impl Server {
         if root_width == 0 || as_of.len() > root_width {
             return Err("root width must be positive and contain the as-of point".into());
         }
-        if self.programs.contains_key(name) {
+        if self.programs.contains_key(name) || self.ledger_sources.contains_key(name) {
             return Err(format!("a program named {:?} is already installed", name));
         }
         // A program's outputs are published as `<name>::<output>`, so the name is one path component.
@@ -64,6 +64,9 @@ impl Server {
         for imp in &prog.root.imports {
             if let st::Source::Trace(t) = &imp.from {
                 let key = canonical_source_name(t);
+                if self.ledger_sources.get(&key).is_some_and(|source| !source.initial().less_equal(&as_of)) {
+                    return Err(format!("as-of {as_of:?} is before ledger source {key:?}'s initial frontier"));
+                }
                 if let Some(output) = self.outputs.get(&key) {
                     if output.width > root_width {
                         return Err(format!("cannot import trace {key:?} of width {} into width {root_width}", output.width));

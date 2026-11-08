@@ -99,6 +99,9 @@ impl Server {
         if output.width > 1 {
             return Err(format!("trace {name:?} has root width {}; name a point with snapshot_as_of or peek_as_of", output.width));
         }
+        if self.ledger_sources.contains_key(&output.owner) {
+            return Err(format!("ledger source {name:?} has its own frontier; name a point with snapshot_as_of or peek_as_of"));
+        }
         let epoch = self.programs[&output.owner].now.get(0).copied().unwrap_or(0);
         if epoch == 0 { return Ok(None); }
         Ok(Some(host_time(epoch - 1)))
@@ -106,6 +109,9 @@ impl Server {
 
     fn readable(&self, name: &str, point: &HostTime) -> Result<(), String> {
         let output = self.output(name, point)?;
+        if self.ledger_sources.get(&output.owner).is_some_and(|source| !source.initial().less_equal(point)) {
+            return Err(format!("point {point:?} is before ledger source {name:?}'s initial frontier"));
+        }
         if !output.since.less_equal(point) { return Err(format!("point {point:?} is before trace {name:?}'s read floor {:?}", output.since)); }
         // Commanded capabilities are identical across workers. A local probe alone can lag
         // on some workers, causing them to refuse while others enter the collective gather.
