@@ -8,6 +8,9 @@
 
 #![warn(unreachable_pub)]
 
+// Ledger state, create/append, and the register backing with an in-memory store.
+pub mod ledger;
+
 // The IR's vocabulary, and the expression language its slots are written in.
 // `Lambda`, `LinearOp`, `Reducer`, `Diff`.
 pub mod ir;

@@ -1,0 +1,118 @@
+-- Ordered atomic transactions against one committed cohort snapshot.
+-- Each input-2 row is a transaction, with changes grouped by ledger id.
+-- Group ids must be strictly increasing, so each id has at most one change.
+-- Transaction keys are unique and supply a total order compatible with completed operations.
+-- All input relations are sets.
+-- Empty transactions succeed.
+-- These rules decide effects; they do not publish them or establish durability.
+--
+-- Structural validation depends only on the transaction.
+-- It checks group order and strict span bounds.
+-- CreateAppend makes lower and since equal start by construction.
+-- Structural failure reports the first invalid group index.
+-- Resolution then reports the first state-dependent failure, also by group index, and discards every effect of that transaction.
+-- Later transactions observe only effects of earlier successful transactions.
+--
+-- This serial reference gathers a cohort into one reduce, scans registry and manifest lists per change, and recomputes the fold when an input changes.
+-- Registry and manifest rows sort before transaction rows; transactions sort by their integer keys.
+-- No separately maintained upper is a source of truth.
+-- Candidate ids, shapes, payload correctness, and dimension validity are caller obligations as in model.md.
+-- Times are fixed-width integer products.
+
+type Payload = Empty | Inline List(int) | Blob List(int);
+type Change = Create (List(int), List(List(int)))
+            | Append (List(List(int)), List(List(int)), Payload)
+            | CreateAppend (List(int), List(List(int)), List(List(int)), Payload);
+type Failure = Write List(List(int)) | Exists int | UnknownLedger int | Invalid;
+type TxnResult = Committed | Aborted (int, Failure);
+-- The variant order ensures initial state is folded before transactions.
+type Row = Registry (int, List(int), List(List(int)))
+         | Span (int, List(List(int)), List(List(int)), List(List(int)), Payload)
+         | Transaction (int, List((int, Change)));
+
+let registry = input 0 : ((int), (List(int), List(List(int))));
+let manifest = input 1 : ((int), (List(List(int)), List(List(int)), List(List(int)), Payload));
+let transactions = input 2 : ((int), (List((int, Change))));
+
+-- This view has no dependency on cohort state. Its failure index is zero-based.
+let invalid = transactions | map((txn, (groups)) ->
+    let checked = ((0, 0, 0, -1), groups) fold (((previous, seen, index, failure), (id, change)) ->
+        let ordered = (seen, (previous, id) lt, 1) select in
+        let bounds = change match (
+            Create (_ -> 1),
+            Append ((lower, upper, _) -> (lower, upper) call frontier_lt),
+            CreateAppend ((_, start, upper, _) -> (start, upper) call frontier_lt)) in
+        let bad = ((ordered, bounds) and, 0) eq in
+        (id, 1, (index, 1) add, (((failure, 0) lt, bad) and, index, failure) select)) in
+    (txn, (checked.3))) | filter((_, (index)) -> (index, 0) ge);
+let invalid_transactions = transactions | join(invalid, (txn, groups, _) -> (txn, groups));
+let valid_transactions = transactions - invalid_transactions;
+
+let rows = (registry | map(((id), (shape, start)) -> ((), (id, shape, start) inject Registry)))
+         + (manifest | map(((id), (lo, hi, since, batch)) -> ((), (id, lo, hi, since, batch) inject Span)))
+         + (valid_transactions | map(((txn), (groups)) -> ((), (txn, groups) inject Transaction)));
+
+let resolved = rows | reduce((_, vals) ->
+    let initial_registry = [] : List((int, List(int), List(List(int)))) in
+    let empty_spans = [] : List((int, List(List(int)), List(List(int)), List(List(int)))) in
+    let initial_manifest = empty_spans map ((id, lo, hi, since) -> (id, lo, hi, since, () inject Empty)) in
+    let empty_results = [] : List(int) in
+    let initial_results = empty_results map (txn -> (txn, () inject Committed)) in
+    let entries = vals map ((row, _) -> row) in
+    let final = ((initial_registry, initial_manifest, initial_results), entries) fold ((state, row) ->
+        (state, row) cap_sum match (
+            Registry (((r, m, results), entry) -> ((r, entry enlist) append, m, results)),
+            Span (((r, m, results), entry) -> (r, (m, entry enlist) append, results)),
+            Transaction (((r, m, results), (txn, groups)) ->
+                let tentative = ((r, m, () inject Committed, 0), groups) fold (((r, m, status, index), (id, change)) ->
+                    ((r, m, index, id, change), status) cap_sum match (
+                        Aborted (((r, m, index, _, _), failure) -> (r, m, failure inject Aborted, (index, 1) add)),
+                        Committed (((r, m, index, id, change), ()) ->
+                            let (kind, shape, lower, upper, batch) = change match (
+                                Create ((shape, start) -> (0, shape, start, start, () inject Empty)),
+                                Append ((lower, upper, batch) -> (1, [] : List(int), lower, upper, batch)),
+                                CreateAppend ((shape, start, upper, batch) -> (2, shape, start, upper, batch))) in
+                            let lower = (lower, lower) call frontier_meet in
+                            let upper = (upper, upper) call frontier_meet in
+                            let creating = (kind, 1) ne in
+                            let registrations = (id, r) cap_list in
+                            let (known, existing_start) = ((0, [] : List(List(int))), registrations) fold (
+                                ((known, start), (id, (i, _, s))) -> ((id, i) eq, (1, s), (known, start)) select) in
+                            let start = (creating, lower, existing_start) select in
+                            let candidates = ((creating, id), m) cap_list in
+                            let own = (candidates map (((creating, id), (i, _, _, _, _)) ->
+                                           ((creating, 0) eq, (id, i) eq) and),
+                                       candidates map ((_, span) -> span)) zip filter in
+                            let write = (start, own) fold ((w, (_, _, hi, _, _)) -> (w, hi) call frontier_join) in
+                            let matches = (lower, write) call frontier_eq in
+                            let status = (creating,
+                                (known, (index, id inject Exists) inject Aborted, () inject Committed) select,
+                                (known,
+                                    (matches, () inject Committed, (index, write inject Write) inject Aborted) select,
+                                    (index, id inject UnknownLedger) inject Aborted) select) select in
+                            let success = status match (Committed (_ -> 1), Aborted (_ -> 0)) in
+                            let added_registry = (r, (id, shape, start) enlist) append in
+                            let added_manifest = (m, (id, lower, upper, start, batch) enlist) append in
+                            (((success, creating) and, added_registry, r) select,
+                             ((success, (kind, 0) ne) and, added_manifest, m) select,
+                             status, (index, 1) add)))) in
+                let (next_registry, next_manifest, result, _) = tentative in
+                let success = result match (Committed (_ -> 1), Aborted (_ -> 0)) in
+                ((success, next_registry, r) select,
+                 (success, next_manifest, m) select,
+                 (results, (txn, result) enlist) append)))) in
+    (final, 1) enlist);
+
+let final_registry = resolved | flatmap(((), (r, _, _)) -> r)
+                             | map(((), (_, (id, shape, start))) -> ((id), (shape, start)));
+let final_manifest = resolved | flatmap(((), (_, m, _)) -> m)
+                             | map(((), (_, (id, lo, hi, since, batch))) -> ((id), (lo, hi, since, batch)));
+
+output "results" = (resolved | flatmap(((), (_, _, results)) -> results)
+                             | map(((), (_, (txn, result))) -> ((txn), (result))))
+                 + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
+output "invalid_transactions" = invalid;
+output "registry" = final_registry;
+output "manifest" = final_manifest;
+output "registry_add" = final_registry - registry;
+output "manifest_add" = final_manifest - manifest;

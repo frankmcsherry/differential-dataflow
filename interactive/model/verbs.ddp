@@ -1,0 +1,73 @@
+-- Single-operation transition rules: one ledger verb against a committed cohort snapshot.
+-- Inputs 0 and 1 are the registry and manifest. Inputs 2 and 3 contain at most
+-- one verb between them. To evaluate another verb, apply the returned additions
+-- to the snapshot and replace the verb. These rules do not select or order
+-- concurrent proposals, commit their effects, or establish durability.
+--
+-- Times are fixed-width products of ints; frontiers are antichains of them.
+-- Host frontier operations ignore list ordering, duplicates, and dominated points.
+-- The snapshot must be reachable by create and append. Its upper frontiers
+-- therefore form a chain for each ledger. Shapes are opaque serialized bytes,
+-- including the data columns and time width. Payload validity is an obligation
+-- of the caller, as in model.md; these rules do not inspect blob contents.
+--
+-- A create supplies a candidate fresh id, allocated outside these rules.
+-- A colliding id, an unknown append id, or invalid bounds violate the verb's
+-- preconditions. The diagnostics below distinguish these from Err(write).
+
+type Payload = Empty | Inline List(int) | Blob List(int);
+type AppendResult = Ok | Err List(List(int));
+
+-- registry : ((id), (shape, start))
+-- manifest : ((id), (lower, upper, since, payload))
+let registry = input 0 : ((int), (List(int), List(List(int))));
+let manifest = input 1 : ((int), (List(List(int)), List(List(int)), List(List(int)), Payload));
+-- create   : ((candidate id), (shape, start))
+-- append   : ((id), (lower, upper, payload))
+-- Across these two inputs, at most one command in total is allowed per snapshot.
+-- These rows are not a batch of commands for a resolver to order.
+let create = input 2 : ((int), (List(int), List(List(int))));
+let append = input 3 : ((int), (List(List(int)), List(List(int)), Payload));
+
+-- The greatest upper, or start if no spans exist. All candidates for an id
+-- are comparable in a snapshot produced by the two verbs. Meeting a frontier
+-- with itself gives a canonical representation before set operations.
+let candidates = (registry | map(((id), (_, start)) -> ((id), (start))))
+               + (manifest | map(((id), (_, upper, _, _)) -> ((id), (upper))))
+               | map(((id), (f)) -> ((id), ((f, f) call frontier_meet))) | distinct;
+let dominated = candidates
+              | join(candidates, ((id), (a), (b)) -> ((id), (a, b)))
+              | filter((_, (a, b)) -> (a, b) call frontier_lt)
+              | map(((id), (a, _)) -> ((id), (a))) | distinct;
+let write = candidates - dominated;
+
+-- Determine if any `create` commands collide with existing `registry` entries.
+let collision = create | join(registry, ((id), proposal, _) -> ((id), proposal));
+let registry_add = create - collision;
+
+-- Bounds must advance strictly in the frontier order, including to [] to seal.
+let strict = append | filter((_, (lower, upper, _)) -> (lower, upper) call frontier_lt);
+let invalid = append - strict;
+
+-- Partition `append` by identifiers that are known and unknown in `registry`.
+let known = strict | join(registry, ((id), (lower, upper, batch), (_, start)) ->
+                ((id), (lower, upper, batch, start)));
+let unknown = strict - (known | map(((id), (lower, upper, batch, _)) -> ((id), (lower, upper, batch))));
+
+let checked = known | join(write, ((id), (lower, upper, batch, start), (w)) ->
+                  ((id), (lower, upper, batch, start, w)));
+let accepted = checked | filter((_, (lower, _, _, _, w)) -> (lower, w) call frontier_eq);
+let rejected = checked - accepted;
+
+-- Only these two outputs change cohort state. Rejection changes neither set.
+output "registry_add" = registry_add;
+output "manifest_add" = accepted | map(((id), (lower, upper, batch, start, _)) ->
+                            ((id), (lower, upper, start, batch)));
+output "created" = registry_add | map(((id), _) -> ((id), ()));
+output "appended" = (accepted | map(((id), _) -> ((id), (() inject AppendResult::Ok))))
+                  + (rejected | map(((id), (_, _, _, _, w)) -> ((id), (w inject AppendResult::Err))));
+
+output "write" = write;
+output "collision" = collision;
+output "invalid" = invalid;
+output "unknown" = unknown;
