@@ -2,8 +2,9 @@
 //! UUIDs use their canonical 16 bytes, and shapes are serialized as opaque bytes for .ddp.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use interactive::ledger::{validate, Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Resolver, Shape, State, Store, Time};
+use interactive::ledger::{validate, Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Resolver, Shape, State, Store, Time, Writer};
 use interactive::runtime::container::Updates;
 
 type Row = (String, String, i64);
@@ -142,6 +143,9 @@ fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], 
     let cohort = Cohort::new(store, "comparison");
     let publisher = Cohort::new(store, "resolved");
     let resolver = Resolver::new(workers).unwrap();
+    let resident_store = Arc::new(MemoryStore::default());
+    for payload in payloads { resident_store.put(payload).unwrap(); }
+    let mut resident = Writer::open(resident_store.clone(), "resident", workers).unwrap();
     for txns in rounds {
         let before = cohort.snapshot().unwrap();
         let mut ordered = txns.to_vec();
@@ -160,6 +164,11 @@ fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], 
         reference_results.sort();
         assert_eq!(published_results, reference_results, "published transaction outcomes");
         assert_eq!(publisher.snapshot().unwrap(), after, "published cohort state");
+        let mut resident_results = resident.transact_batch(txns).unwrap().into_iter()
+            .map(|(txn, outcome)| print_result(txn, outcome)).collect::<Vec<_>>();
+        resident_results.sort();
+        assert_eq!(resident_results, reference_results, "resident transaction outcomes");
+        assert_eq!(Cohort::new(resident_store.as_ref(), "resident").snapshot().unwrap(), after, "resident cohort state");
         let actual = evaluate(&before, txns, workers);
         let registry_add = State {
             registry: after.registry.iter().filter(|(id, _)| !before.registry.contains_key(*id))

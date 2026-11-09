@@ -2,7 +2,8 @@
 //!
 //! `MemoryStore` models storage that survives dropping clients, while the process stays alive.
 //! On Unix, `FileStore` makes completed writes durable on a local filesystem.
-//! Every commit writes a complete cohort snapshot; payload bytes are opaque and writer-validated.
+//! Native verbs publish snapshots; the resolver can publish linked batches of conclusions.
+//! Payload bytes are opaque and writer-validated.
 //! The DDIR source bridge consumes committed snapshots; the keyed `.ddp` resolver can publish conclusions through the same roots.
 //! Compaction, reclamation, and a stable storage format remain future work.
 //! Run the backing tests with `cargo test -p interactive --lib ledger::`.
@@ -20,6 +21,10 @@ mod file;
 pub use file::FileStore;
 mod resolve;
 pub use resolve::{Resolution, Resolver, Transaction};
+mod log;
+mod engine;
+mod writer;
+pub use writer::{Receipt, Writer};
 
 /// Signed product time, with trailing minimum coordinates omitted by `PointStamp`.
 pub type Time = differential_dataflow::dynamic::pointstamp::PointStamp<i64, 2>;
@@ -169,7 +174,7 @@ pub struct Root {
 }
 
 /// A storage failure is distinct from an append rejected by its write frontier.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     Unavailable(String),
     Missing(BlobId),
@@ -230,7 +235,7 @@ impl Store for MemoryStore {
 }
 
 /// Failures outside the verb's `Result<(), Write>` result.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Store(StoreError),
     Invalid(&'static str),
@@ -261,12 +266,7 @@ impl<'a> Cohort<'a> {
     }
 
     fn load(&self) -> Result<(Root, State), Error> {
-        let root = self.store.read_root(self.root)?;
-        let state = match root.state {
-            Some(id) => bincode::deserialize(&self.store.get(id)?).map_err(|e| Error::Corrupt(e.to_string()))?,
-            None => State::default(),
-        };
-        Ok((root, state))
+        log::load(self.store, self.root)
     }
 
     /// Recover the current committed snapshot, without replaying proposals.

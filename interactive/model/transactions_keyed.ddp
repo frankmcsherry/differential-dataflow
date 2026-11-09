@@ -103,10 +103,28 @@ output "registry_add" = effects | flatmap((_, (id, _, change)) -> (id, change) c
     Append (_ -> [] : List(((List(int)), (List(int), List(List(int)))))),
     CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, (start, start) call frontier_meet)) enlist)))
     | map((_, (_, row)) -> row);
-output "manifest_add" = effects | flatmap((_, (id, start, change)) -> ((id, start), change) cap_sum match (
+let manifest_ordered = effects | flatmap((_, (id, start, change)) -> ((id, start), change) cap_sum match (
     Create (_ ->
         let empty = [] : List(((List(int)), (List(List(int)), List(List(int)), List(List(int))))) in
         empty map ((id, (lo, hi, since)) -> (id, (lo, hi, since, () inject Empty)))),
     Append (((id, start), (lower, upper, batch)) -> ((id), ((lower, lower) call frontier_meet, (upper, upper) call frontier_meet, start, batch)) enlist),
     CreateAppend (((id, start), (_, lower, upper, batch)) -> ((id), ((lower, lower) call frontier_meet, (upper, upper) call frontier_meet, start, batch)) enlist)))
-    | map((_, (_, row)) -> row);
+    | map((key, (_, ((id), (lower, upper, since, batch)))) -> (key, (id, lower, upper, since, batch)));
+output "manifest_ordered" = manifest_ordered;
+output "manifest_add" = manifest_ordered | map((_, (id, lower, upper, since, batch)) -> ((id), (lower, upper, since, batch)));
+
+-- Feed these conclusions into input 0 after retracting this batch's commands.
+-- Values sort by transaction key, so the final element is the latest accepted effect.
+-- Selecting it directly avoids negating transaction keys, including the minimum integer.
+let next_initial = effects | map(((txn, _), (id, start, change)) ->
+    let write = change match (
+        Create ((_, lower) -> lower),
+        Append ((_, upper, _) -> upper),
+        CreateAppend ((_, _, upper, _) -> upper)) in
+    ((id), (txn, start, (write, write) call frontier_meet)))
+    | reduce((_, vals) ->
+        let entries = vals map ((entry, _) -> entry) in
+        let last = ((entries len, 1) sub enlist, entries) gather in
+        last map ((_, start, write) -> ((start, write), 1)));
+let old_initial = next_initial | join(initial, (id, _, old) -> (id, old));
+output "initial_delta" = next_initial - old_initial;

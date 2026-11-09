@@ -22,8 +22,8 @@ pub struct Resolution {
 
 /// The compiled keyed `.ddp` transaction resolver.
 pub struct Resolver {
-    program: crate::scope_ir::Program,
-    workers: usize,
+    pub(super) program: crate::scope_ir::Program,
+    pub(super) workers: usize,
 }
 
 impl Resolver {
@@ -31,7 +31,7 @@ impl Resolver {
         if workers == 0 { return Err(Error::Invalid("the resolver needs at least one worker")); }
         let program = std::panic::catch_unwind(|| {
             let mut program = crate::lower::lower_tree(crate::parse::pipe::parse(include_str!("../../model/transactions_keyed.ddp")));
-            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "registry_add" | "manifest_add"));
+            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "registry_add" | "manifest_add" | "manifest_ordered" | "initial_delta"));
             crate::passes::optimize(&mut program);
             program
         }).map_err(|_| Error::Resolve("cannot compile transaction rules".into()))?;
@@ -71,7 +71,7 @@ impl Cohort<'_> {
     }
 }
 
-fn unique_keys(transactions: &[Transaction]) -> Result<(), Error> {
+pub(super) fn unique_keys(transactions: &[Transaction]) -> Result<(), Error> {
     let mut keys = BTreeSet::new();
     if transactions.iter().any(|(key, _)| !keys.insert(*key)) {
         return Err(Error::Invalid("transaction keys must be unique"));
@@ -91,7 +91,7 @@ fn current<'a>(state: &'a State, transactions: &[Transaction]) -> Vec<(Id, &'a R
     entries.into_iter().map(|(id, (entry, write))| (id, entry, write)).collect()
 }
 
-fn maximum_width(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction]) -> usize {
+pub(super) fn maximum_width(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction]) -> usize {
     let mut width = initial.iter().map(|(_, entry, _)| entry.shape.time_width).max().unwrap_or(0);
     let mut include = |frontier: &Frontier| {
         width = width.max(frontier.elements().iter().map(|time| time.len()).max().unwrap_or(0));
@@ -116,14 +116,14 @@ fn maximum_width(initial: &[(Id, &Registration, &Frontier)], transactions: &[Tra
     width
 }
 
-fn bytes<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Value {
+pub(super) fn bytes<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Value {
     let mut ends = Vec::new();
     let mut flat = Vec::new();
     for value in values { flat.extend_from_slice(value); ends.push(flat.len()); }
     Value::List(ends.into(), Box::new(Value::u8(flat)))
 }
 
-fn frontiers<'a>(values: impl IntoIterator<Item = &'a Frontier>, width: usize) -> Value {
+pub(super) fn frontiers<'a>(values: impl IntoIterator<Item = &'a Frontier>, width: usize) -> Value {
     let (mut frontier_ends, mut time_ends, mut coordinates) = (Vec::new(), Vec::new(), Vec::new());
     for value in values {
         let mut points = value.elements().to_vec();
@@ -161,6 +161,10 @@ fn inputs(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transactio
         vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, entry, _)| &entry.start), width), frontiers(initial.iter().map(|(_, _, write)| *write), width)]),
         diffs: vec![1; initial.len()],
     };
+    Ok(vec![committed, commands(transactions, width)?])
+}
+
+pub(super) fn commands(transactions: &[Transaction], width: usize) -> Result<Updates, Error> {
     let groups = transactions.iter().flat_map(|(_, groups)| groups).collect::<Vec<_>>();
     let (mut tags, mut creates, mut appends, mut combined) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (_, change) in &groups {
@@ -182,7 +186,7 @@ fn inputs(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transactio
         vals: Value::Prod(vec![Value::List(ends.into(), Box::new(Value::Prod(vec![bytes(groups.iter().map(|(id, _)| id.as_bytes().as_slice())), changes])))]),
         diffs: vec![1; transactions.len()],
     };
-    Ok(vec![committed, commands])
+    Ok(commands)
 }
 
 fn evaluate(program: &crate::scope_ir::Program, inputs: Vec<Updates>, workers: usize) -> Result<BTreeMap<String, Updates>, Error> {
@@ -209,15 +213,15 @@ fn evaluate(program: &crate::scope_ir::Program, inputs: Vec<Updates>, workers: u
 }
 
 #[derive(Clone, Copy)]
-struct Row<'a> { value: &'a Value, index: usize }
+pub(super) struct Row<'a> { pub(super) value: &'a Value, pub(super) index: usize }
 
 impl<'a> Row<'a> {
-    fn product<const N: usize>(self) -> Result<[Self; N], Error> {
+    pub(super) fn product<const N: usize>(self) -> Result<[Self; N], Error> {
         let Value::Prod(fields) = self.value else { return Err(corrupt("expected product")); };
         if fields.len() != N { return Err(corrupt("unexpected product width")); }
         Ok(std::array::from_fn(|field| Self { value: &fields[field], index: self.index }))
     }
-    fn list(self) -> Result<(&'a Value, Range<usize>), Error> {
+    pub(super) fn list(self) -> Result<(&'a Value, Range<usize>), Error> {
         match self.value {
             Value::List(bounds, values) => {
                 let (start, end) = match bounds {
@@ -232,18 +236,18 @@ impl<'a> Row<'a> {
             _ => Err(corrupt("expected list")),
         }
     }
-    fn integer(self) -> Result<i64, Error> {
+    pub(super) fn integer(self) -> Result<i64, Error> {
         corgi::arrange::borrowed_i64(self.value).and_then(|values| values.get(self.index).copied())
             .ok_or_else(|| corrupt("expected integer"))
     }
-    fn bytes(self) -> Result<Vec<u8>, Error> {
+    pub(super) fn bytes(self) -> Result<Vec<u8>, Error> {
         let (value, rows) = self.list()?;
         rows.map(|index| u8::try_from(Self { value, index }.integer()?).map_err(|_| corrupt("byte out of range"))).collect()
     }
-    fn id(self) -> Result<Id, Error> {
+    pub(super) fn id(self) -> Result<Id, Error> {
         Ok(Id::from_bytes(self.bytes()?.try_into().map_err(|_| corrupt("UUID must contain 16 bytes"))?))
     }
-    fn frontier(self) -> Result<Frontier, Error> {
+    pub(super) fn frontier(self) -> Result<Frontier, Error> {
         let (points, rows) = self.list()?;
         rows.map(|index| {
             let (coordinates, rows) = Self { value: points, index }.list()?;
@@ -251,7 +255,7 @@ impl<'a> Row<'a> {
                 .map(|point| Time::new(point.into()))
         }).collect()
     }
-    fn variant(self) -> Result<(usize, Self), Error> {
+    pub(super) fn variant(self) -> Result<(usize, Self), Error> {
         let Value::Sum(tags, variants) = self.value else { return Err(corrupt("expected sum")); };
         if self.index >= tags.len() { return Err(corrupt("invalid sum row")); }
         let tag = tags.tag_at(self.index);
@@ -260,13 +264,13 @@ impl<'a> Row<'a> {
         if index >= value.len() { return Err(corrupt("invalid variant offset")); }
         Ok((tag, Self { value, index }))
     }
-    fn unit(self) -> Result<(), Error> {
+    pub(super) fn unit(self) -> Result<(), Error> {
         match self.value {
             Value::Unit(rows) if self.index < *rows => Ok(()),
             _ => Err(corrupt("expected unit")),
         }
     }
-    fn payload(self) -> Result<Payload, Error> {
+    pub(super) fn payload(self) -> Result<Payload, Error> {
         let (tag, value) = self.variant()?;
         match tag {
             0 => { value.unit()?; Ok(Payload::Empty) }
@@ -279,7 +283,7 @@ impl<'a> Row<'a> {
 
 fn corrupt(message: &str) -> Error { Error::Corrupt(format!("transaction resolver: {message}")) }
 
-fn output<'a>(outputs: &'a BTreeMap<String, Updates>, name: &str) -> Result<&'a Updates, Error> {
+pub(super) fn output<'a>(outputs: &'a BTreeMap<String, Updates>, name: &str) -> Result<&'a Updates, Error> {
     let output = outputs.get(name).ok_or_else(|| corrupt("missing output"))?;
     if output.keys.len() != output.len() || output.vals.len() != output.len() || output.diffs.iter().any(|diff| *diff != 1) {
         return Err(corrupt("outputs must be sets of rows"));
@@ -295,7 +299,7 @@ fn frontier_key(id: Id, frontier: &Frontier) -> (Id, Vec<Time>) {
 }
 
 // Widen each output leaf once, so row reads borrow integers instead of repeatedly widening a whole byte column through CORGI's public integer reader.
-fn wide(value: Value) -> Result<Value, Error> {
+pub(super) fn wide(value: Value) -> Result<Value, Error> {
     Ok(match value {
         leaf @ Value::Prim(_) => Value::i64(leaf.into_i64("resolver output").map_err(Error::Corrupt)?),
         Value::Prod(fields) => Value::Prod(fields.into_iter().map(wide).collect::<Result<_, _>>()?),
@@ -312,34 +316,7 @@ fn conclusions(before: &State, transactions: &[Transaction], outputs: BTreeMap<S
         updates.vals = wide(updates.vals)?;
         Ok((name, updates))
     }).collect::<Result<BTreeMap<_, _>, Error>>()?;
-    let mut outcomes = BTreeMap::new();
-    let results = output(&outputs, "results")?;
-    for index in 0..results.len() {
-        let [key] = Row { value: &results.keys, index }.product()?;
-        let [result] = Row { value: &results.vals, index }.product()?;
-        let (tag, payload) = result.variant()?;
-        let result = match tag {
-            0 => { payload.unit()?; Ok(()) }
-            1 => {
-                let [group, failure] = payload.product()?;
-                let group = usize::try_from(group.integer()?).map_err(|_| corrupt("negative group index"))?;
-                let (tag, value) = failure.variant()?;
-                let reason = match tag {
-                    0 => Failure::Write(value.frontier()?),
-                    1 => Failure::Exists(value.id()?),
-                    2 => Failure::UnknownLedger(value.id()?),
-                    3 => { value.unit()?; Failure::Invalid("transaction structure is invalid") }
-                    _ => return Err(corrupt("invalid failure tag")),
-                };
-                Err(Rejection { group, reason })
-            }
-            _ => return Err(corrupt("invalid transaction result tag")),
-        };
-        if outcomes.insert(key.integer()?, result).is_some() { return Err(corrupt("duplicate transaction result")); }
-    }
-    if outcomes.len() != transactions.len() || transactions.iter().any(|(key, groups)| {
-        outcomes.get(key).is_none_or(|result| result.as_ref().is_err_and(|failure| failure.group >= groups.len()))
-    }) { return Err(corrupt("transaction results do not match requests")); }
+    let outcomes = outcomes(output(&outputs, "results")?, transactions)?;
 
     let additions = output(&outputs, "registry_add")?;
     let mut registrations = BTreeMap::new();
@@ -393,4 +370,37 @@ fn conclusions(before: &State, transactions: &[Transaction], outputs: BTreeMap<S
     }
     if !registrations.is_empty() || !spans.is_empty() { return Err(corrupt("unexpected state additions")); }
     Ok(Resolution { state, outcomes })
+}
+
+/// Read outcome columns after widening their integer leaves once.
+pub(super) fn outcomes(results: &Updates, transactions: &[Transaction]) -> Result<BTreeMap<i64, Result<(), Rejection>>, Error> {
+    let mut outcomes = BTreeMap::new();
+    for index in 0..results.len() {
+        let [key] = Row { value: &results.keys, index }.product()?;
+        let [result] = Row { value: &results.vals, index }.product()?;
+        let (tag, payload) = result.variant()?;
+        let result = match tag {
+            0 => { payload.unit()?; Ok(()) }
+            1 => {
+                let [group, failure] = payload.product()?;
+                let group = usize::try_from(group.integer()?).map_err(|_| corrupt("negative group index"))?;
+                let (tag, value) = failure.variant()?;
+                let reason = match tag {
+                    0 => Failure::Write(value.frontier()?),
+                    1 => Failure::Exists(value.id()?),
+                    2 => Failure::UnknownLedger(value.id()?),
+                    3 => { value.unit()?; Failure::Invalid("transaction structure is invalid") }
+                    _ => return Err(corrupt("invalid failure tag")),
+                };
+                Err(Rejection { group, reason })
+            }
+            _ => return Err(corrupt("invalid transaction result tag")),
+        };
+        if outcomes.insert(key.integer()?, result).is_some() { return Err(corrupt("duplicate transaction result")); }
+    }
+    if outcomes.len() != transactions.len() || transactions.iter().any(|(key, groups)| {
+        outcomes.get(key).is_none_or(|result| result.as_ref().is_err_and(|failure| failure.group >= groups.len()))
+    }) { return Err(corrupt("transaction results do not match requests")); }
+
+    Ok(outcomes)
 }
