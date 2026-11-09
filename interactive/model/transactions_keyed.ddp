@@ -61,7 +61,9 @@ let checks = groups | map((txn, (id, index, change)) ->
         CreateAppend ((_, start, upper, _) -> (2, start, upper))) in
     (txn, (id, index, kind, lower, upper)));
 let touched = checks | map((_, (id, _, _, _, _)) -> ((id), ())) | distinct;
-let bases = initial | join(touched, (id, (write), ()) -> (id, write inject Base));
+-- Probe the resident write frontiers once, at the touched ledgers; later uses read this small collection.
+let probed = initial | join(touched, (id, (write), ()) -> (id, (write)));
+let bases = probed | map((id, (write)) -> (id, write inject Base));
 
 res: {
     let excluded = checks | join(rejected, (txn, group, ()) -> (txn, group));
@@ -143,7 +145,7 @@ let next_initial = effects | map(((txn, _), (id, _, change)) ->
         let entries = vals map ((entry, _) -> entry) in
         let last = ((entries len, 1) sub enlist, entries) gather in
         last map ((_, write) -> ((write), 1)));
-let old_initial = next_initial | join(initial, (id, _, old) -> (id, old));
+let old_initial = next_initial | join(probed, (id, _, old) -> (id, old));
 output "initial_delta" = next_initial - old_initial;
 -- Feed these into input 2: starts of ledgers this batch creates.
 output "registered_delta" = registry_add | map((id, (_, start)) -> (id, (start)));
