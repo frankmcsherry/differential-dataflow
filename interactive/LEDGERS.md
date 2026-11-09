@@ -59,7 +59,7 @@ Taken 2026-11-09, with the branch author's agreement.
 - **Resident catalog cost.** Merging the catalog costs about 3.6x per row what the older prototype's index did, and a catalog built through 40 submissions of creations ran about 3% slower (647k against 666k appends/s) than one loaded at open.
   Whether the row types force this, or it can be optimized, is unexplored; the cost should also fall with fewer ledgers, which is unmeasured.
 - **Consumption is a Rust API that polls.** `LedgerSnapshot::capture` replays the whole cohort for each capture, and `refresh_ledger` takes a later capture; there is no live tail and no DDIR syntax for importing a ledger.
-- **`model.md` is unchanged, pending discussion.** It is the aligning document, so it changes only after discussion.
+- **`model.md` is unchanged, pending discussion.** It is the aligning document, so it changes only after discussion; the proposal is [`MODEL_PROPOSAL.md`](MODEL_PROPOSAL.md).
   Topics: its verbs as rules any batched implementation must respect; multi-ledger transactions and their rejection order; the register backing reduced to the guarantees it illustrates; the manifest as a ledger; and "Proximal target", checked against what was built.
 - **Not started:** compaction, read holds, garbage collection, and names bound to ledger ids.
 
