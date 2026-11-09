@@ -1,4 +1,4 @@
-//! Measure the reference resolver and publication path on disjoint multi-ledger transactions.
+//! Measure the keyed resolver and publication path on disjoint multi-ledger transactions.
 //! Usage: cargo run --release -p interactive --example ledger_resolve -- MODE [TXNS WIDTH ROUNDS WORKERS]
 //! MODE is resolve, memory, or file:PATH; defaults are memory, 16, 2, 5, and 1.
 //! Appends have empty payloads, so the measurement covers span metadata and publication.

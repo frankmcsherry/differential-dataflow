@@ -3,7 +3,7 @@
 //! `MemoryStore` models storage that survives dropping clients, while the process stays alive.
 //! On Unix, `FileStore` makes completed writes durable on a local filesystem.
 //! Every commit writes a complete cohort snapshot; payload bytes are opaque and writer-validated.
-//! The DDIR source bridge consumes committed snapshots; the serial `.ddp` resolver can publish conclusions through the same roots.
+//! The DDIR source bridge consumes committed snapshots; the keyed `.ddp` resolver can publish conclusions through the same roots.
 //! Compaction, reclamation, and a stable storage format remain future work.
 //! Run the backing tests with `cargo test -p interactive --lib ledger::`.
 

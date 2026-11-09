@@ -20,7 +20,7 @@ pub struct Resolution {
     pub outcomes: BTreeMap<i64, Result<(), Rejection>>,
 }
 
-/// The compiled `.ddp` transaction resolver.
+/// The compiled keyed `.ddp` transaction resolver.
 pub struct Resolver {
     program: crate::scope_ir::Program,
     workers: usize,
@@ -30,7 +30,7 @@ impl Resolver {
     pub fn new(workers: usize) -> Result<Self, Error> {
         if workers == 0 { return Err(Error::Invalid("the resolver needs at least one worker")); }
         let program = std::panic::catch_unwind(|| {
-            let mut program = crate::lower::lower_tree(crate::parse::pipe::parse(include_str!("../../model/transactions.ddp")));
+            let mut program = crate::lower::lower_tree(crate::parse::pipe::parse(include_str!("../../model/transactions_keyed.ddp")));
             program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "registry_add" | "manifest_add"));
             crate::passes::optimize(&mut program);
             program
@@ -46,8 +46,9 @@ impl Resolver {
         if transactions.is_empty() {
             return Ok(Resolution { state: before.clone(), outcomes: BTreeMap::new() });
         }
-        let width = maximum_width(before, transactions);
-        let inputs = inputs(before, transactions, width)?;
+        let initial = current(before, transactions);
+        let width = maximum_width(&initial, transactions);
+        let inputs = inputs(&initial, transactions, width)?;
         let outputs = evaluate(&self.program, inputs, self.workers)?;
         conclusions(before, transactions, outputs)
     }
@@ -78,13 +79,24 @@ fn unique_keys(transactions: &[Transaction]) -> Result<(), Error> {
     Ok(())
 }
 
-fn maximum_width(state: &State, transactions: &[Transaction]) -> usize {
-    let mut width = state.registry.values().map(|entry| entry.shape.time_width).max().unwrap_or(0);
+// Derive touched ledgers' current frontiers from committed append order.
+// This is a view of registry and spans, not another authoritative frontier.
+fn current<'a>(state: &'a State, transactions: &[Transaction]) -> Vec<(Id, &'a Registration, &'a Frontier)> {
+    let mut entries = transactions.iter().flat_map(|(_, groups)| groups.iter()).filter_map(|(id, _)| {
+        state.registry.get(id).map(|entry| (*id, (entry, &entry.start)))
+    }).collect::<BTreeMap<_, _>>();
+    for span in &state.manifest {
+        if let Some((_, write)) = entries.get_mut(&span.id) { *write = &span.upper; }
+    }
+    entries.into_iter().map(|(id, (entry, write))| (id, entry, write)).collect()
+}
+
+fn maximum_width(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction]) -> usize {
+    let mut width = initial.iter().map(|(_, entry, _)| entry.shape.time_width).max().unwrap_or(0);
     let mut include = |frontier: &Frontier| {
         width = width.max(frontier.elements().iter().map(|time| time.len()).max().unwrap_or(0));
     };
-    for entry in state.registry.values() { include(&entry.start); }
-    for span in &state.manifest { include(&span.lower); include(&span.upper); include(&span.since); }
+    for (_, entry, write) in initial { include(&entry.start); include(write); }
     for (_, groups) in transactions {
         for (_, change) in groups {
             match change {
@@ -143,21 +155,11 @@ fn payloads(values: &[&Payload]) -> Value {
     Value::sum(tags, vec![Value::Unit(empty), bytes(inline), bytes(blobs)])
 }
 
-fn inputs(state: &State, transactions: &[Transaction], width: usize) -> Result<Vec<Updates>, Error> {
-    let registry = Updates {
-        keys: Value::Prod(vec![bytes(state.registry.keys().map(|id| id.as_bytes().as_slice()))]),
-        vals: Value::Prod(vec![shapes(state.registry.values().map(|entry| &entry.shape))?, frontiers(state.registry.values().map(|entry| &entry.start), width)]),
-        diffs: vec![1; state.registry.len()],
-    };
-    let manifest = Updates {
-        keys: Value::Prod(vec![bytes(state.manifest.iter().map(|span| span.id.as_bytes().as_slice()))]),
-        vals: Value::Prod(vec![
-            frontiers(state.manifest.iter().map(|span| &span.lower), width),
-            frontiers(state.manifest.iter().map(|span| &span.upper), width),
-            frontiers(state.manifest.iter().map(|span| &span.since), width),
-            payloads(&state.manifest.iter().map(|span| &span.batch).collect::<Vec<_>>()),
-        ]),
-        diffs: vec![1; state.manifest.len()],
+fn inputs(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction], width: usize) -> Result<Vec<Updates>, Error> {
+    let committed = Updates {
+        keys: Value::Prod(vec![bytes(initial.iter().map(|(id, _, _)| id.as_bytes().as_slice()))]),
+        vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, entry, _)| &entry.start), width), frontiers(initial.iter().map(|(_, _, write)| *write), width)]),
+        diffs: vec![1; initial.len()],
     };
     let groups = transactions.iter().flat_map(|(_, groups)| groups).collect::<Vec<_>>();
     let (mut tags, mut creates, mut appends, mut combined) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -180,7 +182,7 @@ fn inputs(state: &State, transactions: &[Transaction], width: usize) -> Result<V
         vals: Value::Prod(vec![Value::List(ends.into(), Box::new(Value::Prod(vec![bytes(groups.iter().map(|(id, _)| id.as_bytes().as_slice())), changes])))]),
         diffs: vec![1; transactions.len()],
     };
-    Ok(vec![registry, manifest, commands])
+    Ok(vec![committed, commands])
 }
 
 fn evaluate(program: &crate::scope_ir::Program, inputs: Vec<Updates>, workers: usize) -> Result<BTreeMap<String, Updates>, Error> {
