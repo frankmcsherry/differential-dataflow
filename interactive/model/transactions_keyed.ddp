@@ -1,8 +1,9 @@
 -- Ordered atomic transactions, resolved separately for each ledger id.
 -- transactions.ddp remains the serial specification of these rules.
 -- Input 0 is a derived view of committed registration starts and write frontiers.
--- Input 1 has the same grouped transactions as input 2 of transactions.ddp.
--- Ledger ids are canonical UUID byte lists; frontiers use uniformly padded integer products.
+-- Input 1 holds grouped transactions; UUID words replace the byte lists in transactions.ddp.
+-- Ledger ids are two signed words, each biased by its sign bit to preserve UUID byte order.
+-- Frontiers use uniformly padded integer products; public and durable UUIDs remain byte lists.
 -- Group ids must increase strictly, transaction keys must be unique, and both inputs are sets.
 --
 -- Every valid group is checked, even while its transaction is rejected elsewhere.
@@ -15,17 +16,17 @@ type Payload = Empty | Inline List(int) | Blob List(int);
 type Change = Create (List(int), List(List(int)))
             | Append (List(List(int)), List(List(int)), Payload)
             | CreateAppend (List(int), List(List(int)), List(List(int)), Payload);
-type Failure = Write List(List(int)) | Exists List(int) | UnknownLedger List(int) | Invalid;
+type Failure = Write List(List(int)) | Exists (int, int) | UnknownLedger (int, int) | Invalid;
 type TxnResult = Committed | Aborted (int, Failure);
 -- Base state sorts before proposals, which sort by transaction key without a sentinel key.
 type Row = Base (List(List(int)), List(List(int))) | Proposal (int, int, Change, int);
 
-let initial = input 0 : ((List(int)), (List(List(int)), List(List(int))));
-let transactions = input 1 : ((int), (List((List(int), Change))));
+let initial = input 0 : (((int, int)), (List(List(int)), List(List(int))));
+let transactions = input 1 : ((int), (List(((int, int), Change))));
 
 -- Structural validation is independent of committed state and speculative outcomes.
 let invalid = transactions | map((txn, (groups)) ->
-    let first = [] : List(int) in
+    let first = (0, 0) in
     let checked = ((first, 0, 0, -1), groups) fold (((previous, seen, index, failure), (id, change)) ->
         let ordered = (seen, (previous, id) lt, 1) select in
         let bounds = change match (
@@ -100,12 +101,12 @@ output "results" = (accepted | map((txn, _) -> (txn, (() inject Committed))))
                  + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
 output "registry_add" = effects | flatmap((_, (id, _, change)) -> (id, change) cap_sum match (
     Create ((id, (shape, start)) -> ((id), (shape, (start, start) call frontier_meet)) enlist),
-    Append (_ -> [] : List(((List(int)), (List(int), List(List(int)))))),
+    Append (_ -> [] : List((((int, int)), (List(int), List(List(int)))))),
     CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, (start, start) call frontier_meet)) enlist)))
     | map((_, (_, row)) -> row);
 let manifest_ordered = effects | flatmap((_, (id, start, change)) -> ((id, start), change) cap_sum match (
     Create (_ ->
-        let empty = [] : List(((List(int)), (List(List(int)), List(List(int)), List(List(int))))) in
+        let empty = [] : List((((int, int)), (List(List(int)), List(List(int)), List(List(int))))) in
         empty map ((id, (lo, hi, since)) -> (id, (lo, hi, since, () inject Empty)))),
     Append (((id, start), (lower, upper, batch)) -> ((id), ((lower, lower) call frontier_meet, (upper, upper) call frontier_meet, start, batch)) enlist),
     CreateAppend (((id, start), (_, lower, upper, batch)) -> ((id), ((lower, lower) call frontier_meet, (upper, upper) call frontier_meet, start, batch)) enlist)))

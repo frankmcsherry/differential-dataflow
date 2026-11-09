@@ -123,6 +123,62 @@ pub(super) fn bytes<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Value {
     Value::List(ends.into(), Box::new(Value::u8(flat)))
 }
 
+/// Two signed words preserve all UUID bits and their unsigned lexicographic order.
+pub(super) fn ids(values: impl IntoIterator<Item = Id>) -> Value {
+    let (mut high, mut low) = (Vec::new(), Vec::new());
+    for id in values {
+        let bytes = id.as_bytes();
+        high.push(i64::from_be_bytes(bytes[..8].try_into().unwrap()) ^ i64::MIN);
+        low.push(i64::from_be_bytes(bytes[8..].try_into().unwrap()) ^ i64::MIN);
+    }
+    Value::Prod(vec![Value::int(high), Value::int(low)])
+}
+
+/// Restore the public UUID byte columns once, after collecting resolver conclusions.
+fn public_ids(value: Value) -> Result<Value, Error> {
+    let value = corgi::OpLike::eval(&corgi::NumOp::Core(corgi::Op::Clone), value).map_err(Error::Corrupt)?;
+    let Value::Prod(words) = value else { return Err(corrupt("expected UUID words")); };
+    let [high, low]: [Value; 2] = words.try_into().map_err(|_| corrupt("expected two UUID words"))?;
+    let high = high.as_i64("UUID high word").map_err(Error::Corrupt)?;
+    let low = low.as_i64("UUID low word").map_err(Error::Corrupt)?;
+    if high.len() != low.len() { return Err(corrupt("UUID word lengths differ")); }
+    let mut bytes = Vec::with_capacity(16 * high.len());
+    for (high, low) in high.iter().zip(low.iter()) {
+        bytes.extend_from_slice(&(high ^ i64::MIN).to_be_bytes());
+        bytes.extend_from_slice(&(low ^ i64::MIN).to_be_bytes());
+    }
+    Ok(Value::List(Bounds::Stride(16, high.len()), Box::new(Value::u8(bytes))))
+}
+
+pub(super) fn public_outputs(mut outputs: BTreeMap<String, Updates>) -> Result<BTreeMap<String, Updates>, Error> {
+    let restore = |value: &mut Value| -> Result<(), Error> {
+        *value = public_ids(std::mem::replace(value, Value::Unit(0)))?;
+        Ok(())
+    };
+    for (name, updates) in &mut outputs {
+        match name.as_str() {
+            "registry_add" | "manifest_add" => {
+                let Value::Prod(fields) = &mut updates.keys else { return Err(corrupt("expected UUID key")); };
+                restore(&mut fields[0])?;
+            }
+            "manifest_ordered" => {
+                let Value::Prod(fields) = &mut updates.vals else { return Err(corrupt("expected span fields")); };
+                restore(&mut fields[0])?;
+            }
+            "results" | "aborted" => {
+                let Value::Prod(fields) = &mut updates.vals else { return Err(corrupt("expected result field")); };
+                let Value::Sum(_, results) = &mut fields[0] else { return Err(corrupt("expected result variants")); };
+                let Value::Prod(aborted) = &mut results[1] else { return Err(corrupt("expected rejection fields")); };
+                let Value::Sum(_, failures) = &mut aborted[1] else { return Err(corrupt("expected failure variants")); };
+                restore(&mut failures[1])?;
+                restore(&mut failures[2])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(outputs)
+}
+
 pub(super) fn frontiers<'a>(values: impl IntoIterator<Item = &'a Frontier>, width: usize) -> Value {
     let (mut frontier_ends, mut time_ends, mut coordinates) = (Vec::new(), Vec::new(), Vec::new());
     for value in values {
@@ -157,7 +213,7 @@ fn payloads(values: &[&Payload]) -> Value {
 
 fn inputs(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction], width: usize) -> Result<Vec<Updates>, Error> {
     let committed = Updates {
-        keys: Value::Prod(vec![bytes(initial.iter().map(|(id, _, _)| id.as_bytes().as_slice()))]),
+        keys: Value::Prod(vec![ids(initial.iter().map(|(id, _, _)| *id))]),
         vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, entry, _)| &entry.start), width), frontiers(initial.iter().map(|(_, _, write)| *write), width)]),
         diffs: vec![1; initial.len()],
     };
@@ -183,7 +239,7 @@ pub(super) fn commands(transactions: &[Transaction], width: usize) -> Result<Upd
     let ends = transactions.iter().map(|(_, groups)| { end += groups.len(); end }).collect::<Vec<_>>();
     let commands = Updates {
         keys: Value::Prod(vec![Value::int(transactions.iter().map(|(key, _)| *key))]),
-        vals: Value::Prod(vec![Value::List(ends.into(), Box::new(Value::Prod(vec![bytes(groups.iter().map(|(id, _)| id.as_bytes().as_slice())), changes])))]),
+        vals: Value::Prod(vec![Value::List(ends.into(), Box::new(Value::Prod(vec![ids(groups.iter().map(|(id, _)| *id)), changes])))]),
         diffs: vec![1; transactions.len()],
     };
     Ok(commands)
@@ -209,7 +265,7 @@ fn evaluate(program: &crate::scope_ir::Program, inputs: Vec<Updates>, workers: u
         let result = result.map_err(Error::Resolve)?.map_err(Error::Resolve)?;
         if worker == 0 { outputs = Some(result); }
     }
-    outputs.ok_or_else(|| Error::Resolve("resolver returned no worker result".into()))
+    public_outputs(outputs.ok_or_else(|| Error::Resolve("resolver returned no worker result".into()))?)
 }
 
 #[derive(Clone, Copy)]
@@ -403,4 +459,36 @@ pub(super) fn outcomes(results: &Updates, transactions: &[Transaction]) -> Resul
     }) { return Err(corrupt("transaction results do not match requests")); }
 
     Ok(outcomes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuid_words_preserve_bits_and_order() {
+        let mut values = vec![0, 1, (1 << 63) - 1, 1 << 63, u64::MAX as u128,
+            1 << 64, (1 << 127) - 1, 1 << 127, u128::MAX];
+        let mut random = 17_u128;
+        for _ in 0..128 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            values.push(random);
+        }
+        values.sort();
+        values.dedup();
+        let values = values.into_iter().map(Id::from_u128).collect::<Vec<_>>();
+        let encoded = ids(values.iter().copied());
+        let Value::Prod(words) = &encoded else { unreachable!() };
+        let high = words[0].as_i64("high").unwrap();
+        let low = words[1].as_i64("low").unwrap();
+        let ordered = high.iter().zip(low.iter()).collect::<Vec<_>>();
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+        let restored = wide(public_ids(encoded).unwrap()).unwrap();
+        for (index, id) in values.into_iter().enumerate() {
+            assert_eq!(Row { value: &restored, index }.id().unwrap(), id);
+        }
+        assert_eq!(public_ids(ids([])).unwrap().len(), 0);
+    }
 }

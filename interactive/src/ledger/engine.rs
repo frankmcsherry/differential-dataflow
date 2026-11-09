@@ -39,7 +39,7 @@ impl Engine {
             }
         }
         let mut catalog = crate::lower::lower_tree(crate::parse::pipe::parse(
-            "let current = input 0 : ((List(int)), (List(List(int)), List(List(int)))); output \"current\" = current;"
+            "let current = input 0 : (((int, int)), (List(List(int)), List(List(int)))); output \"current\" = current;"
         ));
         crate::passes::optimize(&mut catalog);
         let workers = resolver.workers;
@@ -135,7 +135,7 @@ impl Engine {
                 }
             }
         }
-        outputs.ok_or_else(|| Error::Resolve("resident resolver returned no results".into()))
+        super::resolve::public_outputs(outputs.ok_or_else(|| Error::Resolve("resident resolver returned no results".into()))?)
     }
 
     fn stop(&mut self) {
@@ -155,7 +155,7 @@ fn shard(updates: &Updates, index: usize, peers: usize) -> Updates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::resolve::{bytes, frontiers};
+    use super::super::resolve::{ids, frontiers};
 
     #[test]
     fn feed_errors_stop_and_join_workers() {
@@ -163,7 +163,7 @@ mod tests {
         let wrong = Updates { keys: corgi::Value::int(vec![0]), vals: corgi::Value::Unit(1), diffs: vec![1] };
         assert!(Engine::new(&resolver, wrong.clone()).is_err());
         let initial = Updates {
-            keys: corgi::Value::Prod(vec![bytes(std::iter::empty::<&[u8]>())]),
+            keys: corgi::Value::Prod(vec![ids(std::iter::empty())]),
             vals: corgi::Value::Prod(vec![frontiers(std::iter::empty(), 0), frontiers(std::iter::empty(), 0)]),
             diffs: Vec::new(),
         };

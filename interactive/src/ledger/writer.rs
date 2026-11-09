@@ -256,7 +256,7 @@ fn initial(state: &State, width: usize) -> Updates {
         if let Some((_, write)) = entries.get_mut(&span.id) { *write = &span.upper; }
     }
     Updates {
-        keys: corgi::Value::Prod(vec![resolve::bytes(entries.keys().map(|id| id.as_bytes().as_slice()))]),
+        keys: corgi::Value::Prod(vec![resolve::ids(entries.keys().copied())]),
         vals: corgi::Value::Prod(vec![
             resolve::frontiers(entries.values().map(|(entry, _)| &entry.start), width),
             resolve::frontiers(entries.values().map(|(_, write)| *write), width),
