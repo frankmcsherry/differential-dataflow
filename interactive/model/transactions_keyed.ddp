@@ -22,7 +22,18 @@ type TxnResult = Committed | Aborted (int, Failure);
 type Row = Base (List(List(int)), List(List(int))) | Proposal (int, int, Change, int);
 
 let initial = input 0 : (((int, int)), (List(List(int)), List(List(int))));
-let transactions = input 1 : ((int), (List(((int, int), Change))));
+let submitted = input 1 : ((int), (List(((int, int), Change))));
+-- Canonicalize command frontiers once; committed starts and writes already have this invariant.
+let transactions = submitted | map((txn, (groups)) ->
+    let groups = groups map ((id, change) ->
+        let change = change match (
+            Create ((shape, start) -> (shape, start call frontier_normalize) inject Create),
+            Append ((lower, upper, batch) ->
+                (lower call frontier_normalize, upper call frontier_normalize, batch) inject Append),
+            CreateAppend ((shape, start, upper, batch) ->
+                (shape, start call frontier_normalize, upper call frontier_normalize, batch) inject CreateAppend)) in
+        (id, change)) in
+    (txn, (groups)));
 
 -- Structural validation is independent of committed state and speculative outcomes.
 let invalid = transactions | map((txn, (groups)) ->
@@ -61,8 +72,6 @@ res: {
                         Create ((_, start) -> (0, start, start)),
                         Append ((lower, upper, _) -> (1, lower, upper)),
                         CreateAppend ((_, start, upper, _) -> (2, start, upper))) in
-                    let lower = (lower, lower) call frontier_meet in
-                    let upper = (upper, upper) call frontier_meet in
                     let creating = (kind, 1) ne in
                     let matches = (lower, write) call frontier_eq in
                     let status = (creating,
@@ -100,16 +109,16 @@ output "results" = (accepted | map((txn, _) -> (txn, (() inject Committed))))
                  + (failures | map((txn, failure) -> (txn, (failure inject Aborted))))
                  + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
 output "registry_add" = effects | flatmap((_, (id, _, change)) -> (id, change) cap_sum match (
-    Create ((id, (shape, start)) -> ((id), (shape, (start, start) call frontier_meet)) enlist),
+    Create ((id, (shape, start)) -> ((id), (shape, start)) enlist),
     Append (_ -> [] : List((((int, int)), (List(int), List(List(int)))))),
-    CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, (start, start) call frontier_meet)) enlist)))
+    CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, start)) enlist)))
     | map((_, (_, row)) -> row);
 let manifest_ordered = effects | flatmap((_, (id, start, change)) -> ((id, start), change) cap_sum match (
     Create (_ ->
         let empty = [] : List((((int, int)), (List(List(int)), List(List(int)), List(List(int))))) in
         empty map ((id, (lo, hi, since)) -> (id, (lo, hi, since, () inject Empty)))),
-    Append (((id, start), (lower, upper, batch)) -> ((id), ((lower, lower) call frontier_meet, (upper, upper) call frontier_meet, start, batch)) enlist),
-    CreateAppend (((id, start), (_, lower, upper, batch)) -> ((id), ((lower, lower) call frontier_meet, (upper, upper) call frontier_meet, start, batch)) enlist)))
+    Append (((id, start), (lower, upper, batch)) -> ((id), (lower, upper, start, batch)) enlist),
+    CreateAppend (((id, start), (_, lower, upper, batch)) -> ((id), (lower, upper, start, batch)) enlist)))
     | map((key, (_, ((id), (lower, upper, since, batch)))) -> (key, (id, lower, upper, since, batch)));
 output "manifest_ordered" = manifest_ordered;
 output "manifest_add" = manifest_ordered | map((_, (id, lower, upper, since, batch)) -> ((id), (lower, upper, since, batch)));
@@ -122,7 +131,7 @@ let next_initial = effects | map(((txn, _), (id, start, change)) ->
         Create ((_, lower) -> lower),
         Append ((_, upper, _) -> upper),
         CreateAppend ((_, _, upper, _) -> upper)) in
-    ((id), (txn, start, (write, write) call frontier_meet)))
+    ((id), (txn, start, write)))
     | reduce((_, vals) ->
         let entries = vals map ((entry, _) -> entry) in
         let last = ((entries len, 1) sub enlist, entries) gather in
