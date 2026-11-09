@@ -1,9 +1,9 @@
 //! Compare the Rust backing and the .ddp transaction rules on the same histories.
-//! Fixture IDs map to UUIDs, and shapes are serialized as opaque bytes for .ddp.
+//! UUIDs use their canonical 16 bytes, and shapes are serialized as opaque bytes for .ddp.
 
 use std::collections::BTreeMap;
 
-use interactive::ledger::{validate, Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Shape, State, Store, Time};
+use interactive::ledger::{validate, Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Resolver, Shape, State, Store, Time};
 use interactive::runtime::container::Updates;
 
 type Row = (String, String, i64);
@@ -12,9 +12,9 @@ type Transaction = (i64, Vec<(Id, Change)>);
 fn tuple(fields: &[String]) -> String { format!("tuple({})", fields.join(",")) }
 fn list(fields: &[String]) -> String { format!("list({})", fields.join(",")) }
 fn inject(tag: usize, payload: &str) -> String { format!("inject({tag},{payload})") }
-fn number(id: Id) -> i64 { id.as_u128().try_into().unwrap() }
 fn id(number: i64) -> Id { Id::from_u128(number.try_into().unwrap()) }
 fn bytes(bytes: &[u8]) -> String { list(&bytes.iter().map(u8::to_string).collect::<Vec<_>>()) }
+fn print_id(id: Id) -> String { bytes(id.as_bytes()) }
 
 fn frontier(points: &[&[i64]]) -> Frontier {
     points.iter().map(|point| Time::new((*point).into())).collect()
@@ -56,7 +56,7 @@ fn print_group((id, change): &(Id, Change)) -> String {
             print_shape(shape), print_frontier(start), print_frontier(upper), print_payload(batch),
         ])),
     };
-    tuple(&[number(*id).to_string(), change])
+    tuple(&[print_id(*id), change])
 }
 
 fn row(key: i64, value: String) -> Row {
@@ -69,8 +69,8 @@ fn print_result(txn: i64, result: Result<(), Rejection>) -> Row {
         Err(Rejection { group, reason }) => {
             let reason = match reason {
                 Failure::Write(write) => inject(0, &print_frontier(&write)),
-                Failure::Exists(id) => inject(1, &number(id).to_string()),
-                Failure::UnknownLedger(id) => inject(2, &number(id).to_string()),
+                Failure::Exists(id) => inject(1, &print_id(id)),
+                Failure::UnknownLedger(id) => inject(2, &print_id(id)),
                 Failure::Invalid(_) => inject(3, "tuple()"),
             };
             inject(1, &tuple(&[group.to_string(), reason]))
@@ -81,7 +81,7 @@ fn print_result(txn: i64, result: Result<(), Rejection>) -> Row {
 
 fn registry(state: &State) -> Vec<Row> {
     state.registry.iter().map(|(id, entry)| (
-        tuple(&[number(*id).to_string()]),
+        tuple(&[print_id(*id)]),
         tuple(&[print_shape(&entry.shape), print_frontier(&entry.start)]),
         1,
     )).collect()
@@ -89,7 +89,7 @@ fn registry(state: &State) -> Vec<Row> {
 
 fn manifest(state: &State) -> Vec<Row> {
     state.manifest.iter().map(|span| (
-        tuple(&[number(span.id).to_string()]),
+        tuple(&[print_id(span.id)]),
         tuple(&[print_frontier(&span.lower), print_frontier(&span.upper), print_frontier(&span.since), print_payload(&span.batch)]),
         1,
     )).collect()
@@ -140,6 +140,8 @@ fn check(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]]) {
 fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], store: &dyn Store) {
     for payload in payloads { store.put(payload).unwrap(); }
     let cohort = Cohort::new(store, "comparison");
+    let publisher = Cohort::new(store, "resolved");
+    let resolver = Resolver::new(workers).unwrap();
     for txns in rounds {
         let before = cohort.snapshot().unwrap();
         let mut ordered = txns.to_vec();
@@ -151,6 +153,13 @@ fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], 
             validate(changes).err().map(|rejection| row(*txn, rejection.group.to_string()))
         }).collect::<Vec<_>>();
         let after = cohort.snapshot().unwrap();
+        let outcomes = publisher.transact_batch(&resolver, txns).unwrap();
+        let mut published_results = outcomes.into_iter().map(|(txn, outcome)| print_result(txn, outcome)).collect::<Vec<_>>();
+        let mut reference_results = results.clone();
+        published_results.sort();
+        reference_results.sort();
+        assert_eq!(published_results, reference_results, "published transaction outcomes");
+        assert_eq!(publisher.snapshot().unwrap(), after, "published cohort state");
         let actual = evaluate(&before, txns, workers);
         let registry_add = State {
             registry: after.registry.iter().filter(|(id, _)| !before.registry.contains_key(*id))
@@ -253,5 +262,29 @@ fn grouped_changes_and_local_conflicts_agree() {
 #[test]
 fn local_rejection_without_any_cohort_rows_agrees() {
     let rounds = vec![vec![(0, vec![create(1, at(0, 0)), create(1, at(0, 0))])]];
+    for workers in [1, 2] { check(&rounds, workers, &[]); }
+}
+
+#[test]
+fn uuid_bytes_preserve_high_bits_and_order() {
+    let low = Id::from_u128((1_u128 << 64) | 1);
+    let low_sign = Id::from_u128((1_u128 << 64) | (1_u128 << 63) | 1);
+    let high_sign = Id::from_u128((1_u128 << 127) | 1);
+    let maximum = Id::from_u128(u128::MAX);
+    let unknown = Id::from_u128((1_u128 << 127) | 2);
+    let start = at(0, 0);
+    let middle = frontier(&[&[0, 1], &[1, 0]]);
+    let create = |id| (id, Change::Create { shape: shape(), start: start.clone() });
+    let append = |id, lower, upper| (id, Change::Append { lower, upper, batch: Payload::Empty });
+    let rounds = vec![
+        vec![(0, vec![create(low), create(low_sign), create(high_sign), create(maximum)])],
+        vec![
+            (10, vec![append(low_sign, start.clone(), middle.clone()), append(high_sign, start.clone(), middle.clone())]),
+            (20, vec![create(high_sign)]),
+            (30, vec![append(unknown, start.clone(), middle.clone())]),
+            (40, vec![append(maximum, start.clone(), middle.clone()), append(low_sign, middle.clone(), at(1, 1))]),
+            (50, vec![append(low_sign, middle.clone(), at(1, 1)), append(high_sign, middle.clone(), Frontier::new())]),
+        ],
+    ];
     for workers in [1, 2] { check(&rounds, workers, &[]); }
 }

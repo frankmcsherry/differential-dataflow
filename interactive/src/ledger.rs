@@ -3,7 +3,7 @@
 //! `MemoryStore` models storage that survives dropping clients, while the process stays alive.
 //! On Unix, `FileStore` makes completed writes durable on a local filesystem.
 //! Every commit writes a complete cohort snapshot; payload bytes are opaque and writer-validated.
-//! The DDIR source bridge consumes committed snapshots; the `.ddp` resolver remains a reference model.
+//! The DDIR source bridge consumes committed snapshots; the serial `.ddp` resolver can publish conclusions through the same roots.
 //! Compaction, reclamation, and a stable storage format remain future work.
 //! Run the backing tests with `cargo test -p interactive --lib ledger::`.
 
@@ -18,6 +18,8 @@ use timely::progress::frontier::Antichain;
 mod file;
 #[cfg(unix)]
 pub use file::FileStore;
+mod resolve;
+pub use resolve::{Resolution, Resolver, Transaction};
 
 /// Signed product time, with trailing minimum coordinates omitted by `PointStamp`.
 pub type Time = differential_dataflow::dynamic::pointstamp::PointStamp<i64, 2>;
@@ -234,6 +236,7 @@ pub enum Error {
     Invalid(&'static str),
     UnknownLedger(Id),
     Corrupt(String),
+    Resolve(String),
     /// The operation may have committed; `id` also identifies an uncertain creation.
     CommitUnknown {
         id: Id,

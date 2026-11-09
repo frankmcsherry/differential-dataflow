@@ -296,3 +296,103 @@ fn root_names_differing_by_case_are_distinct() {
     assert_eq!(store.cas_root("Root", 0, blob), Ok(true));
     assert_eq!(store.read_root("root").unwrap().version, 1);
 }
+
+#[test]
+fn resolved_cohort_recovers_without_reresolving_intents() {
+    use interactive::ledger::{Failure, Rejection, Resolver};
+
+    if let Some(path) = std::env::var_os(DIRECTORY) {
+        let store = FileStore::open(path).unwrap();
+        let cohort = Cohort::new(&store, "resolved");
+        let middle = frontier(&[&[0, 1], &[1, 0]]);
+        match std::env::var(ROLE).unwrap().as_str() {
+            "seed" => {
+                let blob = store.put(&payload("1", &[vec![0], vec![0]])).unwrap();
+                let outcomes = cohort
+                    .transact_batch(
+                        &Resolver::new(2).unwrap(),
+                        &[
+                            (
+                                10,
+                                vec![(
+                                    id(1),
+                                    Change::CreateAppend {
+                                        shape: shape(),
+                                        start: at(0, 0),
+                                        upper: middle.clone(),
+                                        batch: Payload::Blob(blob),
+                                    },
+                                )],
+                            ),
+                            (
+                                20,
+                                vec![
+                                    (id(0), Change::Create { shape: shape(), start: at(0, 0) }),
+                                    (id(1), Change::Append { lower: at(0, 0), upper: at(1, 1), batch: Payload::Empty }),
+                                ],
+                            ),
+                            (
+                                30,
+                                vec![(
+                                    id(1),
+                                    Change::Append {
+                                        lower: middle.clone(),
+                                        upper: at(1, 1),
+                                        batch: Payload::Inline(payload("2", &[vec![0], vec![1]])),
+                                    },
+                                )],
+                            ),
+                            (
+                                40,
+                                vec![(
+                                    id(1),
+                                    Change::Append { lower: at(1, 1), upper: Frontier::new(), batch: Payload::Empty },
+                                )],
+                            ),
+                        ],
+                    )
+                    .unwrap();
+                assert_eq!(outcomes.len(), 4);
+                assert_eq!(outcomes[&10], Ok(()));
+                assert_eq!(outcomes[&20], Err(Rejection { group: 1, reason: Failure::Write(middle) }));
+                assert_eq!(outcomes[&30], Ok(()));
+                assert_eq!(outcomes[&40], Ok(()));
+                assert_eq!(store.read_root("resolved").unwrap().version, 1);
+            }
+            "read" => {
+                // Recovery consumes committed state and payloads, without constructing a resolver.
+                let state = cohort.snapshot().unwrap();
+                assert_eq!(state.registry.len(), 1);
+                assert!(!state.registry.contains_key(&id(0)));
+                assert_eq!(state.manifest.len(), 3);
+                assert_eq!(state.write(id(1)), Some(&Frontier::new()));
+                assert_eq!(store.read_root("resolved").unwrap().version, 1);
+                let cut = LedgerSnapshot::capture(&store, "resolved", id(1)).unwrap();
+                let (before, after) = timely::execute_directly(move |worker| {
+                    let mut server = Server::new();
+                    server.publish_ledger(worker, "saved", &cut).unwrap();
+                    let program = interactive::lower::lower_tree(interactive::parse::pipe::parse(
+                        "output \"rows\" = import \"saved\" : ((int), ());",
+                    ));
+                    server.install_with_root(worker, "reader", &program, 2, HostTime::default()).unwrap();
+                    let at = |x, y| HostTime::new([x, y].into());
+                    (
+                        server.snapshot_as_of(worker, "reader::rows", &at(0, 0)).unwrap().rows(),
+                        server.snapshot_as_of(worker, "reader::rows", &at(0, 1)).unwrap().rows(),
+                    )
+                });
+                assert_eq!(before, vec![("tuple(1)".into(), "tuple()".into(), 1)]);
+                assert_eq!(
+                    after,
+                    vec![("tuple(1)".into(), "tuple()".into(), 1), ("tuple(2)".into(), "tuple()".into(), 1),]
+                );
+            }
+            role => panic!("unknown role {role}"),
+        }
+        // Skip destructors: the published resolver conclusions must already be durable.
+        std::process::exit(0);
+    }
+    let directory = Directory::new();
+    run("resolved_cohort_recovers_without_reresolving_intents", &directory.0, "seed");
+    run("resolved_cohort_recovers_without_reresolving_intents", &directory.0, "read");
+}

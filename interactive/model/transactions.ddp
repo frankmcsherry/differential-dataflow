@@ -1,6 +1,9 @@
 -- Ordered atomic transactions against one committed cohort snapshot.
 -- Each input-2 row is a transaction, with changes grouped by ledger id.
 -- Group ids must be strictly increasing, so each id has at most one change.
+-- Ledger ids are UUIDs encoded as 16 bytes in standard UUID byte order, each byte an int in 0..255.
+-- Their fixed-width byte-list order agrees with UUID order; width and byte range are caller obligations.
+-- The illustrative single-verb verbs.ddp still uses integer ids.
 -- Transaction keys are unique and supply a total order compatible with completed operations.
 -- All input relations are sets.
 -- Empty transactions succeed.
@@ -23,20 +26,21 @@ type Payload = Empty | Inline List(int) | Blob List(int);
 type Change = Create (List(int), List(List(int)))
             | Append (List(List(int)), List(List(int)), Payload)
             | CreateAppend (List(int), List(List(int)), List(List(int)), Payload);
-type Failure = Write List(List(int)) | Exists int | UnknownLedger int | Invalid;
+type Failure = Write List(List(int)) | Exists List(int) | UnknownLedger List(int) | Invalid;
 type TxnResult = Committed | Aborted (int, Failure);
 -- The variant order ensures initial state is folded before transactions.
-type Row = Registry (int, List(int), List(List(int)))
-         | Span (int, List(List(int)), List(List(int)), List(List(int)), Payload)
-         | Transaction (int, List((int, Change)));
+type Row = Registry (List(int), List(int), List(List(int)))
+         | Span (List(int), List(List(int)), List(List(int)), List(List(int)), Payload)
+         | Transaction (int, List((List(int), Change)));
 
-let registry = input 0 : ((int), (List(int), List(List(int))));
-let manifest = input 1 : ((int), (List(List(int)), List(List(int)), List(List(int)), Payload));
-let transactions = input 2 : ((int), (List((int, Change))));
+let registry = input 0 : ((List(int)), (List(int), List(List(int))));
+let manifest = input 1 : ((List(int)), (List(List(int)), List(List(int)), List(List(int)), Payload));
+let transactions = input 2 : ((int), (List((List(int), Change))));
 
 -- This view has no dependency on cohort state. Its failure index is zero-based.
 let invalid = transactions | map((txn, (groups)) ->
-    let checked = ((0, 0, 0, -1), groups) fold (((previous, seen, index, failure), (id, change)) ->
+    let first = [] : List(int) in
+    let checked = ((first, 0, 0, -1), groups) fold (((previous, seen, index, failure), (id, change)) ->
         let ordered = (seen, (previous, id) lt, 1) select in
         let bounds = change match (
             Create (_ -> 1),
@@ -53,8 +57,8 @@ let rows = (registry | map(((id), (shape, start)) -> ((), (id, shape, start) inj
          + (valid_transactions | map(((txn), (groups)) -> ((), (txn, groups) inject Transaction)));
 
 let resolved = rows | reduce((_, vals) ->
-    let initial_registry = [] : List((int, List(int), List(List(int)))) in
-    let empty_spans = [] : List((int, List(List(int)), List(List(int)), List(List(int)))) in
+    let initial_registry = [] : List((List(int), List(int), List(List(int)))) in
+    let empty_spans = [] : List((List(int), List(List(int)), List(List(int)), List(List(int)))) in
     let initial_manifest = empty_spans map ((id, lo, hi, since) -> (id, lo, hi, since, () inject Empty)) in
     let empty_results = [] : List(int) in
     let initial_results = empty_results map (txn -> (txn, () inject Committed)) in

@@ -163,6 +163,19 @@ It is not used to advance ledger sources.
 
 `cargo test -p interactive --test server_ledgers` exercises the bridge on one and four workers, including refresh, product timestamps, empty spans, sealing, and independent lifetimes.
 
+`interactive::ledger::Resolver::new(workers)` compiles the `.ddp` transaction rules once.
+`Cohort::transact_batch(&resolver, &transactions)` resolves a batch against committed state and publishes its accepted effects through one root CAS.
+Each transaction has an integer key scoped to that batch and changes grouped by strictly increasing UUID.
+Ledger identifiers use their full 16 bytes in the evaluator.
+Results return after publication; a lost CAS repeats resolution against the new committed state, while an unknown publication returns an error without retrying.
+Recovery reads the committed state without replaying intents or rerunning the resolver.
+
+The resolver still uses the serial reference algorithm and starts a worker group for each resolution.
+`cargo run --release -p interactive --example ledger_resolve -- memory 16 2 5 1` measures five batches of sixteen transactions changing two ledgers each, after one warmup batch.
+Use `resolve` in place of `memory` to omit publication, or `file:/path/to/fresh-store` for filesystem publication.
+The example uses empty payloads, excludes proposal generation and initial compilation from the timed batches, and includes evaluator setup, resolution, and any publication.
+It checks the final span count and write frontiers.
+
 On Unix, `interactive::ledger::FileStore::open(path)` provides the same blob and root operations on a local filesystem.
 The store keeps immutable content-addressed files in `blobs/`, versioned roots in `roots/`, and persistent root lock files in `locks/`.
 Root and lock filenames encode name bytes as lowercase hex, preserving distinct names on case-insensitive filesystems.
