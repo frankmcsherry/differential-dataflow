@@ -147,7 +147,7 @@ state, not elapsed wall-clock time.
 
 ## Ledger sources through the Rust API
 
-`interactive::ledger::Cohort` creates and appends ledgers independently of programs and arrangements.
+`interactive::ledger::Writer` creates and appends ledgers independently of programs and arrangements, and `Cohort` reads what it committed.
 For DDIR consumption, declare the ledger columns as `(key, val)` and encode raw updates with `interactive::server::encode_ledger_batch`, supplying one signed coordinate lane per declared time dimension.
 The current bridge requires nonnegative coordinates because DDIR timestamps use unsigned integers.
 
@@ -163,18 +163,13 @@ It is not used to advance ledger sources.
 
 `cargo test -p interactive --test server_ledgers` exercises the bridge on one and four workers, including refresh, product timestamps, empty spans, sealing, and independent lifetimes.
 
-`interactive::ledger::Resolver::new(workers)` compiles the `.ddp` transaction rules once.
-`Cohort::transact_batch(&resolver, &transactions)` resolves a batch against committed state and publishes its accepted effects through one root CAS.
-Each transaction has an integer key scoped to that batch and changes grouped by strictly increasing UUID.
-Ledger identifiers use their full 16 bytes in the evaluator.
-Results return after publication; a lost CAS repeats resolution against the new committed state, while an unknown publication returns an error without retrying.
-Recovery reads the committed state without replaying intents or rerunning the resolver.
-
-The resolver still uses the serial reference algorithm and starts a worker group for each resolution.
-`cargo run --release -p interactive --example ledger_resolve -- memory 16 2 5 1` measures five batches of sixteen transactions changing two ledgers each, after one warmup batch.
-Use `resolve` in place of `memory` to omit publication, or `file:/path/to/fresh-store` for filesystem publication.
-The example uses empty payloads, excludes proposal generation and initial compilation from the timed batches, and includes evaluator setup, resolution, and any publication.
-It checks the final span count and write frontiers.
+`interactive::ledger::Writer::open(store, root, workers)` recovers a cohort and keeps its write frontiers resident on its own workers.
+`submit` resolves a batch of transactions with the keyed `.ddp` rules and returns a receipt; `wait` returns its outcomes once the batch's conclusions are published through one root CAS.
+Later batches may resolve while earlier ones publish, and batches that queue meanwhile share one publication.
+Each transaction has an integer key scoped to its batch and changes grouped by strictly increasing UUID.
+A lost CAS reloads the cohort and re-resolves every unacknowledged batch; an unknown publication stops the writer without retrying.
+Recovery reads the linked conclusions without replaying intents or rerunning the rules.
+`State::transact` is the same rules applied serially in Rust, which the tests use as the reference.
 
 On Unix, `interactive::ledger::FileStore::open(path)` provides the same blob and root operations on a local filesystem.
 The store keeps immutable content-addressed files in `blobs/`, versioned roots in `roots/`, and persistent root lock files in `locks/`.
@@ -184,7 +179,7 @@ Root reads and compare-and-swap operations share a per-root file lock, so reader
 An uncertain publication returns `StoreError::CommitUnknown`; callers must inspect committed state rather than assume the operation failed.
 The on-disk formats are internal to this prototype.
 
-`cargo test -p interactive --test ledger_file --test ledger_model` checks fresh-process recovery, process exclusion, DDIR replay, and agreement with the `.ddp` rules using both backings.
+`cargo test -p interactive --test ledger_file --test ledger_model --test ledger_keyed --test ledger_writer` checks fresh-process recovery, process exclusion, DDIR replay, and agreement between the writer, the serial `.ddp` rules and `State::transact`, using both backings.
 
 ## Writes: `feed`
 
@@ -304,4 +299,4 @@ The [LDBC-derived workload](../bench/ldbc/README.md) runs parameterized interact
 queries and maintained BI queries together through this server. It includes a
 tiny correctness fixture and can read an existing SNB CSV snapshot for timing.
 
-For the ledger implementation state, matched reference benchmark, and profiling handoff, see [`bench/ledger`](../bench/ledger/README.md).
+For the ledger work's state, decisions and next steps, see [`LEDGERS.md`](../LEDGERS.md); for the matched benchmark, see [`bench/ledger`](../bench/ledger/README.md).

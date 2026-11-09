@@ -2,10 +2,10 @@
 //!
 //! `MemoryStore` models storage that survives dropping clients, while the process stays alive.
 //! On Unix, `FileStore` makes completed writes durable on a local filesystem.
-//! Native verbs publish snapshots; the resolver can publish linked batches of conclusions.
+//! `Writer` is the one way to change a cohort: the keyed `.ddp` rules resolve each batch, and the root links its conclusions.
+//! `Cohort` reads the committed state; `State::transact` is the serial rules in Rust, the reference the resolver is tested against.
 //! Payload bytes are opaque and writer-validated.
-//! The DDIR source bridge consumes committed snapshots; the keyed `.ddp` resolver can publish conclusions through the same roots.
-//! Compaction, reclamation, and a stable storage format remain future work.
+//! Compaction, reclamation, checkpoints, and a stable storage format remain future work.
 //! Run the backing tests with `cargo test -p interactive --lib ledger::`.
 
 use std::collections::BTreeMap;
@@ -20,7 +20,7 @@ mod file;
 #[cfg(unix)]
 pub use file::FileStore;
 mod resolve;
-pub use resolve::{Resolution, Resolver, Transaction};
+pub use resolve::Transaction;
 mod log;
 mod engine;
 mod writer;
@@ -80,6 +80,26 @@ impl State {
     pub fn write(&self, id: Id) -> Option<&Frontier> {
         let entry = self.registry.get(&id)?;
         Some(self.manifest.iter().rev().find(|span| span.id == id).map_or(&entry.start, |span| &span.upper))
+    }
+
+    /// The serial rules: apply one transaction's groups in order, all or none.
+    /// This is the reference for the `.ddp` rules; it checks no payload storage and publishes nothing.
+    pub fn transact(&mut self, changes: &[(Id, Change)]) -> Result<(), Rejection> {
+        validate(changes)?;
+        // Rejection discards every tentative effect: this transaction's spans and the ledgers it created.
+        let spans = self.manifest.len();
+        let mut created = Vec::new();
+        for (group, (id, change)) in changes.iter().enumerate() {
+            let fresh = !self.registry.contains_key(id);
+            let result = self.apply(*id, change);
+            if fresh && self.registry.contains_key(id) { created.push(*id); }
+            if let Err(reason) = result {
+                self.manifest.truncate(spans);
+                for id in created { self.registry.remove(&id); }
+                return Err(Rejection { group, reason });
+            }
+        }
+        Ok(())
     }
 
     fn apply(&mut self, id: Id, change: &Change) -> Result<(), Failure> {
@@ -234,18 +254,13 @@ impl Store for MemoryStore {
     }
 }
 
-/// Failures outside the verb's `Result<(), Write>` result.
+/// Failures outside a transaction's own `Rejection`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Store(StoreError),
     Invalid(&'static str),
-    UnknownLedger(Id),
     Corrupt(String),
     Resolve(String),
-    /// The operation may have committed; `id` also identifies an uncertain creation.
-    CommitUnknown {
-        id: Id,
-    },
 }
 
 impl From<StoreError> for Error {
@@ -254,7 +269,7 @@ impl From<StoreError> for Error {
     }
 }
 
-/// A client for one cohort; all committed state resides in the store.
+/// A reader of one cohort; all committed state resides in the store.
 pub struct Cohort<'a> {
     store: &'a dyn Store,
     root: &'a str,
@@ -265,93 +280,9 @@ impl<'a> Cohort<'a> {
         Self { store, root }
     }
 
-    fn load(&self) -> Result<(Root, State), Error> {
-        log::load(self.store, self.root)
-    }
-
     /// Recover the current committed snapshot, without replaying proposals.
     pub fn snapshot(&self) -> Result<State, Error> {
-        Ok(self.load()?.1)
-    }
-
-    fn publish(&self, root: Root, state: &State) -> Result<bool, Error> {
-        let bytes = bincode::serialize(state).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let blob = self.store.put(&bytes)?;
-        self.store.cas_root(self.root, root.version, blob).map_err(Error::Store)
-    }
-
-    /// Validate locally, then publish all group effects together.
-    /// Each group changes a distinct ledger; rejection publishes none of its tentative effects.
-    /// A lost CAS retries the entire transaction against a fresh committed snapshot.
-    /// `Error::Store(StoreError::CommitUnknown)` leaves the outcome uncertain and is never retried.
-    /// All candidate creation IDs remain available in the caller's groups.
-    /// An empty sequence succeeds without publishing.
-    pub fn transact(&self, changes: &[(Id, Change)]) -> Result<Result<(), Rejection>, Error> {
-        if let Err(rejection) = validate(changes) {
-            return Ok(Err(rejection));
-        }
-        if changes.is_empty() {
-            return Ok(Ok(()));
-        }
-        loop {
-            let (root, mut state) = self.load()?;
-            for (group, (id, change)) in changes.iter().enumerate() {
-                if let Err(reason) = state.apply(*id, change) {
-                    return Ok(Err(Rejection { group, reason }));
-                }
-                // A referenced payload must already be durable before publishing its span.
-                if let Change::Append { batch: Payload::Blob(blob), .. }
-                | Change::CreateAppend { batch: Payload::Blob(blob), .. } = change
-                {
-                    self.store.get(*blob)?;
-                }
-            }
-            if self.publish(root, &state)? {
-                return Ok(Ok(()));
-            }
-            // Another transaction committed. Recheck all groups, with the same candidate IDs.
-        }
-    }
-
-    fn single(&self, id: Id, change: Change) -> Result<Result<(), Failure>, Error> {
-        self.transact(&[(id, change)]).map(|result| result.map_err(|rejection| rejection.reason)).map_err(|error| {
-            match error {
-                Error::Store(StoreError::CommitUnknown) => Error::CommitUnknown { id },
-                error => error,
-            }
-        })
-    }
-
-    /// Durably add a fresh registry entry, returning only after publication.
-    pub fn create(&self, shape: Shape, start: Frontier) -> Result<Id, Error> {
-        loop {
-            let id = Id::new_v4();
-            match self.single(id, Change::Create { shape: shape.clone(), start: start.clone() })? {
-                Ok(()) => return Ok(id),
-                Err(Failure::Exists(_)) => continue,
-                Err(Failure::Invalid(message)) => return Err(Error::Invalid(message)),
-                Err(_) => unreachable!("create can fail only for an existing id or invalid start"),
-            }
-        }
-    }
-
-    /// Append raw updates, or return the write frontier at the deciding root read.
-    /// The outer result distinguishes storage failures and invalid arguments from rejection.
-    /// Payload shape and update timestamps are the writer's obligation.
-    pub fn append(
-        &self,
-        id: Id,
-        lower: Frontier,
-        upper: Frontier,
-        batch: Payload,
-    ) -> Result<Result<(), Frontier>, Error> {
-        match self.single(id, Change::Append { lower, upper, batch })? {
-            Ok(()) => Ok(Ok(())),
-            Err(Failure::Write(write)) => Ok(Err(write)),
-            Err(Failure::UnknownLedger(id)) => Err(Error::UnknownLedger(id)),
-            Err(Failure::Invalid(message)) => Err(Error::Invalid(message)),
-            Err(Failure::Exists(_)) => unreachable!("append cannot create a ledger"),
-        }
+        Ok(log::load(self.store, self.root)?.1)
     }
 }
 

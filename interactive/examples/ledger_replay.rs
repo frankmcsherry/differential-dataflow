@@ -1,19 +1,17 @@
 //! Replay an exact request fixture through the public Writer.
 //! Usage: cargo run --release -p interactive --example ledger_replay -- INPUT memory|file:DIR serial|pipeline [WORKERS=4] [WARMUP=5]
-//! Requests, reference outcomes, checkpoint seeding, startup, and final verification are outside timing.
+//! Requests, reference outcomes, seeding the registrations, startup, and final verification are outside timing.
 //! Timed submissions include production validation, encoding, resolution, publication, and outcomes.
 //! DDIRMAT1 fixtures contain six little-endian u64 header fields: ledgers, epochs, requests per epoch, seed, records, and commits.
 //! Each record has five little-endian i64 fields: epoch, transaction key, ledger index, lower, and upper.
 //! DDIR_SAMPLE_GATE=PATH writes the PID to PATH.with_extension("ready") after warmup, then waits for PATH.with_extension("go").
 //! CPU totals cover measured batches; unavailable clocks report zero.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use interactive::ledger::{
-    Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Registration, Shape, State, Store, Time, Transaction,
-    Writer,
+    Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Shape, Store, Time, Transaction, Writer,
 };
 
 #[global_allocator]
@@ -162,21 +160,17 @@ fn main() -> Result<(), String> {
     }
     let shape = Shape { columns: corgi::Shape::Int, time_width: 1 };
     let origin = at(0);
-    let checkpoint = State {
-        registry: (0..input.ids)
-            .map(|number| {
-                (Id::from_u128(number as u128 + 1), Registration { shape: shape.clone(), start: origin.clone() })
-            })
-            .collect::<BTreeMap<_, _>>(),
-        manifest: Vec::new(),
-    };
-    let bytes = bincode::serialize(&checkpoint).map_err(|error| error.to_string())?;
-    let hash = store.put(&bytes).map_err(|error| format!("{error:?}"))?;
-    if !store.cas_root("replay", 0, hash).map_err(|error| format!("{error:?}"))? {
-        return Err("seed CAS lost".into());
+    // Register every ledger through the writer, in batches of the measured size, before the clock starts.
+    let mut writer = Writer::open(Arc::clone(&store), "replay", workers).map_err(|error| format!("{error:?}"))?;
+    for chunk in (0..input.ids).collect::<Vec<_>>().chunks(input.appends) {
+        let creations = chunk.iter()
+            .map(|number| (*number as i64, vec![(Id::from_u128(*number as u128 + 1), Change::Create { shape: shape.clone(), start: origin.clone() })]))
+            .collect::<Vec<Transaction>>();
+        let outcomes = writer.transact_batch(&creations).map_err(|error| format!("{error:?}"))?;
+        if outcomes.values().any(Result::is_err) { return Err("seed creation rejected".into()); }
     }
-    drop(bytes);
-    drop(checkpoint);
+    // Reopen, so the measured writer starts from recovery, with its resident index loaded at once.
+    drop(writer);
     let mut writer = Writer::open(Arc::clone(&store), "replay", workers).map_err(|error| format!("{error:?}"))?;
     let setup = prepared.elapsed();
     let mut outcomes = Vec::with_capacity(batches.len());

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use corgi::Shape;
-use interactive::ledger::{Cohort, Frontier, MemoryStore, Payload, Shape as LedgerShape, Store, Time};
+use interactive::ledger::{Change, Cohort, Frontier, Id, MemoryStore, Payload, Shape as LedgerShape, Store, Time, Writer};
 use interactive::runtime::container::Updates;
 use interactive::runtime::feed::FeedDecoder;
 use interactive::server::{encode_ledger_batch, HostTime, LedgerSnapshot, Server};
@@ -30,25 +30,47 @@ fn rows(text: &str) -> Updates {
     decoder.finish()
 }
 
+/// Creates and appends through a writer, one committed transaction at a time.
+struct Ledgers { writer: Writer, next: u128 }
+
+impl Ledgers {
+    fn open(store: &Arc<MemoryStore>) -> Self {
+        Self { writer: Writer::open(store.clone(), "test", 1).unwrap(), next: 1 }
+    }
+    fn commit(&mut self, id: Id, change: Change) {
+        let outcomes = self.writer.transact_batch(&[(0, vec![(id, change)])]).unwrap();
+        assert_eq!(outcomes[&0], Ok(()));
+    }
+    fn create(&mut self, shape: LedgerShape, start: Frontier) -> Id {
+        let id = Id::from_u128(self.next);
+        self.next += 1;
+        self.commit(id, Change::Create { shape, start });
+        id
+    }
+    fn append(&mut self, id: Id, lower: Frontier, upper: Frontier, batch: Payload) {
+        self.commit(id, Change::Append { lower, upper, batch });
+    }
+}
+
 fn cuts() -> (Arc<MemoryStore>, interactive::ledger::Id, Vec<LedgerSnapshot>) {
     let store = Arc::new(MemoryStore::default());
-    let cohort = Cohort::new(store.as_ref(), "test");
+    let mut ledgers = Ledgers::open(&store);
     let start = frontier(&[&[0, 0]]);
     let middle = frontier(&[&[0, 1], &[1, 0]]);
     let later = frontier(&[&[1, 1]]);
     let last = frontier(&[&[2, 2]]);
-    let id = cohort.create(shape(2), start.clone()).unwrap();
+    let id = ledgers.create(shape(2), start.clone());
     let mut cuts = vec![LedgerSnapshot::capture(store.as_ref(), "test", id).unwrap()];
     let bytes = encode_ledger_batch(&rows("1"), &[vec![0], vec![0]]).unwrap();
     let hash = store.put(&bytes).unwrap();
-    assert_eq!(cohort.append(id, start, middle.clone(), Payload::Blob(hash)), Ok(Ok(())));
+    ledgers.append(id, start, middle.clone(), Payload::Blob(hash));
     cuts.push(LedgerSnapshot::capture(store.as_ref(), "test", id).unwrap());
-    assert_eq!(cohort.append(id, middle, later.clone(), Payload::Empty), Ok(Ok(())));
+    ledgers.append(id, middle, later.clone(), Payload::Empty);
     cuts.push(LedgerSnapshot::capture(store.as_ref(), "test", id).unwrap());
     let bytes = encode_ledger_batch(&rows("2\n1 diff=-1"), &[vec![1, 1], vec![1, 2]]).unwrap();
-    assert_eq!(cohort.append(id, later, last.clone(), Payload::Inline(bytes)), Ok(Ok(())));
+    ledgers.append(id, later, last.clone(), Payload::Inline(bytes));
     cuts.push(LedgerSnapshot::capture(store.as_ref(), "test", id).unwrap());
-    assert_eq!(cohort.append(id, last, Frontier::new(), Payload::Empty), Ok(Ok(())));
+    ledgers.append(id, last, Frontier::new(), Payload::Empty);
     cuts.push(LedgerSnapshot::capture(store.as_ref(), "test", id).unwrap());
     (store, id, cuts)
 }
@@ -119,29 +141,29 @@ fn committed_product_updates_and_empty_span_progress_reach_computations() {
 
 #[test]
 fn invalid_payloads_and_signed_times_are_refused_before_source_installation() {
-    let store = MemoryStore::default();
-    let cohort = Cohort::new(&store, "test");
-    let negative = cohort.create(shape(2), frontier(&[&[-1, 0]])).unwrap();
-    assert!(LedgerSnapshot::capture(&store, "test", negative).is_err());
-    let id = cohort.create(shape(2), frontier(&[&[0, 0]])).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let mut ledgers = Ledgers::open(&store);
+    let negative = ledgers.create(shape(2), frontier(&[&[-1, 0]]));
+    assert!(LedgerSnapshot::capture(store.as_ref(), "test", negative).is_err());
+    let id = ledgers.create(shape(2), frontier(&[&[0, 0]]));
     let invalid = encode_ledger_batch(&rows("1"), &[vec![2], vec![2]]).unwrap();
-    assert_eq!(cohort.append(id, frontier(&[&[0, 0]]), frontier(&[&[1, 1]]), Payload::Inline(invalid)), Ok(Ok(())));
-    assert!(LedgerSnapshot::capture(&store, "test", id).is_err(), "raw update outside its span");
+    ledgers.append(id, frontier(&[&[0, 0]]), frontier(&[&[1, 1]]), Payload::Inline(invalid));
+    assert!(LedgerSnapshot::capture(store.as_ref(), "test", id).is_err(), "raw update outside its span");
 
-    let wrong_width = cohort.create(shape(2), frontier(&[&[0, 0]])).unwrap();
+    let wrong_width = ledgers.create(shape(2), frontier(&[&[0, 0]]));
     let bytes = encode_ledger_batch(&rows("1"), &[vec![0]]).unwrap();
-    assert_eq!(cohort.append(wrong_width, frontier(&[&[0, 0]]), frontier(&[&[1, 1]]), Payload::Inline(bytes)), Ok(Ok(())));
-    assert!(LedgerSnapshot::capture(&store, "test", wrong_width).is_err());
+    ledgers.append(wrong_width, frontier(&[&[0, 0]]), frontier(&[&[1, 1]]), Payload::Inline(bytes));
+    assert!(LedgerSnapshot::capture(store.as_ref(), "test", wrong_width).is_err());
 }
 
 #[test]
 fn nonzero_start_bounds_reads_and_imports() {
-    let store = MemoryStore::default();
-    let cohort = Cohort::new(&store, "test");
-    let id = cohort.create(shape(2), frontier(&[&[2, 3]])).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let mut ledgers = Ledgers::open(&store);
+    let id = ledgers.create(shape(2), frontier(&[&[2, 3]]));
     let bytes = encode_ledger_batch(&rows("9"), &[vec![2], vec![3]]).unwrap();
-    assert_eq!(cohort.append(id, frontier(&[&[2, 3]]), frontier(&[&[3, 4]]), Payload::Inline(bytes)), Ok(Ok(())));
-    let cut = LedgerSnapshot::capture(&store, "test", id).unwrap();
+    ledgers.append(id, frontier(&[&[2, 3]]), frontier(&[&[3, 4]]), Payload::Inline(bytes));
+    let cut = LedgerSnapshot::capture(store.as_ref(), "test", id).unwrap();
     timely::execute_directly(move |worker| {
         let mut server = Server::new();
         server.publish_ledger(worker, "ledger_input", &cut).unwrap();

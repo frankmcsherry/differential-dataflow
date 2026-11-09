@@ -1,10 +1,10 @@
-//! Compare the Rust backing and the .ddp transaction rules on the same histories.
+//! Compare the serial rules in Rust, the serial `.ddp` rules, and the resident writer on the same histories.
 //! UUIDs use their canonical 16 bytes, and shapes are serialized as opaque bytes for .ddp.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use interactive::ledger::{validate, Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Resolver, Shape, State, Store, Time, Writer};
+use interactive::ledger::{validate, Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Shape, State, Store, Time, Writer};
 use interactive::runtime::container::Updates;
 
 type Row = (String, String, i64);
@@ -126,49 +126,38 @@ fn populated(number: i64, start: Frontier, upper: Frontier, batch: Payload) -> (
 
 /// Each round resolves concurrent transactions in key order; changes are grouped by strictly increasing ledger ID.
 fn check(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]]) {
-    check_store(rounds, workers, payloads, &MemoryStore::default());
+    check_store(rounds, workers, payloads, Arc::new(MemoryStore::default()));
     #[cfg(unix)]
     {
         let directory = std::env::temp_dir().join(format!("ddir-ledger-model-{}", Id::new_v4()));
         {
-            let store = interactive::ledger::FileStore::open(&directory).unwrap();
-            check_store(rounds, workers, payloads, &store);
+            let store = Arc::new(interactive::ledger::FileStore::open(&directory).unwrap());
+            check_store(rounds, workers, payloads, store);
         }
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
-fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], store: &dyn Store) {
+fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], store: Arc<dyn Store>) {
     for payload in payloads { store.put(payload).unwrap(); }
-    let cohort = Cohort::new(store, "comparison");
-    let publisher = Cohort::new(store, "resolved");
-    let resolver = Resolver::new(workers).unwrap();
-    let resident_store = Arc::new(MemoryStore::default());
-    for payload in payloads { resident_store.put(payload).unwrap(); }
-    let mut resident = Writer::open(resident_store.clone(), "resident", workers).unwrap();
+    let mut oracle = State::default();
+    let mut resident = Writer::open(store.clone(), "resident", workers).unwrap();
     for txns in rounds {
-        let before = cohort.snapshot().unwrap();
+        let before = oracle.clone();
         let mut ordered = txns.to_vec();
         ordered.sort_by_key(|(txn, _)| *txn);
-        let results = ordered.iter().map(|(txn, commands)| {
-            print_result(*txn, cohort.transact(commands).expect("fixture storage succeeds"))
-        }).collect::<Vec<_>>();
+        let results = ordered.iter().map(|(txn, commands)| print_result(*txn, oracle.transact(commands))).collect::<Vec<_>>();
         let invalid_transactions = ordered.iter().filter_map(|(txn, changes)| {
             validate(changes).err().map(|rejection| row(*txn, rejection.group.to_string()))
         }).collect::<Vec<_>>();
-        let after = cohort.snapshot().unwrap();
-        let outcomes = publisher.transact_batch(&resolver, txns).unwrap();
-        let mut published_results = outcomes.into_iter().map(|(txn, outcome)| print_result(txn, outcome)).collect::<Vec<_>>();
+        let after = oracle.clone();
         let mut reference_results = results.clone();
-        published_results.sort();
         reference_results.sort();
-        assert_eq!(published_results, reference_results, "published transaction outcomes");
-        assert_eq!(publisher.snapshot().unwrap(), after, "published cohort state");
         let mut resident_results = resident.transact_batch(txns).unwrap().into_iter()
             .map(|(txn, outcome)| print_result(txn, outcome)).collect::<Vec<_>>();
         resident_results.sort();
         assert_eq!(resident_results, reference_results, "resident transaction outcomes");
-        assert_eq!(Cohort::new(resident_store.as_ref(), "resident").snapshot().unwrap(), after, "resident cohort state");
+        assert_eq!(Cohort::new(store.as_ref(), "resident").snapshot().unwrap(), after, "resident cohort state");
         let actual = evaluate(&before, txns, workers);
         let registry_add = State {
             registry: after.registry.iter().filter(|(id, _)| !before.registry.contains_key(*id))

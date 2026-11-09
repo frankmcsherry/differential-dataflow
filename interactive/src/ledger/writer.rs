@@ -8,7 +8,8 @@ use std::thread::JoinHandle;
 use super::engine::Engine;
 use super::log::{self, Delta};
 use super::resolve;
-use super::{Change, Error, Id, Payload, Rejection, Resolver, Root, State, Store, StoreError, Transaction};
+use super::{Change, Error, Id, Payload, Rejection, Root, State, Store, StoreError, Transaction};
+use super::resolve::Resolver;
 use crate::runtime::container::Updates;
 
 type Outcomes = BTreeMap<i64, Result<(), Rejection>>;
@@ -77,7 +78,7 @@ impl Writer {
         }
         if let Some(error) = &self.failure { return Err(error.clone()); }
         self.poll()?;
-        let required = resolve::maximum_width(&[], transactions);
+        let required = resolve::maximum_width(transactions);
         if required > self.width {
             self.flush()?;
             self.reload(required)?;
@@ -205,7 +206,7 @@ impl Writer {
         let mut results = resolve::output(&outputs, "aborted")?.clone();
         results.keys = resolve::wide(results.keys)?;
         results.vals = resolve::wide(results.vals)?;
-        let outcomes = resolve::outcomes(&results, &transactions, true)?;
+        let outcomes = resolve::outcomes(&results, &transactions)?;
         let delta = Delta { registry: resolve::output(&outputs, "registry_add")?.clone(),
             manifest: resolve::output(&outputs, "manifest_ordered")?.clone() };
         let mut ordered = transactions.iter().collect::<Vec<_>>();

@@ -1,4 +1,4 @@
-//! Immutable conclusion records linked from a cohort root, with legacy snapshots as checkpoints.
+//! Immutable conclusion records linked from a cohort root; the first record has no predecessor.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,28 +67,26 @@ pub(super) fn load(store: &dyn Store, name: &str) -> Result<(Root, State), Error
     let mut cursor = root.state;
     let mut seen = BTreeSet::new();
     let mut records = Vec::new();
-    let mut state = State::default();
     while let Some(hash) = cursor {
         if !seen.insert(hash) {
             return Err(corrupt("repeated predecessor"));
         }
         let bytes = store.get(hash)?;
-        if bytes.starts_with(PREFIX) {
-            if !bytes.starts_with(MAGIC) {
-                return Err(corrupt("unsupported record version"));
-            }
-            let record: Log = decode(&bytes[MAGIC.len()..])?;
-            cursor = record.previous;
-            records.push(record);
-            if records.len() as u64 > root.version {
-                return Err(corrupt("more records than root versions"));
-            }
-        } else {
-            state = decode(&bytes)?;
-            break;
+        if !bytes.starts_with(PREFIX) {
+            return Err(corrupt("not a conclusion record"));
+        }
+        if !bytes.starts_with(MAGIC) {
+            return Err(corrupt("unsupported record version"));
+        }
+        let record: Log = decode(&bytes[MAGIC.len()..])?;
+        cursor = record.previous;
+        records.push(record);
+        if records.len() as u64 > root.version {
+            return Err(corrupt("more records than root versions"));
         }
     }
-    let mut writes = current(&mut state)?;
+    let mut state = State::default();
+    let mut writes = BTreeMap::new();
     for record in records.into_iter().rev() {
         for delta in record.deltas {
             apply_with_writes(&mut state, &mut writes, &delta)?;
@@ -100,7 +98,7 @@ pub(super) fn load(store: &dyn Store, name: &str) -> Result<(Root, State), Error
 /// Apply one conclusion batch; invalid batches leave the supplied state unchanged.
 #[cfg(test)]
 pub(super) fn apply(state: &mut State, delta: &Delta) -> Result<(), Error> {
-    let mut writes = current(state)?;
+    let mut writes = writes(state);
     apply_with_writes(state, &mut writes, delta)
 }
 
@@ -164,21 +162,12 @@ fn rows(updates: &Updates) -> Result<Updates, Error> {
     Ok(Updates { keys: wide(updates.keys.clone())?, vals: wide(updates.vals.clone())?, diffs: updates.diffs.clone() })
 }
 
-/// Validate a legacy checkpoint once and derive its current write frontiers.
-fn current(state: &mut State) -> Result<BTreeMap<Id, Frontier>, Error> {
-    let mut writes = BTreeMap::new();
-    for (id, entry) in &mut state.registry {
-        entry.start = canonical(&entry.start, entry.shape.time_width).map_err(corrupt)?;
-        writes.insert(*id, entry.start.clone());
-    }
-    for span in &mut state.manifest {
-        let entry = state.registry.get(&span.id).ok_or_else(|| corrupt("checkpoint span has no registration"))?;
-        span.lower = canonical(&span.lower, entry.shape.time_width).map_err(corrupt)?;
-        span.upper = canonical(&span.upper, entry.shape.time_width).map_err(corrupt)?;
-        span.since = canonical(&span.since, entry.shape.time_width).map_err(corrupt)?;
-        advance(&mut writes, entry, span)?;
-    }
-    Ok(writes)
+/// The write frontier of every registered ledger, from its start and its chain of spans.
+#[cfg(test)]
+fn writes(state: &State) -> BTreeMap<Id, Frontier> {
+    let mut writes = state.registry.iter().map(|(id, entry)| (*id, entry.start.clone())).collect::<BTreeMap<_, _>>();
+    for span in &state.manifest { writes.insert(span.id, span.upper.clone()); }
+    writes
 }
 
 fn advance(writes: &mut BTreeMap<Id, Frontier>, entry: &Registration, span: &Span) -> Result<(), Error> {
@@ -206,7 +195,7 @@ fn corrupt(message: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Change, Cohort, MemoryStore, Payload, Time};
+    use super::super::{MemoryStore, Time};
     use super::*;
     use corgi::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -295,17 +284,9 @@ mod tests {
     }
 
     #[test]
-    fn linked_conclusions_replay_in_batch_and_span_order_with_legacy_checkpoints() {
+    fn linked_conclusions_replay_in_batch_and_span_order() {
         let store = CountingStore::default();
-        let cohort = Cohort::new(&store, "root");
-        assert_eq!(
-            cohort.transact(&[(
-                id(),
-                Change::CreateAppend { shape: shape(), start: at(0), upper: at(1), batch: Payload::Empty }
-            )]),
-            Ok(Ok(()))
-        );
-        let root = store.read_root("root").unwrap();
+        let root = publish(&store, "root", Root::default(), &[delta(true, &[(1, 0, 0, 1)])]).unwrap().unwrap();
         let root = publish(&store, "root", root, &[delta(false, &[(30, 0, 2, 3), (20, 0, 1, 2)])]).unwrap().unwrap();
         let root = publish(&store, "root", root, &[delta(false, &[(99, 0, 3, 4)]), delta(false, &[(-1, 0, 4, 5)])])
             .unwrap()
@@ -318,11 +299,14 @@ mod tests {
             state.manifest.iter().map(|span| span.upper.clone()).collect::<Vec<_>>(),
             vec![at(1), at(2), at(3), at(4), at(5)]
         );
-        // A native snapshot replaces the linked head and checkpoints its whole committed history.
-        assert_eq!(cohort.append(id(), at(5), at(6), Payload::Empty), Ok(Ok(())));
-        store.gets.store(0, Ordering::SeqCst);
-        assert_eq!(load(&store, "root").unwrap().1.write(id()), Some(&at(6)));
-        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_root_naming_anything_but_a_conclusion_record_is_corrupt() {
+        let store = MemoryStore::default();
+        let hash = store.put(&bincode::serialize(&State::default()).unwrap()).unwrap();
+        assert!(store.cas_root("root", 0, hash).unwrap());
+        assert!(matches!(load(&store, "root"), Err(Error::Corrupt(_))));
     }
 
     #[test]

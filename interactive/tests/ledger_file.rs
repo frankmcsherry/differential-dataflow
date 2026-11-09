@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 
-use interactive::ledger::{Change, Cohort, FileStore, Frontier, Id, Payload, Shape, Store, Time};
+use interactive::ledger::{Change, Cohort, FileStore, Frontier, Id, Payload, Shape, Store, Time, Writer};
 use interactive::runtime::feed::FeedDecoder;
 use interactive::server::{encode_ledger_batch, HostTime, LedgerSnapshot, Server};
 
@@ -81,155 +81,6 @@ fn run(test: &str, path: &Path, role: &str) {
     );
 }
 
-#[test]
-fn committed_cohort_recovers_after_process_exit() {
-    if let Some(path) = std::env::var_os(DIRECTORY) {
-        let store = FileStore::open(path).unwrap();
-        let cohort = Cohort::new(&store, "cohort");
-        let middle = frontier(&[&[0, 1], &[1, 0]]);
-        match std::env::var(ROLE).unwrap().as_str() {
-            "seed" => {
-                let blob = store.put(&payload("1", &[vec![0], vec![0]])).unwrap();
-                assert_eq!(
-                    cohort.transact(&[
-                        (
-                            id(1),
-                            Change::CreateAppend {
-                                shape: shape(),
-                                start: at(0, 0),
-                                upper: middle,
-                                batch: Payload::Blob(blob)
-                            }
-                        ),
-                        (
-                            id(2),
-                            Change::Create {
-                                shape: shape(),
-                                start: at(4, 5)
-                            }
-                        ),
-                    ]),
-                    Ok(Ok(()))
-                );
-                // A valid proposal blob is not committed merely because it is durable.
-                let mut proposal = cohort.snapshot().unwrap();
-                proposal.registry.remove(&id(2));
-                store.put(&bincode::serialize(&proposal).unwrap()).unwrap();
-            }
-            "resume" => {
-                let before = cohort.snapshot().unwrap();
-                assert_eq!(before.registry.len(), 2);
-                assert_eq!(before.manifest.len(), 1);
-                assert_eq!(before.write(id(1)), Some(&middle));
-                assert_eq!(
-                    cohort.append(id(1), at(0, 0), at(1, 1), Payload::Empty),
-                    Ok(Err(middle.clone()))
-                );
-                assert_eq!(
-                    cohort.append(id(1), middle, at(1, 1), Payload::Empty),
-                    Ok(Ok(()))
-                );
-                let data = payload("2\n1 diff=-1", &[vec![1, 1], vec![1, 2]]);
-                assert_eq!(
-                    cohort.append(id(1), at(1, 1), at(2, 2), Payload::Inline(data)),
-                    Ok(Ok(()))
-                );
-                assert_eq!(
-                    cohort.append(id(1), at(2, 2), Frontier::new(), Payload::Empty),
-                    Ok(Ok(()))
-                );
-                let root = store.read_root("cohort").unwrap();
-                assert!(cohort
-                    .transact(&[
-                        (
-                            id(0),
-                            Change::Create {
-                                shape: shape(),
-                                start: at(0, 0)
-                            }
-                        ),
-                        (
-                            id(1),
-                            Change::Append {
-                                lower: at(0, 0),
-                                upper: at(3, 3),
-                                batch: Payload::Empty
-                            }
-                        ),
-                    ])
-                    .unwrap()
-                    .is_err());
-                assert_eq!(store.read_root("cohort").unwrap(), root);
-                assert!(!cohort.snapshot().unwrap().registry.contains_key(&id(0)));
-            }
-            "read" => {
-                let state = cohort.snapshot().unwrap();
-                assert_eq!(state.registry.len(), 2);
-                assert_eq!(state.manifest.len(), 4);
-                assert_eq!(state.write(id(1)), Some(&Frontier::new()));
-                assert_eq!(state.write(id(2)), Some(&at(4, 5)));
-                assert_eq!(store.read_root("cohort").unwrap().version, 4);
-                let cut = Arc::new(LedgerSnapshot::capture(&store, "cohort", id(1)).unwrap());
-                let guards = timely::execute(timely::Config::process(2), move |worker| {
-                    let mut server = Server::new();
-                    server.publish_ledger(worker, "saved", &cut).unwrap();
-                    let program = interactive::lower::lower_tree(interactive::parse::pipe::parse(
-                        "output \"rows\" = import \"saved\" : ((int), ());",
-                    ));
-                    server
-                        .install_with_root(worker, "reader", &program, 2, HostTime::default())
-                        .unwrap();
-                    let at = |x, y| HostTime::new([x, y].into());
-                    let before = server
-                        .snapshot_as_of(worker, "reader::rows", &at(1, 1))
-                        .unwrap()
-                        .rows();
-                    let after = server
-                        .snapshot_as_of(worker, "reader::rows", &at(1, 2))
-                        .unwrap()
-                        .rows();
-                    (before, after)
-                })
-                .unwrap();
-                for (worker, result) in guards.join().into_iter().enumerate() {
-                    let (before, after) = result.unwrap();
-                    if worker == 0 {
-                        assert_eq!(
-                            before,
-                            vec![
-                                ("tuple(1)".into(), "tuple()".into(), 1),
-                                ("tuple(2)".into(), "tuple()".into(), 1)
-                            ]
-                        );
-                        assert_eq!(after, vec![("tuple(2)".into(), "tuple()".into(), 1)]);
-                    } else {
-                        assert!(before.is_empty() && after.is_empty());
-                    }
-                }
-            }
-            role => panic!("unknown role {role}"),
-        }
-        // Skip destructors: acknowledged state must already be on disk.
-        std::process::exit(0);
-    }
-    let directory = Directory::new();
-    run(
-        "committed_cohort_recovers_after_process_exit",
-        &directory.0,
-        "seed",
-    );
-    run(
-        "committed_cohort_recovers_after_process_exit",
-        &directory.0,
-        "resume",
-    );
-    run(
-        "committed_cohort_recovers_after_process_exit",
-        &directory.0,
-        "read",
-    );
-}
-
 fn ready(child: &mut Child) {
     let mut output = BufReader::new(child.stdout.as_mut().unwrap());
     loop {
@@ -299,18 +150,18 @@ fn root_names_differing_by_case_are_distinct() {
 
 #[test]
 fn resolved_cohort_recovers_without_reresolving_intents() {
-    use interactive::ledger::{Failure, Rejection, Resolver};
+    use interactive::ledger::{Failure, Rejection};
 
     if let Some(path) = std::env::var_os(DIRECTORY) {
-        let store = FileStore::open(path).unwrap();
-        let cohort = Cohort::new(&store, "resolved");
+        let store = Arc::new(FileStore::open(path).unwrap());
+        let cohort = Cohort::new(store.as_ref(), "resolved");
         let middle = frontier(&[&[0, 1], &[1, 0]]);
         match std::env::var(ROLE).unwrap().as_str() {
             "seed" => {
                 let blob = store.put(&payload("1", &[vec![0], vec![0]])).unwrap();
-                let outcomes = cohort
+                let outcomes = Writer::open(store.clone(), "resolved", 2)
+                    .unwrap()
                     .transact_batch(
-                        &Resolver::new(2).unwrap(),
                         &[
                             (
                                 10,
@@ -360,14 +211,14 @@ fn resolved_cohort_recovers_without_reresolving_intents() {
                 assert_eq!(store.read_root("resolved").unwrap().version, 1);
             }
             "read" => {
-                // Recovery consumes committed state and payloads, without constructing a resolver.
+                // Recovery consumes committed state and payloads, without constructing a writer.
                 let state = cohort.snapshot().unwrap();
                 assert_eq!(state.registry.len(), 1);
                 assert!(!state.registry.contains_key(&id(0)));
                 assert_eq!(state.manifest.len(), 3);
                 assert_eq!(state.write(id(1)), Some(&Frontier::new()));
                 assert_eq!(store.read_root("resolved").unwrap().version, 1);
-                let cut = LedgerSnapshot::capture(&store, "resolved", id(1)).unwrap();
+                let cut = LedgerSnapshot::capture(store.as_ref(), "resolved", id(1)).unwrap();
                 let (before, after) = timely::execute_directly(move |worker| {
                     let mut server = Server::new();
                     server.publish_ledger(worker, "saved", &cut).unwrap();

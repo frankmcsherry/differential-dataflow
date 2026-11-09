@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
 
-use super::{Error, Resolver};
+use super::Error;
+use super::resolve::Resolver;
 use crate::runtime::container::Updates;
 
 type Outputs = BTreeMap<String, Updates>;
@@ -32,8 +33,6 @@ impl Engine {
             receivers.push(Mutex::new(receiver));
         }
         let mut program = resolver.program.clone();
-        program.root.exports.retain(|output| matches!(output.name.as_str(), "aborted" | "registry_add" | "manifest_ordered" | "initial_delta" | "registered_delta"));
-        crate::passes::optimize(&mut program);
         for import in &mut program.root.imports {
             if matches!(import.from, crate::scope_ir::Source::Input(0)) {
                 import.from = crate::scope_ir::Source::Trace(crate::server::output_name("catalog", "current"));

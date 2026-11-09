@@ -1,8 +1,9 @@
-//! Compare the production resolver with ordered native transactions on the same snapshot.
+//! Compare the resident writer with the serial rules in `State::transact`, from the same seeded cohort.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use interactive::ledger::{Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Resolver, Shape, Time, Transaction};
+use interactive::ledger::{Change, Cohort, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Shape, State, Time, Transaction, Writer};
 
 fn id(value: u128) -> Id { Id::from_u128(value) }
 fn at(value: i64) -> Frontier { frontier(&[&[value, value]]) }
@@ -15,27 +16,30 @@ fn append(id: Id, lower: Frontier, upper: Frontier) -> (Id, Change) {
     (id, Change::Append { lower, upper, batch: Payload::Empty })
 }
 
-fn compare(resolver: &Resolver, seed: &[(Id, Change)], transactions: &[Transaction]) -> BTreeMap<i64, Result<(), Rejection>> {
-    let store = MemoryStore::default();
-    let cohort = Cohort::new(&store, "oracle");
-    assert_eq!(cohort.transact(seed).unwrap(), Ok(()));
-    let before = cohort.snapshot().unwrap();
+fn compare(workers: usize, seed: &[(Id, Change)], transactions: &[Transaction]) -> BTreeMap<i64, Result<(), Rejection>> {
+    let store = Arc::new(MemoryStore::default());
+    let mut writer = Writer::open(store.clone(), "cohort", workers).unwrap();
+    let mut oracle = State::default();
+    if !seed.is_empty() {
+        assert_eq!(oracle.transact(seed), Ok(()));
+        assert_eq!(writer.transact_batch(&[(0, seed.to_vec())]).unwrap(), BTreeMap::from([(0, Ok(()))]));
+    }
     let mut ordered = transactions.to_vec();
     ordered.sort_by_key(|(key, _)| *key);
-    let expected = ordered.iter().map(|(key, groups)| (*key, cohort.transact(groups).unwrap()))
+    let expected = ordered.iter().map(|(key, groups)| (*key, oracle.transact(groups)))
         .collect::<BTreeMap<_, _>>();
-    let actual = resolver.resolve(&before, transactions).unwrap();
-    assert_eq!(actual.outcomes.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>());
+    let actual = writer.transact_batch(transactions).unwrap();
+    assert_eq!(actual.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>());
     for (key, expected) in &expected {
         // Invalid's text describes the implementation's diagnostic, not its logical result.
-        match (&actual.outcomes[key], expected) {
+        match (&actual[key], expected) {
             (Err(Rejection { group: a, reason: Failure::Invalid(_) }),
              Err(Rejection { group: b, reason: Failure::Invalid(_) })) => assert_eq!(a, b),
             (actual, expected) => assert_eq!(actual, expected, "transaction {key}, batch {transactions:?}"),
         }
     }
-    assert_eq!(actual.state, cohort.snapshot().unwrap(), "batch {transactions:?}");
-    actual.outcomes
+    assert_eq!(Cohort::new(store.as_ref(), "cohort").snapshot().unwrap(), oracle, "batch {transactions:?}");
+    actual
 }
 
 #[test]
@@ -54,7 +58,7 @@ fn cascading_rollbacks_reinstate_later_transactions() {
     ];
     transactions.reverse();
     for workers in [1, 2] {
-        let outcomes = compare(&Resolver::new(workers).unwrap(), &seed, &transactions);
+        let outcomes = compare(workers, &seed, &transactions);
         assert_eq!(outcomes.iter().map(|(key, result)| (*key, result.is_ok())).collect::<Vec<_>>(),
                    vec![(10, false), (20, true), (30, false), (40, true), (50, true), (60, true)]);
     }
@@ -82,7 +86,7 @@ fn concurrent_creations_and_extreme_transaction_keys() {
         (2, vec![]),
     ];
     for workers in [1, 2] {
-        let outcomes = compare(&Resolver::new(workers).unwrap(), &[], &transactions);
+        let outcomes = compare(workers, &[], &transactions);
         assert!(matches!(&outcomes[&(i64::MIN + 1)], Err(Rejection { group: 0, reason: Failure::Exists(found) }) if *found == a));
         assert!(matches!(&outcomes[&1], Err(Rejection { group: 0, reason: Failure::Exists(found) }) if *found == b));
         assert!(matches!(&outcomes[&-3], Err(Rejection { group: 0, reason: Failure::UnknownLedger(found) }) if *found == unknown));
@@ -105,7 +109,7 @@ fn rolled_back_creation_does_not_supply_since() {
     ];
     for workers in [1, 2] {
         // Comparing complete states checks that the committed span's since is 10, not 5.
-        let outcomes = compare(&Resolver::new(workers).unwrap(), &[], &transactions);
+        let outcomes = compare(workers, &[], &transactions);
         assert!(matches!(&outcomes[&10], Err(Rejection { group: 1, reason: Failure::UnknownLedger(found) }) if *found == b));
         assert!(outcomes[&20].is_ok());
         assert!(outcomes[&30].is_ok());
@@ -126,8 +130,7 @@ fn structural_validation_precedes_first_state_failure() {
         (7, vec![append(a, at(0), at(1))]),
     ];
     for workers in [1, 2] {
-        let resolver = Resolver::new(workers).unwrap();
-        let outcomes = compare(&resolver, &[create(a)], &transactions);
+        let outcomes = compare(workers, &[create(a)], &transactions);
         for key in [0, 1, 2] {
             assert!(matches!(&outcomes[&key], Err(Rejection { group: 1, reason: Failure::Invalid(_) })));
         }
@@ -136,7 +139,7 @@ fn structural_validation_precedes_first_state_failure() {
         assert!(matches!(&outcomes[&5], Err(Rejection { group: 0, reason: Failure::Write(write) }) if *write == at(0)));
         assert!(matches!(&outcomes[&6], Err(Rejection { group: 1, reason: Failure::UnknownLedger(found) }) if *found == b));
         assert!(outcomes[&7].is_ok());
-        compare(&resolver, &[], &[
+        compare(workers, &[], &[
             (i64::MIN, vec![]),
             (-1, vec![create(c), create(c)]),
             (i64::MAX, vec![]),
@@ -159,7 +162,7 @@ fn product_antichains_and_sealing_agree() {
         (4, vec![append(a, end, frontier(&[&[2, 2, 2]]))]),
     ];
     for workers in [1, 2] {
-        let outcomes = compare(&Resolver::new(workers).unwrap(), &seed, &transactions);
+        let outcomes = compare(workers, &seed, &transactions);
         assert!(matches!(&outcomes[&1], Err(Rejection { group: 0, reason: Failure::Invalid(_) })));
         assert!(matches!(&outcomes[&4], Err(Rejection { group: 0, reason: Failure::Write(write) }) if write.elements().is_empty()));
     }
@@ -168,7 +171,6 @@ fn product_antichains_and_sealing_agree() {
 #[test]
 fn small_conflicting_histories_agree() {
     let [a, b] = [id(1), id(2)];
-    let resolver = Resolver::new(1).unwrap();
     for mask in 0..16 {
         let choose = |bit, zero, one| if mask & (1 << bit) == 0 { zero } else { one };
         let transactions = vec![
@@ -177,6 +179,6 @@ fn small_conflicting_histories_agree() {
             (2, vec![append(b, at(choose(2, 0, 2)), at(3))]),
             (3, vec![append(a, at(choose(3, 0, 2)), at(3)), append(b, at(choose(2, 0, 3)), at(4))]),
         ];
-        compare(&resolver, &[create(a), create(b)], &transactions);
+        compare(1, &[create(a), create(b)], &transactions);
     }
 }

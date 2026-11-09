@@ -1,12 +1,12 @@
-//! Evaluate the transaction rules and publish their conclusions through a cohort root.
-//! The program is compiled once; each resolution currently uses a fresh worker group.
+//! Encode transactions for the keyed `.ddp` rules, and decode their conclusions.
+//! The program is compiled once; `Engine` evaluates it on resident workers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use corgi::{Bounds, Value};
 
-use super::{canonical, Change, Cohort, Error, Failure, Frontier, Id, Payload, Registration, Rejection, Shape, Span, State, Time};
+use super::{Change, Error, Failure, Frontier, Id, Payload, Rejection, Shape, Time};
 use crate::runtime::container::Updates;
 
 /// A supplied transaction key and its changes, grouped in strictly increasing ledger order.
@@ -14,60 +14,22 @@ use crate::runtime::container::Updates;
 /// Root publication orders successful batches.
 pub type Transaction = (i64, Vec<(Id, Change)>);
 
-/// Conclusions computed by the rules, before publication.
-pub struct Resolution {
-    pub state: State,
-    pub outcomes: BTreeMap<i64, Result<(), Rejection>>,
-}
-
 /// The compiled keyed `.ddp` transaction resolver.
-pub struct Resolver {
+pub(super) struct Resolver {
     pub(super) program: crate::scope_ir::Program,
     pub(super) workers: usize,
 }
 
 impl Resolver {
-    pub fn new(workers: usize) -> Result<Self, Error> {
+    pub(super) fn new(workers: usize) -> Result<Self, Error> {
         if workers == 0 { return Err(Error::Invalid("the resolver needs at least one worker")); }
         let program = std::panic::catch_unwind(|| {
             let mut program = crate::lower::lower_tree(crate::parse::pipe::parse(include_str!("../../model/transactions_keyed.ddp")));
-            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "aborted" | "registry_add" | "manifest_add" | "manifest_ordered" | "initial_delta" | "registered_delta"));
+            program.root.exports.retain(|output| matches!(output.name.as_str(), "aborted" | "registry_add" | "manifest_ordered" | "initial_delta" | "registered_delta"));
             crate::passes::optimize(&mut program);
             program
         }).map_err(|_| Error::Resolve("cannot compile transaction rules".into()))?;
         Ok(Self { program, workers })
-    }
-
-    /// Resolve one batch against a pinned state, without reading or changing storage.
-    /// All frontiers share one maximum width in the evaluator, padded with minimum coordinates.
-    /// Their declared ledger widths remain in the opaque shapes and are checked on new effects.
-    pub fn resolve(&self, before: &State, transactions: &[Transaction]) -> Result<Resolution, Error> {
-        unique_keys(transactions)?;
-        if transactions.is_empty() {
-            return Ok(Resolution { state: before.clone(), outcomes: BTreeMap::new() });
-        }
-        let initial = current(before, transactions);
-        let width = maximum_width(&initial, transactions);
-        let inputs = inputs(&initial, transactions, width)?;
-        let outputs = evaluate(&self.program, inputs, self.workers)?;
-        conclusions(before, transactions, outputs)
-    }
-}
-
-impl Cohort<'_> {
-    /// Publish one batch of `.ddp` conclusions, retrying resolution after a lost CAS.
-    /// Results are returned only after publication; uncertain publication is never retried.
-    pub fn transact_batch(&self, resolver: &Resolver, transactions: &[Transaction]) -> Result<BTreeMap<i64, Result<(), Rejection>>, Error> {
-        unique_keys(transactions)?;
-        if transactions.is_empty() { return Ok(BTreeMap::new()); }
-        loop {
-            let (root, before) = self.load()?;
-            let resolution = resolver.resolve(&before, transactions)?;
-            for span in &resolution.state.manifest[before.manifest.len()..] {
-                if let Payload::Blob(hash) = &span.batch { self.store.get(*hash)?; }
-            }
-            if self.publish(root, &resolution.state)? { return Ok(resolution.outcomes); }
-        }
     }
 }
 
@@ -79,24 +41,12 @@ pub(super) fn unique_keys(transactions: &[Transaction]) -> Result<(), Error> {
     Ok(())
 }
 
-// Derive touched ledgers' current frontiers from committed append order.
-// This is a view of registry and spans, not another authoritative frontier.
-fn current<'a>(state: &'a State, transactions: &[Transaction]) -> Vec<(Id, &'a Registration, &'a Frontier)> {
-    let mut entries = transactions.iter().flat_map(|(_, groups)| groups.iter()).filter_map(|(id, _)| {
-        state.registry.get(id).map(|entry| (*id, (entry, &entry.start)))
-    }).collect::<BTreeMap<_, _>>();
-    for span in &state.manifest {
-        if let Some((_, write)) = entries.get_mut(&span.id) { *write = &span.upper; }
-    }
-    entries.into_iter().map(|(id, (entry, write))| (id, entry, write)).collect()
-}
-
-pub(super) fn maximum_width(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction]) -> usize {
-    let mut width = initial.iter().map(|(_, entry, _)| entry.shape.time_width).max().unwrap_or(0);
+/// The widest time any transaction names or any creation declares.
+pub(super) fn maximum_width(transactions: &[Transaction]) -> usize {
+    let mut width = 0;
     let mut include = |frontier: &Frontier| {
         width = width.max(frontier.elements().iter().map(|time| time.len()).max().unwrap_or(0));
     };
-    for (_, entry, write) in initial { include(&entry.start); include(write); }
     for (_, groups) in transactions {
         for (_, change) in groups {
             match change {
@@ -157,7 +107,7 @@ pub(super) fn public_outputs(mut outputs: BTreeMap<String, Updates>) -> Result<B
     };
     for (name, updates) in &mut outputs {
         match name.as_str() {
-            "registry_add" | "manifest_add" => {
+            "registry_add" => {
                 let Value::Prod(fields) = &mut updates.keys else { return Err(corrupt("expected UUID key")); };
                 restore(&mut fields[0])?;
             }
@@ -165,7 +115,7 @@ pub(super) fn public_outputs(mut outputs: BTreeMap<String, Updates>) -> Result<B
                 let Value::Prod(fields) = &mut updates.vals else { return Err(corrupt("expected span fields")); };
                 restore(&mut fields[0])?;
             }
-            "results" | "aborted" => {
+            "aborted" => {
                 let Value::Prod(fields) = &mut updates.vals else { return Err(corrupt("expected result field")); };
                 let Value::Sum(_, results) = &mut fields[0] else { return Err(corrupt("expected result variants")); };
                 let Value::Prod(aborted) = &mut results[1] else { return Err(corrupt("expected rejection fields")); };
@@ -211,20 +161,6 @@ fn payloads(values: &[&Payload]) -> Value {
     Value::sum(tags, vec![Value::Unit(empty), bytes(inline), bytes(blobs)])
 }
 
-fn inputs(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction], width: usize) -> Result<Vec<Updates>, Error> {
-    let committed = Updates {
-        keys: Value::Prod(vec![ids(initial.iter().map(|(id, _, _)| *id))]),
-        vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, _, write)| *write), width)]),
-        diffs: vec![1; initial.len()],
-    };
-    let registered = Updates {
-        keys: Value::Prod(vec![ids(initial.iter().map(|(id, _, _)| *id))]),
-        vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, entry, _)| &entry.start), width)]),
-        diffs: vec![1; initial.len()],
-    };
-    Ok(vec![committed, commands(transactions, width)?, registered])
-}
-
 pub(super) fn commands(transactions: &[Transaction], width: usize) -> Result<Updates, Error> {
     let groups = transactions.iter().flat_map(|(_, groups)| groups).collect::<Vec<_>>();
     let (mut tags, mut creates, mut appends, mut combined) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -248,29 +184,6 @@ pub(super) fn commands(transactions: &[Transaction], width: usize) -> Result<Upd
         diffs: vec![1; transactions.len()],
     };
     Ok(commands)
-}
-
-fn evaluate(program: &crate::scope_ir::Program, inputs: Vec<Updates>, workers: usize) -> Result<BTreeMap<String, Updates>, Error> {
-    let program = program.clone();
-    let guards = timely::execute(timely::Config::process(workers), move |worker| -> Result<_, String> {
-        let mut server = crate::server::Server::new();
-        server.set_passes(crate::passes::Config::none());
-        server.install(worker, "resolve", &program)?;
-        for (input, updates) in inputs.iter().enumerate() {
-            let rows = (worker.index()..updates.len()).step_by(worker.peers()).collect::<Vec<_>>();
-            server.feed_columns("resolve", input, updates.select(&rows), None)?;
-        }
-        server.tick(worker);
-        program.root.exports.iter().map(|output| {
-            server.snapshot(worker, &crate::server::output_name("resolve", &output.name)).map(|updates| (output.name.clone(), updates))
-        }).collect::<Result<BTreeMap<_, _>, _>>()
-    }).map_err(|error| Error::Resolve(error.to_string()))?;
-    let mut outputs = None;
-    for (worker, result) in guards.join().into_iter().enumerate() {
-        let result = result.map_err(Error::Resolve)?.map_err(Error::Resolve)?;
-        if worker == 0 { outputs = Some(result); }
-    }
-    public_outputs(outputs.ok_or_else(|| Error::Resolve("resolver returned no worker result".into()))?)
 }
 
 #[derive(Clone, Copy)]
@@ -352,13 +265,6 @@ pub(super) fn output<'a>(outputs: &'a BTreeMap<String, Updates>, name: &str) -> 
     Ok(output)
 }
 
-fn span_key(span: &Span) -> (Id, Vec<Time>) { frontier_key(span.id, &span.lower) }
-fn frontier_key(id: Id, frontier: &Frontier) -> (Id, Vec<Time>) {
-    let mut points = frontier.elements().to_vec();
-    points.sort();
-    (id, points)
-}
-
 // Widen each output leaf once, so row reads borrow integers instead of repeatedly widening a whole byte column through CORGI's public integer reader.
 pub(super) fn wide(value: Value) -> Result<Value, Error> {
     Ok(match value {
@@ -371,71 +277,9 @@ pub(super) fn wide(value: Value) -> Result<Value, Error> {
     })
 }
 
-fn conclusions(before: &State, transactions: &[Transaction], outputs: BTreeMap<String, Updates>) -> Result<Resolution, Error> {
-    let outputs = outputs.into_iter().map(|(name, mut updates)| {
-        updates.keys = wide(updates.keys)?;
-        updates.vals = wide(updates.vals)?;
-        Ok((name, updates))
-    }).collect::<Result<BTreeMap<_, _>, Error>>()?;
-    let outcomes = outcomes(output(&outputs, "results")?, transactions, false)?;
-
-    let additions = output(&outputs, "registry_add")?;
-    let mut registrations = BTreeMap::new();
-    for index in 0..additions.len() {
-        let [id] = Row { value: &additions.keys, index }.product()?;
-        let [shape, start] = Row { value: &additions.vals, index }.product()?;
-        let shape: Shape = bincode::deserialize(&shape.bytes()?).map_err(|error| Error::Corrupt(error.to_string()))?;
-        let start = canonical(&start.frontier()?, shape.time_width).map_err(Error::Invalid)?;
-        if registrations.insert(id.id()?, Registration { shape, start }).is_some() { return Err(corrupt("duplicate registry addition")); }
-    }
-    let additions = output(&outputs, "manifest_add")?;
-    let mut spans = BTreeMap::new();
-    for index in 0..additions.len() {
-        let [id] = Row { value: &additions.keys, index }.product()?;
-        let [lower, upper, since, batch] = Row { value: &additions.vals, index }.product()?;
-        let span = Span { id: id.id()?, lower: lower.frontier()?, upper: upper.frontier()?, since: since.frontier()?, batch: batch.payload()? };
-        if spans.insert(span_key(&span), span).is_some() { return Err(corrupt("duplicate span addition")); }
-    }
-    let mut state = before.clone();
-    let mut ordered = transactions.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|(key, _)| *key);
-    // The outputs are sets.
-    // Use successful requests only to restore append order and identify their effects; all effect contents and acceptance decisions came from .ddp.
-    for (key, groups) in ordered {
-        if outcomes[key].is_err() { continue; }
-        for (id, change) in groups {
-            if let Change::Create { shape, start } | Change::CreateAppend { shape, start, .. } = change {
-                let entry = registrations.remove(id).ok_or_else(|| corrupt("missing registry addition"))?;
-                if state.registry.contains_key(id) || &entry.shape != shape || &entry.start != start {
-                    return Err(corrupt("registry addition differs from its request"));
-                }
-                state.registry.insert(*id, entry);
-            }
-            let bounds = match change {
-                Change::Create { .. } => None,
-                Change::Append { lower, upper, batch } => Some((lower, upper, batch)),
-                Change::CreateAppend { start, upper, batch, .. } => Some((start, upper, batch)),
-            };
-            if let Some((lower, upper, batch)) = bounds {
-                let mut span = spans.remove(&frontier_key(*id, lower)).ok_or_else(|| corrupt("missing span addition"))?;
-                let entry = state.registry.get(id).ok_or_else(|| corrupt("span has no registration"))?;
-                span.lower = canonical(&span.lower, entry.shape.time_width).map_err(Error::Invalid)?;
-                span.upper = canonical(&span.upper, entry.shape.time_width).map_err(Error::Invalid)?;
-                span.since = canonical(&span.since, entry.shape.time_width).map_err(Error::Invalid)?;
-                if &span.upper != upper || &span.batch != batch || span.since != entry.start {
-                    return Err(corrupt("span addition differs from its request"));
-                }
-                state.manifest.push(span);
-            }
-        }
-    }
-    if !registrations.is_empty() || !spans.is_empty() { return Err(corrupt("unexpected state additions")); }
-    Ok(Resolution { state, outcomes })
-}
-
-/// Read full results or failure-only columns after widening their integer leaves once.
-pub(super) fn outcomes(results: &Updates, transactions: &[Transaction], failures_only: bool) -> Result<BTreeMap<i64, Result<(), Rejection>>, Error> {
-    let mut outcomes = if failures_only { transactions.iter().map(|(key, _)| (*key, Ok(()))).collect() } else { BTreeMap::new() };
+/// Read the failure-only results after widening their integer leaves once; every other transaction committed.
+pub(super) fn outcomes(results: &Updates, transactions: &[Transaction]) -> Result<BTreeMap<i64, Result<(), Rejection>>, Error> {
+    let mut outcomes: BTreeMap<i64, Result<(), Rejection>> = transactions.iter().map(|(key, _)| (*key, Ok(()))).collect();
     let mut seen = BTreeSet::new();
     for index in 0..results.len() {
         let [key] = Row { value: &results.keys, index }.product()?;
@@ -460,7 +304,7 @@ pub(super) fn outcomes(results: &Updates, transactions: &[Transaction], failures
         };
         let key = key.integer()?;
         if !seen.insert(key) { return Err(corrupt("duplicate transaction result")); }
-        if failures_only && result.is_ok() { return Err(corrupt("failure output contains a success")); }
+        if result.is_ok() { return Err(corrupt("failure output contains a success")); }
         outcomes.insert(key, result);
     }
     if outcomes.len() != transactions.len() || transactions.iter().any(|(key, groups)| {

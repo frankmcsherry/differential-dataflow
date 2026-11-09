@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use interactive::ledger::{BlobId, Change, Cohort, Error, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Root, Shape, Store, StoreError, Time, Transaction, Writer};
+use interactive::ledger::{BlobId, Change, Cohort, Error, Failure, Frontier, Id, MemoryStore, Payload, Rejection, Root, Shape, State, Store, StoreError, Time, Transaction, Writer};
 
 type Outcomes = BTreeMap<i64, Result<(), Rejection>>;
 type Cas = dyn Fn(&dyn Store, &str, u64, BlobId) -> Result<bool, StoreError> + Send + Sync;
@@ -61,40 +61,43 @@ fn gated(inner: Arc<dyn Store>, first: impl Fn(&dyn Store, &str, u64, BlobId) ->
     (Arc::new(hook), entered_rx, release_tx)
 }
 
-fn native(cohort: &Cohort<'_>, transactions: &[Transaction]) -> Outcomes {
+/// The serial rules' outcomes for one batch, applied in key order.
+fn native(oracle: &mut State, transactions: &[Transaction]) -> Outcomes {
     let mut ordered = transactions.to_vec();
     ordered.sort_by_key(|(key, _)| *key);
-    ordered.iter().map(|(key, groups)| (*key, cohort.transact(groups).unwrap())).collect()
+    ordered.iter().map(|(key, groups)| (*key, oracle.transact(groups))).collect()
+}
+
+/// Commit one batch through a short-lived writer, as a competing process would.
+fn commit(store: &Arc<MemoryStore>, transactions: &[Transaction]) -> Outcomes {
+    Writer::open(store.clone(), "cohort", 1).unwrap().transact_batch(transactions).unwrap()
 }
 
 #[test]
 fn repeated_keys_and_restart_replay_match_native_transactions() {
     let store = Arc::new(MemoryStore::default());
-    let oracle_store = MemoryStore::default();
-    let oracle = Cohort::new(&oracle_store, "oracle");
+    let mut oracle = State::default();
     let cohort = Cohort::new(store.as_ref(), "cohort");
-    // Begin with a legacy snapshot; subsequent Writer commits are conclusion-log entries.
-    assert_eq!(cohort.transact(&[create(1)]), Ok(Ok(())));
-    assert_eq!(oracle.transact(&[create(1)]), Ok(Ok(())));
     let batches = [
+        vec![(0, vec![create(1)])],
         vec![(1, vec![append(1, 0, 9)]), (0, vec![append(1, 0, 1), create(2)])],
         vec![(0, vec![append(1, 1, 2), append(2, 1, 2)]), (1, vec![append(1, 1, 3)])],
         vec![(0, vec![append(1, 3, 4), append(2, 0, 1)]), (1, vec![])],
     ];
     let mut writer = Writer::open(store.clone(), "cohort", 2).unwrap();
     for batch in batches {
-        assert_eq!(writer.transact_batch(&batch).unwrap(), native(&oracle, &batch));
-        assert_eq!(cohort.snapshot().unwrap(), oracle.snapshot().unwrap());
+        assert_eq!(writer.transact_batch(&batch).unwrap(), native(&mut oracle, &batch));
+        assert_eq!(cohort.snapshot().unwrap(), oracle);
     }
     writer.flush().unwrap();
     drop(writer);
-    assert_eq!(cohort.snapshot().unwrap(), oracle.snapshot().unwrap());
-    // A native writer can recover the log and replace it with another legacy snapshot.
-    assert_eq!(cohort.transact(&[append(2, 1, 2)]), oracle.transact(&[append(2, 1, 2)]));
+    assert_eq!(cohort.snapshot().unwrap(), oracle);
+    // A restarted writer recovers the log and extends it.
     let mut restarted = Writer::open(store.clone(), "cohort", 1).unwrap();
-    let batch = [(0, vec![append(2, 2, 3)])];
-    assert_eq!(restarted.transact_batch(&batch).unwrap(), native(&oracle, &batch));
-    assert_eq!(cohort.snapshot().unwrap(), oracle.snapshot().unwrap());
+    for batch in [vec![(0, vec![append(2, 1, 2)])], vec![(0, vec![append(2, 2, 3)])]] {
+        assert_eq!(restarted.transact_batch(&batch).unwrap(), native(&mut oracle, &batch));
+        assert_eq!(cohort.snapshot().unwrap(), oracle);
+    }
 }
 
 #[test]
@@ -134,9 +137,10 @@ fn blocked_publication_gates_outcomes_and_groups_queued_batches() {
 #[test]
 fn lost_cas_reresolves_the_entire_dependent_suffix() {
     let store = Arc::new(MemoryStore::default());
-    assert_eq!(Cohort::new(store.as_ref(), "cohort").transact(&[create(1)]), Ok(Ok(())));
-    let (hook, entered, release) = gated(store.clone(), |inner, name, expected, state| {
-        assert_eq!(Cohort::new(inner, name).transact(&[append(1, 0, 3)]), Ok(Ok(())));
+    assert_eq!(commit(&store, &[(0, vec![create(1)])]), success(0));
+    let competitor = store.clone();
+    let (hook, entered, release) = gated(store.clone(), move |inner, name, expected, state| {
+        assert_eq!(commit(&competitor, &[(0, vec![append(1, 0, 3)])]), success(0));
         inner.cas_root(name, expected, state)
     });
     let mut writer = Writer::open(hook.clone(), "cohort", 2).unwrap();
@@ -324,4 +328,92 @@ fn writer_log_recovers_after_process_exit() {
     }
     let directory = Directory(std::env::temp_dir().join(format!("ddir-writer-process-{}", Id::new_v4())));
     for role in ["seed", "read", "resume", "verify"] { run(&directory.0, role); }
+}
+
+/// Count CAS calls without changing them.
+fn counted(inner: Arc<dyn Store>) -> Arc<Hook> {
+    Arc::new(Hook { inner, calls: AtomicUsize::new(0), cas: Box::new(|store, name, expected, state| store.cas_root(name, expected, state)) })
+}
+
+#[test]
+fn one_publication_commits_the_accepted_transactions() {
+    let store = Arc::new(MemoryStore::default());
+    let hook = counted(store.clone());
+    let mut writer = Writer::open(hook.clone(), "cohort", 2).unwrap();
+    let outcomes = writer.transact_batch(&[
+        (30, vec![(id(1), Change::Append { lower: at(1), upper: at(2), batch: Payload::Inline(vec![2]) })]),
+        (10, vec![(id(1), Change::CreateAppend { shape: shape(1), start: at(0), upper: at(1), batch: Payload::Inline(vec![1]) })]),
+        (40, vec![populated(2, 3)]),
+        (20, vec![create(0), append(1, 0, 9)]),
+    ]).unwrap();
+    assert_eq!(outcomes, BTreeMap::from([
+        (10, Ok(())),
+        (20, Err(Rejection { group: 1, reason: Failure::Write(at(1)) })),
+        (30, Ok(())),
+        (40, Ok(())),
+    ]));
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    let state = Cohort::new(store.as_ref(), "cohort").snapshot().unwrap();
+    assert_eq!(state.registry.len(), 2);
+    assert!(!state.registry.contains_key(&id(0)));
+    assert_eq!(state.manifest.len(), 3);
+    assert_eq!(state.write(id(1)), Some(&at(2)));
+    assert_eq!(state.write(id(2)), Some(&at(3)));
+}
+
+#[test]
+fn only_accepted_blob_references_must_exist_before_publication() {
+    let store = Arc::new(MemoryStore::default());
+    let hook = counted(store.clone());
+    let missing = Payload::Blob([0; 32]);
+    let missing_upper = |lower, upper| (id(1), Change::Append { lower: at(lower), upper: at(upper), batch: missing.clone() });
+    let mut writer = Writer::open(hook.clone(), "cohort", 2).unwrap();
+    assert_eq!(
+        writer.submit(&[(10, vec![(id(1), Change::CreateAppend { shape: shape(1), start: at(0), upper: at(1), batch: missing.clone() })]), (20, vec![create(2)])]).err(),
+        Some(Error::Store(StoreError::Missing([0; 32])))
+    );
+    // A failed submission stops the writer; nothing was published.
+    assert!(writer.submit(&[(0, vec![create(3)])]).is_err());
+    drop(writer);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.read_root("cohort").unwrap(), Root::default());
+    // A rejected append may name a missing blob.
+    let mut writer = Writer::open(hook.clone(), "cohort", 2).unwrap();
+    assert_eq!(
+        writer.transact_batch(&[(10, vec![populated(1, 1)]), (20, vec![missing_upper(0, 2)])]).unwrap(),
+        BTreeMap::from([(10, Ok(())), (20, Err(Rejection { group: 0, reason: Failure::Write(at(1)) }))])
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn empty_batches_publish_nothing_and_duplicate_keys_are_refused() {
+    let store = Arc::new(MemoryStore::default());
+    let hook = counted(store.clone());
+    let mut writer = Writer::open(hook.clone(), "cohort", 1).unwrap();
+    assert_eq!(writer.transact_batch(&[]), Ok(BTreeMap::new()));
+    assert!(matches!(writer.transact_batch(&[(1, vec![]), (1, vec![])]), Err(Error::Invalid(_))));
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.read_root("cohort").unwrap(), Root::default());
+}
+
+#[test]
+fn declared_widths_survive_padding_and_aborted_creations() {
+    let store = Arc::new(MemoryStore::default());
+    let mut oracle = State::default();
+    let point = |coordinates: &[i64]| -> Frontier { [Time::new(coordinates.into())].into_iter().collect() };
+    let high_start = point(&[0, i64::MIN, i64::MIN]);
+    let high_upper = [Time::new(vec![0, 1, 0].into()), Time::new(vec![1, 0, 0].into())].into_iter().collect();
+    let transactions = vec![
+        (0, vec![create(1), (id(2), Change::Create { shape: shape(3), start: high_start.clone() })]),
+        (10, vec![(id(0), Change::Create { shape: shape(5), start: point(&[0, 0, 0, 0, 0]) }), append(1, 1, 2)]),
+        (20, vec![(id(0), Change::Create { shape: shape(2), start: point(&[0, 0]) })]),
+        (30, vec![append(1, 0, 1), (id(2), Change::Append { lower: high_start, upper: high_upper, batch: Payload::Empty })]),
+    ];
+    let mut writer = Writer::open(store.clone(), "cohort", 2).unwrap();
+    assert_eq!(writer.transact_batch(&transactions).unwrap(), native(&mut oracle, &transactions));
+    let actual = Cohort::new(store.as_ref(), "cohort").snapshot().unwrap();
+    assert_eq!(actual, oracle);
+    assert_eq!(actual.registry[&id(0)].shape.time_width, 2);
+    assert_eq!(actual.registry[&id(2)].shape.time_width, 3);
 }
