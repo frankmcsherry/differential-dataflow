@@ -66,12 +66,10 @@ impl Frontiers {
     fn new(value: Value, name: &str) -> Result<Self, String> {
         let (frontiers, times) = value.into_list(name)?;
         let (times, coordinates) = times.into_list(name)?;
-        coordinates.as_i64(name)?;
         Ok(Self { frontiers, times, coordinates })
     }
 
-    fn row(&self, row: usize, width: &mut Option<usize>, name: &str) -> Result<Frontier, String> {
-        let coordinates = self.coordinates.as_i64(name)?;
+    fn row(&self, coordinates: &[i64], row: usize, width: &mut Option<usize>, name: &str) -> Result<Frontier, String> {
         let (lo, hi) = span(&self.frontiers, row);
         let mut result = Frontier::new();
         for index in lo..hi {
@@ -100,6 +98,9 @@ impl HostKernel for Kernel {
             .map_err(|_| format!("{}: expected two frontiers", self.name))?;
         let left = Frontiers::new(left, self.name)?;
         let right = Frontiers::new(right, self.name)?;
+        // Byte coordinates widen once per column; every row shares that slice.
+        let left_coordinates = left.coordinates.as_i64(self.name)?;
+        let right_coordinates = right.coordinates.as_i64(self.name)?;
         if rows(&left.frontiers) != rows(&right.frontiers) {
             return Err(format!("{}: argument columns have different lengths", self.name));
         }
@@ -109,8 +110,8 @@ impl HostKernel for Kernel {
         let mut coordinates = Vec::new();
         for row in 0..rows(&left.frontiers) {
             let mut width = None;
-            let left = left.row(row, &mut width, self.name)?;
-            let right = right.row(row, &mut width, self.name)?;
+            let left = left.row(&left_coordinates, row, &mut width, self.name)?;
+            let right = right.row(&right_coordinates, row, &mut width, self.name)?;
             let frontier = match self.operation {
                 Operation::Le => { comparisons.push(i64::from(PartialOrder::less_equal(&left, &right))); continue; }
                 Operation::Lt => { comparisons.push(i64::from(PartialOrder::less_than(&left, &right))); continue; }
