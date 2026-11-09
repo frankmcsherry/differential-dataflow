@@ -30,6 +30,7 @@ libc = "0.2"
 
 [dev-dependencies]
 diagnostics = { path = "../diagnostics" }
+mimalloc = "0.1.48"
 
 [features]
 default = ["timely/getopts"]

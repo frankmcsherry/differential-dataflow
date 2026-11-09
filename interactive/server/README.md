@@ -303,3 +303,5 @@ fronting proxy if a deployment ever needs one.
 The [LDBC-derived workload](../bench/ldbc/README.md) runs parameterized interactive
 queries and maintained BI queries together through this server. It includes a
 tiny correctness fixture and can read an existing SNB CSV snapshot for timing.
+
+For the ledger implementation state, matched reference benchmark, and profiling handoff, see [`bench/ledger`](../bench/ledger/README.md).

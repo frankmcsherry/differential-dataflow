@@ -1,0 +1,219 @@
+--- a/interactive/src/ledger/engine.rs
++++ b/interactive/src/ledger/engine.rs
+@@ -49,7 +49,10 @@
+         let (ready, receiver) = mpsc::channel();
+         let thread = std::thread::spawn(move || {
+             let guards = timely::execute(timely::Config::process(workers), move |worker| {
++                let diagnostics = std::env::var_os("DDIR_PROFILE_OPS").map(|_| crate::diag::register(worker));
+                 let mut server = crate::server::Server::new();
++                if let Some(diag) = &diagnostics { server.set_diagnostics(std::rc::Rc::clone(diag)); }
++                let mut profile_epoch = 0;
+                 server.set_passes(crate::passes::Config::none());
+                 let installed = server.install(worker, "catalog", &catalog)
+                     .and_then(|_| server.feed_columns("catalog", 0, shard(&initial, worker.index(), worker.peers()), None));
+@@ -61,6 +64,8 @@
+                 if status.is_some() { return; }
+
+                 while let Ok(request) = receivers[worker.index()].lock().unwrap().recv() {
++                    let attr_cpu = super::resolve::profile_thread_cpu();
++                    let attr_begin = std::time::Instant::now();
+                     let staged = server.install(worker, "resolve", &program).and_then(|_| {
+                         server.feed_columns("resolve", 1, shard(&request.commands, worker.index(), worker.peers()), None)
+                     });
+@@ -71,7 +76,11 @@
+                         let _ = request.reply.send(Err(error));
+                         break;
+                     }
++                    let attr_staged = attr_begin.elapsed();
++                    let attr_begin = std::time::Instant::now();
+                     server.tick(worker);
++                    let attr_resolve = attr_begin.elapsed();
++                    let attr_begin = std::time::Instant::now();
+                     let outputs = program.root.exports.iter().filter(|output| output.name != "initial_delta").map(|output| {
+                         server.snapshot(worker, &crate::server::output_name("resolve", &output.name))
+                             .map(|updates| (output.name.clone(), updates))
+@@ -85,6 +94,8 @@
+                     }
+                     // Absorb the local conclusion shard without gathering the catalog or delta on worker 0.
+                     // Drop the resolver before advancing its imported base, so no old proposals are replayed.
++                    let attr_snapshot = attr_begin.elapsed();
++                    let attr_begin = std::time::Instant::now();
+                     let absorbed = server.load(worker, "catalog", 0, &crate::server::output_name("resolve", "initial_delta"), 1)
+                         .and_then(|_| server.drop_program(worker, "resolve"));
+                     if let Err(error) = absorbed { *failure.lock().unwrap() = Some(error); }
+@@ -93,7 +104,20 @@
+                         let _ = request.reply.send(Err(error));
+                         break;
+                     }
++                    let attr_absorb = attr_begin.elapsed();
++                    let attr_begin = std::time::Instant::now();
+                     server.tick(worker);
++                    if worker.index()==0 && std::env::var_os("DDIR_ATTR").is_some() { eprintln!("ATTR engine staged_ns={} tick_ns={} snapshot_ns={} absorb_ns={} catalog_tick_ns={}",attr_staged.as_nanos(),attr_resolve.as_nanos(),attr_snapshot.as_nanos(),attr_absorb.as_nanos(),attr_begin.elapsed().as_nanos()); }
++                    if std::env::var_os("DDIR_ATTR").is_some() { eprintln!("ATTR worker worker={} cpu_ns={}",worker.index(),super::resolve::profile_thread_cpu()-attr_cpu); }
++                    profile_epoch += 1;
++                    if profile_epoch == 5 || profile_epoch == 40 {
++                        if let Some(diag) = &diagnostics {
++                            crate::diag::flush(worker);
++                            let installed = worker.installed_dataflows().into_iter().collect();
++                            diag.borrow_mut().process(&installed);
++                            profile_operators(&diag.borrow(),profile_epoch,worker.index()).unwrap();
++                        }
++                    }
+                     let _ = request.reply.send(outputs);
+                 }
+             }).map_err(|error| error.to_string())?;
+@@ -173,3 +197,35 @@
+         assert!(engine.resolve(wrong).is_err());
+     }
+ }
++
++
++fn profile_operators(diag: &crate::diag::Diagnostics,epoch: usize,worker:usize) -> Result<(),Error> {
++    use super::resolve::{wide,Row};
++    fn snapshot(diag:&crate::diag::Diagnostics,name:&str)->Result<Option<Updates>,Error> {
++        diag.snapshot(name).map(|u|Ok(Updates{keys:wide(u.keys)?,vals:wide(u.vals)?,diffs:u.diffs})).transpose()
++    }
++    fn name(row:Row<'_>)->Result<String,Error> {String::from_utf8(row.bytes()?).map_err(|e|Error::Corrupt(e.to_string()))}
++    let mut operators=BTreeMap::new();
++    let mut totals=BTreeMap::<(String,String,String),i64>::new();
++    if let Some(rows)=snapshot(diag,"diag.operator")? {
++        for index in 0..rows.len() {
++            let [_,id]=Row{value:&rows.keys,index}.product()?;
++            let [p,s,n,_]=Row{value:&rows.vals,index}.product()?;
++            operators.insert(id.integer()?,(name(p)?,name(s)?,name(n)?));
++        }
++    }
++    if let Some(rows)=snapshot(diag,"diag.time")? {
++        for index in 0..rows.len() {
++            let [_,id]=Row{value:&rows.keys,index}.product()?;
++            if let Some(desc)=operators.get(&id.integer()?) {*totals.entry(desc.clone()).or_default()+=rows.diffs[index];}
++        }
++    }
++    if let Some(rows)=snapshot(diag,"diag.time_retired")? {
++        for index in 0..rows.len() {
++            let [_,p,s,n]=Row{value:&rows.keys,index}.product()?;
++            *totals.entry((name(p)?,name(s)?,name(n)?)).or_default()+=rows.diffs[index];
++        }
++    }
++    for ((p,s,n),ns) in totals { eprintln!("OP_PROFILE epoch={} worker={} program={:?} statement={:?} operator={:?} ns={}",epoch,worker,p,s,n,ns); }
++    Ok(())
++}
+--- a/interactive/src/ledger/writer.rs
++++ b/interactive/src/ledger/writer.rs
+@@ -66,6 +66,8 @@
+     /// Resolve a batch and queue its conclusions; this does not acknowledge a commit.
+     /// Keys need be unique only within this batch.
+     pub fn submit(&mut self, transactions: &[Transaction]) -> Result<Receipt, Error> {
++        let attr_cpu = super::resolve::profile_thread_cpu();
++        let attr_begin = std::time::Instant::now();
+         resolve::unique_keys(transactions)?;
+         let number = self.next;
+         self.next = self.next.checked_add(1).ok_or(Error::Invalid("submission counter exhausted"))?;
+@@ -91,13 +93,16 @@
+             }
+         }
+         if self.flight.is_none() { self.start()?; }
++        if std::env::var_os("DDIR_ATTR").is_some() { eprintln!("ATTR submit total_ns={} cpu_ns={}", attr_begin.elapsed().as_nanos(),super::resolve::profile_thread_cpu()-attr_cpu); }
+         Ok(receipt)
+     }
+
+     /// Wait for all queued work, then consume this receipt's committed result.
+     pub fn wait(&mut self, receipt: Receipt) -> Result<Outcomes, Error> {
+         if receipt.owner != self.owner { return Err(Error::Invalid("receipt belongs to another writer")); }
++        let attr_begin = std::time::Instant::now();
+         let flushed = self.flush();
++        if std::env::var_os("DDIR_ATTR").is_some() { eprintln!("ATTR wait total_ns={}", attr_begin.elapsed().as_nanos()); }
+         self.completed.remove(&receipt.number)
+             .unwrap_or_else(|| flushed.and(Err(Error::Invalid("unknown receipt"))))
+     }
+@@ -198,12 +203,19 @@
+     }
+
+     fn resolve(&mut self, number: u64, transactions: Vec<Transaction>) -> Result<Batch, Error> {
+-        let outputs = self.engine.as_mut().ok_or(Error::Invalid("writer has no evaluator"))?
+-            .resolve(resolve::commands(&transactions, self.width)?)?;
++        let attr_begin = std::time::Instant::now();
++        let commands = resolve::commands(&transactions, self.width)?;
++        let attr_encode = attr_begin.elapsed();
++        let attr_begin = std::time::Instant::now();
++        let outputs = self.engine.as_mut().ok_or(Error::Invalid("writer has no evaluator"))?.resolve(commands)?;
++        let attr_engine = attr_begin.elapsed();
++        let attr_begin = std::time::Instant::now();
+         let mut results = resolve::output(&outputs, "aborted")?.clone();
+         results.keys = resolve::wide(results.keys)?;
+         results.vals = resolve::wide(results.vals)?;
+         let outcomes = resolve::outcomes(&results, &transactions, true)?;
++        let attr_outcomes = attr_begin.elapsed();
++        let attr_begin = std::time::Instant::now();
+         let delta = Delta { registry: resolve::output(&outputs, "registry_add")?.clone(),
+             manifest: resolve::output(&outputs, "manifest_ordered")?.clone() };
+         let mut ordered = transactions.iter().collect::<Vec<_>>();
+@@ -240,6 +252,7 @@
+             return Err(Error::Corrupt("conclusions do not match accepted requests".into()));
+         }
+         self.widths.extend(created);
++        if std::env::var_os("DDIR_ATTR").is_some() { eprintln!("ATTR writer encode_ns={} engine_ns={} outcomes_ns={} validate_ns={}",attr_encode.as_nanos(),attr_engine.as_nanos(),attr_outcomes.as_nanos(),attr_begin.elapsed().as_nanos()); }
+         Ok(Batch { number, transactions, delta, outcomes })
+     }
+ }
+--- a/interactive/src/ledger/log.rs
++++ b/interactive/src/ledger/log.rs
+@@ -35,15 +35,24 @@
+     }
+     let version =
+         root.version.checked_add(1).ok_or_else(|| StoreError::Unavailable("root version exhausted".into()))?;
++    let attr_begin = std::time::Instant::now();
+     let deltas = deltas
+         .iter()
+         .map(|delta| Ok(Delta { registry: compact(&delta.registry)?, manifest: compact(&delta.manifest)? }))
+         .collect::<Result<_, Error>>()?;
++    let attr_compact = attr_begin.elapsed();
++    let attr_begin = std::time::Instant::now();
+     let record = Log { previous: root.state, deltas };
+     let mut bytes = MAGIC.to_vec();
+     bytes.extend(bincode::serialize(&record).map_err(|error| corrupt(&error.to_string()))?);
++    let attr_encode = attr_begin.elapsed();
++    let attr_begin = std::time::Instant::now();
+     let state = store.put(&bytes)?;
+-    if store.cas_root(name, root.version, state)? {
++    let attr_put = attr_begin.elapsed();
++    let attr_begin = std::time::Instant::now();
++    let committed = store.cas_root(name, root.version, state)?;
++    if std::env::var_os("DDIR_ATTR").is_some() { eprintln!("ATTR publish compact_ns={} encode_ns={} put_ns={} cas_ns={} bytes={}",attr_compact.as_nanos(),attr_encode.as_nanos(),attr_put.as_nanos(),attr_begin.elapsed().as_nanos(),bytes.len()); }
++    if committed {
+         Ok(Some(Root { version, state: Some(state) }))
+     } else {
+         Ok(None)
+--- a/interactive/src/ledger/resolve.rs
++++ b/interactive/src/ledger/resolve.rs
+@@ -496,3 +496,10 @@
+         assert_eq!(public_ids(ids([])).unwrap().len(), 0);
+     }
+ }
++
++
++pub(super) fn profile_thread_cpu() -> u64 {
++    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) }, 0);
++    (t.tv_sec as u64)*1_000_000_000+t.tv_nsec as u64
++}
+--- a/interactive/src/server/progress.rs
++++ b/interactive/src/server/progress.rs
+@@ -103,8 +103,17 @@
+         if !output.since.less_equal(since) { return Err("compaction must advance monotonically".into()); }
+         let frontier = Antichain::from_elem(since.clone());
+         let trace = self.traces.get_mut(&name).unwrap();
++        let profile = std::env::var_os("DDIR_COMPACT_PROFILE").is_some();
++        let cpu = || {
++            let mut t = libc::timespec { tv_sec:0,tv_nsec:0 };
++            assert_eq!(unsafe {libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID,&mut t)},0);
++            t.tv_sec as u64*1_000_000_000+t.tv_nsec as u64
++        };
++        let before=if profile {cpu()} else {0};
++        let wall=std::time::Instant::now();
+         trace.set_logical_compaction(frontier.borrow());
+         trace.set_physical_compaction(frontier.borrow());
++        if profile {eprintln!("COMPACT_PROFILE epoch={} trace={:?} cpu_ns={} wall_ns={}",self.epoch,name,cpu()-before,wall.elapsed().as_nanos());}
+         self.outputs.get_mut(&name).unwrap().since = since.clone();
+         Ok(())
+     }
