@@ -1,9 +1,11 @@
 //! The ledger verbs from `interactive/model.md`, backed by immutable blobs and one root per cohort.
 //!
 //! `MemoryStore` models storage that survives dropping clients, while the process stays alive.
+//! On Unix, `FileStore` makes completed writes durable on a local filesystem.
 //! Every commit writes a complete cohort snapshot; payload bytes are opaque and writer-validated.
-//! There is no compaction, reclamation, resolver, server integration, or stable storage format yet.
-//! Run the tests with `cargo test -p interactive --lib ledger::tests`.
+//! The DDIR source bridge consumes committed snapshots; the `.ddp` resolver remains a reference model.
+//! Compaction, reclamation, and a stable storage format remain future work.
+//! Run the backing tests with `cargo test -p interactive --lib ledger::`.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -11,6 +13,11 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use timely::order::PartialOrder;
 use timely::progress::frontier::Antichain;
+
+#[cfg(unix)]
+mod file;
+#[cfg(unix)]
+pub use file::FileStore;
 
 /// Signed product time, with trailing minimum coordinates omitted by `PointStamp`.
 pub type Time = differential_dataflow::dynamic::pointstamp::PointStamp<i64, 2>;

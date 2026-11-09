@@ -163,6 +163,16 @@ It is not used to advance ledger sources.
 
 `cargo test -p interactive --test server_ledgers` exercises the bridge on one and four workers, including refresh, product timestamps, empty spans, sealing, and independent lifetimes.
 
+On Unix, `interactive::ledger::FileStore::open(path)` provides the same blob and root operations on a local filesystem.
+The store keeps immutable content-addressed files in `blobs/`, versioned roots in `roots/`, and persistent root lock files in `locks/`.
+Root and lock filenames encode name bytes as lowercase hex, preserving distinct names on case-insensitive filesystems.
+Writes sync file contents before publication and the containing directory before returning success.
+Root reads and compare-and-swap operations share a per-root file lock, so readers also settle any publication left by an interrupted writer.
+An uncertain publication returns `StoreError::CommitUnknown`; callers must inspect committed state rather than assume the operation failed.
+The on-disk formats are internal to this prototype.
+
+`cargo test -p interactive --test ledger_file --test ledger_model` checks fresh-process recovery, process exclusion, DDIR replay, and agreement with the `.ddp` rules using both backings.
+
 ## Writes: `feed`
 
     feed <prog> <in> <key> [val=<v>] [time=<t>] [diff=<d>]

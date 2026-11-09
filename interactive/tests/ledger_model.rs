@@ -125,9 +125,21 @@ fn populated(number: i64, start: Frontier, upper: Frontier, batch: Payload) -> (
 
 /// Each round resolves concurrent transactions in key order; changes are grouped by strictly increasing ledger ID.
 fn check(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]]) {
-    let store = MemoryStore::default();
+    check_store(rounds, workers, payloads, &MemoryStore::default());
+    #[cfg(unix)]
+    {
+        let directory = std::env::temp_dir().join(format!("ddir-ledger-model-{}", Id::new_v4()));
+        {
+            let store = interactive::ledger::FileStore::open(&directory).unwrap();
+            check_store(rounds, workers, payloads, &store);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+fn check_store(rounds: &[Vec<Transaction>], workers: usize, payloads: &[&[u8]], store: &dyn Store) {
     for payload in payloads { store.put(payload).unwrap(); }
-    let cohort = Cohort::new(&store, "comparison");
+    let cohort = Cohort::new(store, "comparison");
     for txns in rounds {
         let before = cohort.snapshot().unwrap();
         let mut ordered = txns.to_vec();
