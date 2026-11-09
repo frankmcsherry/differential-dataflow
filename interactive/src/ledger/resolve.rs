@@ -31,7 +31,7 @@ impl Resolver {
         if workers == 0 { return Err(Error::Invalid("the resolver needs at least one worker")); }
         let program = std::panic::catch_unwind(|| {
             let mut program = crate::lower::lower_tree(crate::parse::pipe::parse(include_str!("../../model/transactions_keyed.ddp")));
-            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "aborted" | "registry_add" | "manifest_add" | "manifest_ordered" | "initial_delta"));
+            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "aborted" | "registry_add" | "manifest_add" | "manifest_ordered" | "initial_delta" | "registered_delta"));
             crate::passes::optimize(&mut program);
             program
         }).map_err(|_| Error::Resolve("cannot compile transaction rules".into()))?;
@@ -214,10 +214,15 @@ fn payloads(values: &[&Payload]) -> Value {
 fn inputs(initial: &[(Id, &Registration, &Frontier)], transactions: &[Transaction], width: usize) -> Result<Vec<Updates>, Error> {
     let committed = Updates {
         keys: Value::Prod(vec![ids(initial.iter().map(|(id, _, _)| *id))]),
-        vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, entry, _)| &entry.start), width), frontiers(initial.iter().map(|(_, _, write)| *write), width)]),
+        vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, _, write)| *write), width)]),
         diffs: vec![1; initial.len()],
     };
-    Ok(vec![committed, commands(transactions, width)?])
+    let registered = Updates {
+        keys: Value::Prod(vec![ids(initial.iter().map(|(id, _, _)| *id))]),
+        vals: Value::Prod(vec![frontiers(initial.iter().map(|(_, entry, _)| &entry.start), width)]),
+        diffs: vec![1; initial.len()],
+    };
+    Ok(vec![committed, commands(transactions, width)?, registered])
 }
 
 pub(super) fn commands(transactions: &[Transaction], width: usize) -> Result<Updates, Error> {

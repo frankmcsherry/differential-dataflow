@@ -20,7 +20,7 @@ pub(super) struct Engine {
 }
 
 impl Engine {
-    pub(super) fn new(resolver: &Resolver, initial: Updates) -> Result<Self, Error> {
+    pub(super) fn new(resolver: &Resolver, initial: Updates, registered: Updates) -> Result<Self, Error> {
         if !resolver.program.root.exports.iter().any(|output| output.name == "initial_delta") {
             return Err(Error::Resolve("resident resolver needs initial_delta".into()));
         }
@@ -32,15 +32,18 @@ impl Engine {
             receivers.push(Mutex::new(receiver));
         }
         let mut program = resolver.program.clone();
-        program.root.exports.retain(|output| matches!(output.name.as_str(), "aborted" | "registry_add" | "manifest_ordered" | "initial_delta"));
+        program.root.exports.retain(|output| matches!(output.name.as_str(), "aborted" | "registry_add" | "manifest_ordered" | "initial_delta" | "registered_delta"));
         crate::passes::optimize(&mut program);
         for import in &mut program.root.imports {
             if matches!(import.from, crate::scope_ir::Source::Input(0)) {
                 import.from = crate::scope_ir::Source::Trace(crate::server::output_name("catalog", "current"));
+            } else if matches!(import.from, crate::scope_ir::Source::Input(2)) {
+                import.from = crate::scope_ir::Source::Trace(crate::server::output_name("catalog", "registered"));
             }
         }
         let mut catalog = crate::lower::lower_tree(crate::parse::pipe::parse(
-            "let current = input 0 : (((int, int)), (List(List(int)), List(List(int)))); output \"current\" = current;"
+            "let current = input 0 : (((int, int)), (List(List(int)))); output \"current\" = current; \
+             let registered = input 1 : (((int, int)), (List(List(int)))); output \"registered\" = registered;"
         ));
         crate::passes::optimize(&mut catalog);
         let workers = resolver.workers;
@@ -52,7 +55,8 @@ impl Engine {
                 let mut server = crate::server::Server::new();
                 server.set_passes(crate::passes::Config::none());
                 let installed = server.install(worker, "catalog", &catalog)
-                    .and_then(|_| server.feed_columns("catalog", 0, shard(&initial, worker.index(), worker.peers()), None));
+                    .and_then(|_| server.feed_columns("catalog", 0, shard(&initial, worker.index(), worker.peers()), None))
+                    .and_then(|_| server.feed_columns("catalog", 1, shard(&registered, worker.index(), worker.peers()), None));
                 if let Err(error) = installed { *failure.lock().unwrap() = Some(error); }
                 barrier.wait();
                 let status = failure.lock().unwrap().clone();
@@ -72,7 +76,7 @@ impl Engine {
                         break;
                     }
                     server.tick(worker);
-                    let outputs = program.root.exports.iter().filter(|output| output.name != "initial_delta").map(|output| {
+                    let outputs = program.root.exports.iter().filter(|output| !matches!(output.name.as_str(), "initial_delta" | "registered_delta")).map(|output| {
                         server.snapshot(worker, &crate::server::output_name("resolve", &output.name))
                             .map(|updates| (output.name.clone(), updates))
                     }).collect::<Result<Outputs, _>>();
@@ -86,6 +90,7 @@ impl Engine {
                     // Absorb the local conclusion shard without gathering the catalog or delta on worker 0.
                     // Drop the resolver before advancing its imported base, so no old proposals are replayed.
                     let absorbed = server.load(worker, "catalog", 0, &crate::server::output_name("resolve", "initial_delta"), 1)
+                        .and_then(|_| server.load(worker, "catalog", 1, &crate::server::output_name("resolve", "registered_delta"), 1))
                         .and_then(|_| server.drop_program(worker, "resolve"));
                     if let Err(error) = absorbed { *failure.lock().unwrap() = Some(error); }
                     barrier.wait();
@@ -162,13 +167,13 @@ mod tests {
     fn feed_errors_stop_and_join_workers() {
         let resolver = Resolver::new(2).unwrap();
         let wrong = Updates { keys: corgi::Value::int(vec![0]), vals: corgi::Value::Unit(1), diffs: vec![1] };
-        assert!(Engine::new(&resolver, wrong.clone()).is_err());
         let initial = Updates {
             keys: corgi::Value::Prod(vec![ids(std::iter::empty())]),
-            vals: corgi::Value::Prod(vec![frontiers(std::iter::empty(), 0), frontiers(std::iter::empty(), 0)]),
+            vals: corgi::Value::Prod(vec![frontiers(std::iter::empty(), 0)]),
             diffs: Vec::new(),
         };
-        let mut engine = Engine::new(&resolver, initial).unwrap();
+        assert!(Engine::new(&resolver, wrong.clone(), initial.clone()).is_err());
+        let mut engine = Engine::new(&resolver, initial.clone(), initial).unwrap();
         assert!(engine.resolve(wrong.clone()).is_err());
         assert!(engine.resolve(wrong).is_err());
     }

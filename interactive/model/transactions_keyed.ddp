@@ -1,7 +1,8 @@
 -- Ordered atomic transactions, resolved separately for each ledger id.
 -- transactions.ddp remains the serial specification of these rules.
--- Input 0 is a derived view of committed registration starts and write frontiers.
+-- Input 0 is a derived view of committed write frontiers, which change with every append.
 -- Input 1 holds grouped transactions; UUID words replace the byte lists in transactions.ddp.
+-- Input 2 is a derived view of committed registration starts, which change only with creations.
 -- Ledger ids are two signed words, each biased by its sign bit to preserve UUID byte order.
 -- Frontiers use uniformly padded integer products; public and durable UUIDs remain byte lists.
 -- Group ids must increase strictly, transaction keys must be unique, and both inputs are sets.
@@ -21,8 +22,9 @@ type TxnResult = Committed | Aborted (int, Failure);
 -- Base state sorts before proposals, which sort by transaction key without a sentinel key.
 type Row = Base List(List(int)) | Proposal (int, int, int, List(List(int)), List(List(int)), int);
 
-let initial = input 0 : (((int, int)), (List(List(int)), List(List(int))));
+let initial = input 0 : (((int, int)), (List(List(int))));
 let submitted = input 1 : ((int), (List(((int, int), Change))));
+let registered = input 2 : (((int, int)), (List(List(int))));
 -- Canonicalize command frontiers once; committed starts and writes already have this invariant.
 let transactions = submitted | map((txn, (groups)) ->
     let groups = groups map ((id, change) ->
@@ -59,7 +61,7 @@ let checks = groups | map((txn, (id, index, change)) ->
         CreateAppend ((_, start, upper, _) -> (2, start, upper))) in
     (txn, (id, index, kind, lower, upper)));
 let touched = checks | map((_, (id, _, _, _, _)) -> ((id), ())) | distinct;
-let bases = initial | join(touched, (id, (_, write), ()) -> (id, write inject Base));
+let bases = initial | join(touched, (id, (write), ()) -> (id, write inject Base));
 
 res: {
     let excluded = checks | join(rejected, (txn, group, ()) -> (txn, group));
@@ -108,7 +110,7 @@ let registry_add = committed_groups | flatmap((_, (id, _, change)) -> (id, chang
     CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, start)) enlist)))
     | map((_, (_, row)) -> row);
 -- Probe the resident catalog before projecting; a row projection would scan the whole cohort.
-let starts = (initial | join(touched, (id, (start, _), ()) -> (id, (start))))
+let starts = (registered | join(touched, (id, (start), ()) -> (id, (start))))
            + (registry_add | map((id, (_, start)) -> (id, (start))));
 let effects = committed_groups | map(((txn), (id, index, change)) -> ((id), (txn, index, change)))
               | join(starts, ((id), (txn, index, change), (start)) -> ((txn, index), (id, start, change)));
@@ -131,15 +133,17 @@ output "manifest_add" = manifest_ordered | map((_, (id, lower, upper, since, bat
 -- Feed these conclusions into input 0 after retracting this batch's commands.
 -- Values sort by transaction key, so the final element is the latest accepted effect.
 -- Selecting it directly avoids negating transaction keys, including the minimum integer.
-let next_initial = effects | map(((txn, _), (id, start, change)) ->
+let next_initial = effects | map(((txn, _), (id, _, change)) ->
     let write = change match (
         Create ((_, lower) -> lower),
         Append ((_, upper, _) -> upper),
         CreateAppend ((_, _, upper, _) -> upper)) in
-    ((id), (txn, start, write)))
+    ((id), (txn, write)))
     | reduce((_, vals) ->
         let entries = vals map ((entry, _) -> entry) in
         let last = ((entries len, 1) sub enlist, entries) gather in
-        last map ((_, start, write) -> ((start, write), 1)));
+        last map ((_, write) -> ((write), 1)));
 let old_initial = next_initial | join(initial, (id, _, old) -> (id, old));
 output "initial_delta" = next_initial - old_initial;
+-- Feed these into input 2: starts of ledgers this batch creates.
+output "registered_delta" = registry_add | map((id, (_, start)) -> (id, (start)));

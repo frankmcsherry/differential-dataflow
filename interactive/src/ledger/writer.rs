@@ -57,7 +57,8 @@ impl Writer {
         let (root, state) = log::load(store.as_ref(), &name)?;
         let width = state.registry.values().map(|entry| entry.shape.time_width).max().unwrap_or(0);
         let widths = state.registry.iter().map(|(id, entry)| (*id, entry.shape.time_width)).collect();
-        let engine = Engine::new(&resolver, initial(&state, width))?;
+        let (current, registered) = initial(&state, width);
+        let engine = Engine::new(&resolver, current, registered)?;
         Ok(Self { store, name, resolver, engine: Some(engine), root, width, widths,
             pending: Vec::new(), flight: None, completed: BTreeMap::new(), failure: None,
             owner: Id::new_v4(), next: 0 })
@@ -190,7 +191,8 @@ impl Writer {
         let (root, state) = log::load(self.store.as_ref(), &self.name)?;
         let width = minimum_width.max(state.registry.values().map(|entry| entry.shape.time_width).max().unwrap_or(0));
         self.engine.take();
-        self.engine = Some(Engine::new(&self.resolver, initial(&state, width))?);
+        let (current, registered) = initial(&state, width);
+        self.engine = Some(Engine::new(&self.resolver, current, registered)?);
         self.root = root;
         self.width = width;
         self.widths = state.registry.iter().map(|(id, entry)| (*id, entry.shape.time_width)).collect();
@@ -250,17 +252,21 @@ impl Drop for Writer {
     }
 }
 
-fn initial(state: &State, width: usize) -> Updates {
+/// Write frontiers, which every append changes, apart from starts, which only creations add.
+fn initial(state: &State, width: usize) -> (Updates, Updates) {
     let mut entries = state.registry.iter().map(|(id, entry)| (*id, (entry, &entry.start))).collect::<BTreeMap<_, _>>();
     for span in &state.manifest {
         if let Some((_, write)) = entries.get_mut(&span.id) { *write = &span.upper; }
     }
-    Updates {
+    let current = Updates {
         keys: corgi::Value::Prod(vec![resolve::ids(entries.keys().copied())]),
-        vals: corgi::Value::Prod(vec![
-            resolve::frontiers(entries.values().map(|(entry, _)| &entry.start), width),
-            resolve::frontiers(entries.values().map(|(_, write)| *write), width),
-        ]),
+        vals: corgi::Value::Prod(vec![resolve::frontiers(entries.values().map(|(_, write)| *write), width)]),
         diffs: vec![1; entries.len()],
-    }
+    };
+    let registered = Updates {
+        keys: corgi::Value::Prod(vec![resolve::ids(entries.keys().copied())]),
+        vals: corgi::Value::Prod(vec![resolve::frontiers(entries.values().map(|(entry, _)| &entry.start), width)]),
+        diffs: vec![1; entries.len()],
+    };
+    (current, registered)
 }
