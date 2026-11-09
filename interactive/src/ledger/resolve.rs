@@ -31,7 +31,7 @@ impl Resolver {
         if workers == 0 { return Err(Error::Invalid("the resolver needs at least one worker")); }
         let program = std::panic::catch_unwind(|| {
             let mut program = crate::lower::lower_tree(crate::parse::pipe::parse(include_str!("../../model/transactions_keyed.ddp")));
-            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "registry_add" | "manifest_add" | "manifest_ordered" | "initial_delta"));
+            program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "aborted" | "registry_add" | "manifest_add" | "manifest_ordered" | "initial_delta"));
             crate::passes::optimize(&mut program);
             program
         }).map_err(|_| Error::Resolve("cannot compile transaction rules".into()))?;
@@ -372,7 +372,7 @@ fn conclusions(before: &State, transactions: &[Transaction], outputs: BTreeMap<S
         updates.vals = wide(updates.vals)?;
         Ok((name, updates))
     }).collect::<Result<BTreeMap<_, _>, Error>>()?;
-    let outcomes = outcomes(output(&outputs, "results")?, transactions)?;
+    let outcomes = outcomes(output(&outputs, "results")?, transactions, false)?;
 
     let additions = output(&outputs, "registry_add")?;
     let mut registrations = BTreeMap::new();
@@ -428,9 +428,10 @@ fn conclusions(before: &State, transactions: &[Transaction], outputs: BTreeMap<S
     Ok(Resolution { state, outcomes })
 }
 
-/// Read outcome columns after widening their integer leaves once.
-pub(super) fn outcomes(results: &Updates, transactions: &[Transaction]) -> Result<BTreeMap<i64, Result<(), Rejection>>, Error> {
-    let mut outcomes = BTreeMap::new();
+/// Read full results or failure-only columns after widening their integer leaves once.
+pub(super) fn outcomes(results: &Updates, transactions: &[Transaction], failures_only: bool) -> Result<BTreeMap<i64, Result<(), Rejection>>, Error> {
+    let mut outcomes = if failures_only { transactions.iter().map(|(key, _)| (*key, Ok(()))).collect() } else { BTreeMap::new() };
+    let mut seen = BTreeSet::new();
     for index in 0..results.len() {
         let [key] = Row { value: &results.keys, index }.product()?;
         let [result] = Row { value: &results.vals, index }.product()?;
@@ -452,7 +453,10 @@ pub(super) fn outcomes(results: &Updates, transactions: &[Transaction]) -> Resul
             }
             _ => return Err(corrupt("invalid transaction result tag")),
         };
-        if outcomes.insert(key.integer()?, result).is_some() { return Err(corrupt("duplicate transaction result")); }
+        let key = key.integer()?;
+        if !seen.insert(key) { return Err(corrupt("duplicate transaction result")); }
+        if failures_only && result.is_ok() { return Err(corrupt("failure output contains a success")); }
+        outcomes.insert(key, result);
     }
     if outcomes.len() != transactions.len() || transactions.iter().any(|(key, groups)| {
         outcomes.get(key).is_none_or(|result| result.as_ref().is_err_and(|failure| failure.group >= groups.len()))

@@ -19,7 +19,7 @@ type Change = Create (List(int), List(List(int)))
 type Failure = Write List(List(int)) | Exists (int, int) | UnknownLedger (int, int) | Invalid;
 type TxnResult = Committed | Aborted (int, Failure);
 -- Base state sorts before proposals, which sort by transaction key without a sentinel key.
-type Row = Base (List(List(int)), List(List(int))) | Proposal (int, int, Change, int);
+type Row = Base List(List(int)) | Proposal (int, int, int, List(List(int)), List(List(int)), int);
 
 let initial = input 0 : (((int, int)), (List(List(int)), List(List(int))));
 let submitted = input 1 : ((int), (List(((int, int), Change))));
@@ -51,49 +51,47 @@ let invalid_transactions = transactions | join(invalid, (txn, groups, _) -> (txn
 let valid = transactions - invalid_transactions;
 let groups = valid | flatmap((txn, (groups)) -> groups)
                    | map(((txn), (index, (id, change))) -> ((txn), (id, index, change)));
-let touched = groups | map((_, (id, _, _)) -> ((id), ())) | distinct;
-let bases = initial | join(touched, (id, (start, write), ()) -> (id, (start, write) inject Base));
+-- Project control metadata once; opaque shapes and payloads stay outside the recursion.
+let checks = groups | map((txn, (id, index, change)) ->
+    let (kind, lower, upper) = change match (
+        Create ((_, start) -> (0, start, start)),
+        Append ((lower, upper, _) -> (1, lower, upper)),
+        CreateAppend ((_, start, upper, _) -> (2, start, upper))) in
+    (txn, (id, index, kind, lower, upper)));
+let touched = checks | map((_, (id, _, _, _, _)) -> ((id), ())) | distinct;
+let bases = initial | join(touched, (id, (_, write), ()) -> (id, write inject Base));
 
 res: {
-    let excluded = groups | join(rejected, (txn, group, ()) -> (txn, group));
-    let proposals = ((groups - excluded) | map((txn, (id, index, change)) -> ((id), (txn.0, index, change, 1) inject Proposal)))
-                  + (excluded | map((txn, (id, index, change)) -> ((id), (txn.0, index, change, 0) inject Proposal)));
+    let excluded = checks | join(rejected, (txn, group, ()) -> (txn, group));
+    let proposals = ((checks - excluded) | map(((txn), (id, index, kind, lower, upper)) ->
+                        ((id), (txn, index, kind, lower, upper, 1) inject Proposal)))
+                  + (excluded | map(((txn), (id, index, kind, lower, upper)) ->
+                        ((id), (txn, index, kind, lower, upper, 0) inject Proposal)));
 
-    -- A ledger carries only its existence, start, and write frontier through its proposals.
+    -- A ledger carries only existence and its write frontier through its proposals.
     -- Local failures cannot change state, even before rejection propagates from other ledgers.
-    let checked = (bases + proposals) | reduce(((id), vals) ->
+    let bad = (bases + proposals) | reduce(((id), vals) ->
         let no_frontier = [] : List(List(int)) in
         let entries = vals map ((row, _) -> row) in
-        let final = ((id, 0, no_frontier, no_frontier), entries) foldscan ((state, row) ->
+        let final = ((0, no_frontier), entries) foldscan ((state, row) ->
             (state, row) cap_sum match (
-                Base (((id, _, _, _), (start, write)) -> ((id, 1, start, write), (0, 0, 0, start, () inject Committed))),
-                Proposal (((id, known, start, write), (txn, index, change, eligible)) ->
-                    let (kind, lower, upper) = change match (
-                        Create ((_, start) -> (0, start, start)),
-                        Append ((lower, upper, _) -> (1, lower, upper)),
-                        CreateAppend ((_, start, upper, _) -> (2, start, upper))) in
+                Base (((_, _), write) -> ((1, write), (0, 0, 0, write))),
+                Proposal (((known, write), (txn, index, kind, lower, upper, eligible)) ->
                     let creating = (kind, 1) ne in
                     let matches = (lower, write) call frontier_eq in
-                    let status = (creating,
-                        (known, (index, id inject Exists) inject Aborted, () inject Committed) select,
-                        (known,
-                            (matches, () inject Committed, (index, write inject Write) inject Aborted) select,
-                            (index, id inject UnknownLedger) inject Aborted) select) select in
-                    let success = status match (Committed (_ -> 1), Aborted (_ -> 0)) in
-                    let apply = (success, eligible) and in
-                    let create = (apply, creating) and in
-                    ((id, (create, 1, known) select,
-                      (create, lower, start) select,
-                      (apply, upper, write) select),
-                     (1, txn, index, (creating, lower, start) select, status))))) in
-        (final.1, 1) enlist)
-        | flatmap((id, checks) -> checks)
-        | filter((_, (_, (proposal, _, _, _, _))) -> (proposal, 1) eq)
-        | map(((id), (_, (_, txn, index, start, status))) -> ((txn, index), (id, start, status)));
-
-    let bad = checked | filter((_, (_, _, status)) -> status match (Committed (_ -> 0), Aborted (_ -> 1)))
-                      | map(((txn, index), (_, _, status)) -> ((txn), status match (
-                          Committed (_ -> (0, () inject Invalid)), Aborted (failure -> failure))));
+                    let code = (creating,
+                        (known, 2, 0) select,
+                        (known, (matches, 0, 1) select, 3) select) select in
+                    let apply = ((code, 0) eq, eligible) and in
+                    let next_known = ((apply, creating) and, 1, known) select in
+                    let next_write = (apply, upper, write) select in
+                    ((next_known, next_write), (txn, index, code, write))))) in
+        let failed = (final.1 map ((_, _, code, _) -> (code, 0) ne), final.1) zip filter in
+        (id, failed) cap_list map ((id, (txn, index, code, write)) ->
+            let failure = ((code, 1) eq, write inject Write,
+                ((code, 2) eq, id inject Exists, id inject UnknownLedger) select) select in
+            ((txn, index, failure), 1)))
+        | map((_, (txn, index, failure)) -> ((txn), (index, failure)));
     set rejected = bad | map((txn, _) -> (txn, ())) | distinct;
 }
 
@@ -102,17 +100,24 @@ let failures = res::bad | min;
 let rejected = res::rejected;
 let accepted = valid - (valid | join(rejected, (txn, changes, ()) -> (txn, changes)));
 let committed_groups = groups - (groups | join(rejected, (txn, group, ()) -> (txn, group)));
-let effects = (committed_groups | map(((txn), (id, index, change)) -> ((txn, index), (id, change))))
-              | join(res::checked, (key, (id, change), (_, start, _)) -> (key, (id, start, change)));
 
-output "results" = (accepted | map((txn, _) -> (txn, (() inject Committed))))
-                 + (failures | map((txn, failure) -> (txn, (failure inject Aborted))))
-                 + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
-output "registry_add" = effects | flatmap((_, (id, _, change)) -> (id, change) cap_sum match (
+-- Successful creations supply starts for all accepted effects on their new ledgers.
+let registry_add = committed_groups | flatmap((_, (id, _, change)) -> (id, change) cap_sum match (
     Create ((id, (shape, start)) -> ((id), (shape, start)) enlist),
     Append (_ -> [] : List((((int, int)), (List(int), List(List(int)))))),
     CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, start)) enlist)))
     | map((_, (_, row)) -> row);
+-- Probe the resident catalog before projecting; a row projection would scan the whole cohort.
+let starts = (initial | join(touched, (id, (start, _), ()) -> (id, (start))))
+           + (registry_add | map((id, (_, start)) -> (id, (start))));
+let effects = committed_groups | map(((txn), (id, index, change)) -> ((id), (txn, index, change)))
+              | join(starts, ((id), (txn, index, change), (start)) -> ((txn, index), (id, start, change)));
+
+let aborted = (failures | map((txn, failure) -> (txn, (failure inject Aborted))))
+            + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
+output "results" = (accepted | map((txn, _) -> (txn, (() inject Committed)))) + aborted;
+output "aborted" = aborted;
+output "registry_add" = registry_add;
 let manifest_ordered = effects | flatmap((_, (id, start, change)) -> ((id, start), change) cap_sum match (
     Create (_ ->
         let empty = [] : List((((int, int)), (List(List(int)), List(List(int)), List(List(int))))) in

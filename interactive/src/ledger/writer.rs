@@ -200,10 +200,10 @@ impl Writer {
     fn resolve(&mut self, number: u64, transactions: Vec<Transaction>) -> Result<Batch, Error> {
         let outputs = self.engine.as_mut().ok_or(Error::Invalid("writer has no evaluator"))?
             .resolve(resolve::commands(&transactions, self.width)?)?;
-        let mut results = resolve::output(&outputs, "results")?.clone();
+        let mut results = resolve::output(&outputs, "aborted")?.clone();
         results.keys = resolve::wide(results.keys)?;
         results.vals = resolve::wide(results.vals)?;
-        let outcomes = resolve::outcomes(&results, &transactions)?;
+        let outcomes = resolve::outcomes(&results, &transactions, true)?;
         let delta = Delta { registry: resolve::output(&outputs, "registry_add")?.clone(),
             manifest: resolve::output(&outputs, "manifest_ordered")?.clone() };
         let mut ordered = transactions.iter().collect::<Vec<_>>();

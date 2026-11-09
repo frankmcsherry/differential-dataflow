@@ -32,7 +32,8 @@ impl Engine {
             receivers.push(Mutex::new(receiver));
         }
         let mut program = resolver.program.clone();
-        program.root.exports.retain(|output| matches!(output.name.as_str(), "results" | "registry_add" | "manifest_ordered" | "initial_delta"));
+        program.root.exports.retain(|output| matches!(output.name.as_str(), "aborted" | "registry_add" | "manifest_ordered" | "initial_delta"));
+        crate::passes::optimize(&mut program);
         for import in &mut program.root.imports {
             if matches!(import.from, crate::scope_ir::Source::Input(0)) {
                 import.from = crate::scope_ir::Source::Trace(crate::server::output_name("catalog", "current"));
