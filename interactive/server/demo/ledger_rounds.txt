@@ -1,0 +1,37 @@
+# Ledger transactions as rounds on the stock server (see interactive/model/transactions_keyed.ddp).
+#
+# The catalog program holds each ledger's write frontier and start as arrangements.
+# Each round loads the rules against the catalog, feeds transactions as rows, ticks, reads the outcomes,
+# feeds the conclusions back into the catalog, and drops the rules.
+# Nothing here is durable: committing a round's conclusions to a store is not yet a server feature.
+#
+# Transaction 10 creates ledger (0,1) and appends [0,1). Transaction 20 appends at a stale frontier and is
+# rejected with the ledger's actual write frontier. Transaction 30 appends [1,2) and creates ledger (0,2).
+# Transaction 40 names an unknown ledger in its second group, so none of it commits.
+#
+#   ./target/release/ddir_server < interactive/server/demo/ledger_rounds.txt
+
+load cat begin
+let current = input 0 : (((int, int)), (List(List(int))));
+let registered = input 1 : (((int, int)), (List(List(int))));
+output "current" = current;
+output "registered" = registered;
+cat end-load
+tick
+load res from interactive/model/transactions_keyed.ddp input0=cat::current input2=cat::registered
+feed res 1 begin
+10 val=tuple(list(tuple(tuple(0,1),inject(2,tuple(list(1,2),list(list(0)),list(list(1)),inject(0,tuple()))))))
+20 val=tuple(list(tuple(tuple(0,1),inject(1,tuple(list(list(0)),list(list(5)),inject(0,tuple()))))))
+30 val=tuple(list(tuple(tuple(0,1),inject(1,tuple(list(list(1)),list(list(2)),inject(0,tuple())))),tuple(tuple(0,2),inject(0,tuple(list(1,2),list(list(0)))))))
+40 val=tuple(list(tuple(tuple(0,1),inject(1,tuple(list(list(2)),list(list(3)),inject(0,tuple())))),tuple(tuple(0,9),inject(1,tuple(list(list(0)),list(list(1)),inject(0,tuple()))))))
+end-feed
+tick
+peek res::results
+peek res::manifest_add
+feed cat 0 from res::initial_delta
+feed cat 1 from res::registered_delta
+drop res
+tick
+peek cat::current
+peek cat::registered
+exit
