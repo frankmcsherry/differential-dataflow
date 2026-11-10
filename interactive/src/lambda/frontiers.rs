@@ -1,7 +1,9 @@
 //! Shared frontier operations over `List(List(int))` antichains of product times.
 //! Comparisons ignore order, duplicates, and dominated points.
 //! Normalize, join, and meet return sorted minimal antichains, retaining the input time width.
-//! All points within an operation's row must have the same width; an empty frontier has no width witness.
+//! Points of different widths may meet in one row: a missing trailing coordinate is the minimum, as in `PointStamp`.
+//! No well-shaped input is an error, so a request with ragged times cannot stop a dataflow.
+//! Results have the widest width seen in their row; an empty frontier has no width witness.
 
 use std::sync::{Arc, OnceLock};
 
@@ -72,7 +74,8 @@ impl FrontierRef<'_> {
         // This remains valid for unordered, repeated, or dominated input points.
         (other.lower..other.upper).all(|b| {
             (self.lower..self.upper).any(|a| {
-                self.point(a).iter().zip(other.point(b)).all(|(a, b)| a <= b)
+                let (a, b) = (self.point(a), other.point(b));
+                (0..a.len().max(b.len())).all(|i| a.get(i).copied().unwrap_or(i64::MIN) <= b.get(i).copied().unwrap_or(i64::MIN))
             })
         })
     }
@@ -100,20 +103,14 @@ impl Frontiers {
         Ok(Self { frontiers, times, coordinates })
     }
 
-    fn row<'a>(&'a self, coordinates: &'a [i64], row: usize, width: &mut Option<usize>, name: &str) -> Result<FrontierRef<'a>, String> {
+    /// The row's frontier; `width` grows to the widest of its points.
+    fn row<'a>(&'a self, coordinates: &'a [i64], row: usize, width: &mut Option<usize>) -> FrontierRef<'a> {
         let (lo, hi) = span(&self.frontiers, row);
-        // Check every point before comparisons can short-circuit, including dominated points.
         for index in lo..hi {
             let (lo, hi) = span(&self.times, index);
-            if let Some(width) = *width {
-                if hi - lo != width {
-                    return Err(format!("{name}: time widths differ: {width} and {}", hi - lo));
-                }
-            } else {
-                *width = Some(hi - lo);
-            }
+            *width = Some(width.map_or(hi - lo, |width| width.max(hi - lo)));
         }
-        Ok(FrontierRef { times: &self.times, coordinates, lower: lo, upper: hi })
+        FrontierRef { times: &self.times, coordinates, lower: lo, upper: hi }
     }
 }
 
@@ -146,9 +143,9 @@ impl HostKernel for Kernel {
         let mut coordinates = Vec::new();
         for row in 0..rows(&left.frontiers) {
             let mut width = None;
-            let left = left.row(&left_coordinates, row, &mut width, self.name)?;
+            let left = left.row(&left_coordinates, row, &mut width);
             let right = match (&right, &right_coordinates) {
-                (Some(right), Some(coordinates)) => Some(right.row(coordinates, row, &mut width, self.name)?),
+                (Some(right), Some(coordinates)) => Some(right.row(coordinates, row, &mut width)),
                 _ => None,
             };
             let frontier = match self.operation {
@@ -247,15 +244,18 @@ mod tests {
     }
 
     #[test]
-    fn widths_are_checked_even_for_dominated_points() {
-        for name in &NAMES[..5] {
-            for args in [pair(vec![vec![0]], vec![vec![0, 0]]),
-                         pair(vec![vec![0, 0], vec![1]], vec![])] {
-                assert!(evaluate(name, args).unwrap_err().contains("time widths differ"));
-            }
-        }
+    fn mixed_widths_compare_with_missing_coordinates_as_the_minimum() {
+        // [0] reads as [0, MIN], strictly before [0, 0]; nothing is an error.
+        let args = pair(vec![vec![0]], vec![vec![0, 0]]);
+        assert_eq!(evaluate("frontier_le", args.clone()).unwrap(), Value::int([1]));
+        assert_eq!(evaluate("frontier_lt", args.clone()).unwrap(), Value::int([1]));
+        assert_eq!(evaluate("frontier_eq", args.clone()).unwrap(), Value::int([0]));
+        assert_eq!(evaluate("frontier_join", args.clone()).unwrap(), column(&[vec![vec![0, 0]]]));
+        assert_eq!(evaluate("frontier_meet", args).unwrap(), column(&[vec![vec![0, i64::MIN]]]));
+        // Results take the widest width in their row, here from a dominated point.
         let input = column(&[vec![vec![0, 0], vec![1]]]);
-        assert!(evaluate("frontier_normalize", input).unwrap_err().contains("time widths differ"));
+        assert_eq!(evaluate("frontier_normalize", input).unwrap(), column(&[vec![vec![0, 0], vec![1, i64::MIN]]]));
+        assert_eq!(evaluate("frontier_le", pair(vec![vec![0, 0], vec![1]], vec![])).unwrap(), Value::int([1]));
     }
 
     #[test]

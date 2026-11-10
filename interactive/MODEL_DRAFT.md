@@ -1,9 +1,9 @@
 # Ledgers: the model (draft)
 
-This is a draft to replace `model.md`.
-It states what a ledger is, what may change a set of ledgers, and what any implementation must guarantee.
-It is written from the design notes of 9 and 10 November 2026; items there are cited as D1, P1 and so on.
+This states what a ledger is, what may change a set of ledgers, and what any implementation must guarantee.
+It is a draft, written from the design notes of 9 and 10 November 2026.
 The DDIR in it is excerpted from [`model/ledger.ddp`](model/ledger.ddp), which runs on the server.
+The rules it describes are [`model/resolve.ddp`](model/resolve.ddp), and [`tests/ledgers.rs`](tests/ledgers.rs) checks each against the other.
 
 ## Ledgers
 
@@ -109,15 +109,18 @@ type Action = Create (id, shape, width, start, clock)
 -- requests : ((tx), (List(Action)))
 ```
 
-A transaction names a ledger in at most one `Create` and at most one `Append`, the `Create` first.
+A transaction lists its actions in order of ledger id, a `Create` before an `Append` of the same ledger.
+So it names a ledger in at most one `Create` and at most one `Append`, and this can be checked from the request alone.
 
-* `Create` succeeds if the id is not registered and, when it names a clock, that clock is registered with the same width.
+* `Create` succeeds if the id is not registered and, when it names a clock, that clock was registered before the round, with the same width.
   It adds the registration.
 * `Append` succeeds if the ledger is registered, `seqno` equals its version, `lower` equals its write frontier, and `lower` is strictly before `upper`.
   It adds the span `(seqno, lower, upper, start, batch)`: a new span's `since` is the ledger's start.
 
 A transaction COMMITS if every one of its actions succeeds, in order, and otherwise it is REJECTED and changes nothing.
-A rejection names the first action that failed and why: the ledger's actual version and write frontier, an id already registered, an id not registered, or a request that is invalid in itself.
+A rejection names the first action that failed and why: a stale append, an id already registered, an id not registered, or a request that is invalid in itself.
+A stale append is told the ledger's version and write frontier as the round leaves them, which is where a retry must begin.
+A request is invalid in itself if its actions are out of order, a frontier's times differ in width, an append's lower is not strictly before its upper, or its times are not of the ledger's width.
 
 The writer of a batch vouches for it: its updates have the ledger's shapes, and lie in the span.
 The rules do not open a batch.
@@ -186,29 +189,37 @@ None of this is built.
 
 ## Not settled
 
-1. **Rounds are weaker than serial transactions,** as described under Rounds. This follows from letting a clock's advance not contend with appends; is it acceptable as stated?
-2. **Which frontier a rejection reports.** The rules report the write frontier as it stood when the rejected action was judged, which may already be stale: a transaction with a later key in the same round may have advanced the ledger.
-   In the resolver demo a writer whose keys sort before the winner's is told the old frontier every round, and never catches up until the winner stops.
-   Reporting the frontier as the round leaves it would fix that.
-3. **Width and clocks.** A follower must have its clock's width, so a follower's width could be taken from its clock instead of stated.
-4. **What a root's register holds.** Perhaps the list of the root manifest's spans, or the hash of a blob that holds it.
-5. **Whether DDIR's own times should be ints.** Ledger times are ints and DDIR's are unsigned. They match in structure, and the question is put off.
-6. **Transactions across manifests, skipping resolution for deterministic ledgers, and commits across independent roots** are deferred or ruled out for now; see the design notes.
+1. **Rounds are weaker than serial transactions,** as described under Rounds.
+   This follows from letting a clock's advance not contend with appends; is it acceptable as stated?
+   It matters if clocks are to be used for mutual exclusion, where advancing a clock is meant to fence another writer out.
+2. **A slow writer behind a busy clock.** An append's lower must equal the write frontier, and a clock's advance moves the write frontier of every follower.
+   A writer that takes longer than a round to answer a rejection is stale again when it does.
+   In the resolver demo a slow writer landed nothing while its clock advanced every round, and everything once the clock stopped.
+   Letting a lower be later than the write frontier, which amounts to an implied empty span, would let such a writer aim ahead of the clock.
+3. **Ties.** Among transactions that could each commit alone, the one with the least key wins, every round.
+   In the resolver demo one of three writers to a shared ledger won 15 rounds running.
+4. **Width and clocks.** A follower must have its clock's width, so a follower's width could be taken from its clock instead of stated.
+5. **What a root's register holds.** Perhaps the list of the root manifest's spans, or the hash of a blob that holds it.
+6. **Whether DDIR's own times should be ints.** Ledger times are ints and DDIR's are unsigned. They match in structure, and the question is put off.
+7. **Transactions across manifests, skipping resolution for deterministic ledgers, and commits across independent roots** are deferred or ruled out for now; see the design notes.
 
 ## Where the code stands
 
-* `model/ledger.ddp` runs: the state, the views above and the invariants.
+* **The model runs.** `model/ledger.ddp` is the state, the write frontier and the invariants.
   `server/demo/ledger_views.txt` shows the write frontiers under a two-level clock tree, and then breaks each invariant once.
-* `model/transactions_clocks.ddp` resolves rounds, with clocks read as of the round's start.
-  It differs from this model in five ways:
-  it has no `seqno`;
-  it has a combined create-and-append in place of two actions;
-  what a ledger follows is fed to it directly, not taken from `Create`;
-  it pads times with the most negative int;
-  and it requires a transaction's ledgers in increasing id order.
-* `server/demo/ledger_resolver.py` runs a resolver fed by nine client sessions and pumped by a tenth, all on the stock server.
-  Clients create ledgers, append to many at once, contend on a shared ledger, advance a clock, and append to a follower behind it; every outcome is checked.
-  It leans on three things the server does not do itself: clients choose their own transaction keys, an outside session pumps the rounds, and outcomes pile up in a program nobody trims.
-* The frontier kernels stop the server when asked to join frontiers of different widths.
-  So the width check of `Create` must run before any join, and the `mismatched` view cannot be shown failing.
-* Nothing in the server commits a round durably, confirms outcomes afterwards, or rebuilds its state from a manifest.
+* **The rules run.** `model/resolve.ddp` resolves one round as described above.
+  `server/demo/ledger_rounds.txt` runs three rounds on the stock server.
+* **They are checked against each other.** `tests/ledgers.rs` runs rounds of the rules, and after each has the model derive the indexes from the manifest alone; they must agree, and every invariant must hold.
+* **Many sessions can feed one resolver.** `server/demo/ledger_resolver.py` has nine client sessions and a tenth that pumps the rounds.
+* **Rounds can be made durable, and recovered.** `bench/ledger/fabric.py` writes each round's change to the manifest as a blob and swaps a root file.
+  With `--check` it kills the server, rebuilds the manifest from the log, derives the indexes with the model, and checks the invariants.
+  Its measurements are in `bench/ledger/README.md`.
+* **Frontier comparisons never fail.** They take times of different widths, reading a missing coordinate as before every int, so a ragged request cannot stop a server.
+  The rules reject such requests before comparing them.
+
+What the server does not do itself, and a driver does from outside:
+
+* commit a round durably, and release its outcomes only afterwards;
+* rebuild its state from a manifest when it starts;
+* pump the rounds, and assign transaction keys;
+* read a ledger's batches from blobs, or write them: every batch so far is empty.

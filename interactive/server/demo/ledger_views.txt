@@ -1,4 +1,4 @@
-# The state of a set of ledgers and its derived views (see interactive/model/ledger.ddp and MODEL_DRAFT.md).
+# The state of a set of ledgers and its derived views (see interactive/model/ledger.ddp and interactive/model.md).
 #
 # First a valid state: the write frontiers under a two-level clock tree, and every invariant view empty.
 # Then one row that breaks each invariant, and the views that report it.
@@ -33,9 +33,12 @@ peek ledgers::skipped
 peek ledgers::early
 peek ledgers::unclocked
 peek ledgers::mismatched
-# Now break each invariant once.
+# Now break each invariant once: a span with lower at its upper (ledger 1), a span of an unregistered
+# ledger (77), a version used twice and one skipped (ledger 3), a span that begins before the last
+# ended (clock 8), a clock that is not registered (ledger 4), and a clock of another width (ledger 5).
 feed ledgers 0 begin
 tuple(tuple(0,4)) val=tuple(list(1,2),1,list(list(0)),inject(1,tuple(0,55)))
+tuple(tuple(0,5)) val=tuple(list(1,2),2,list(list(0,0)),inject(1,tuple(0,9)))
 end-feed
 feed ledgers 1 begin
 tuple(tuple(0,1)) val=tuple(0,list(list(4)),list(list(4)),list(list(0)),inject(0,tuple()))

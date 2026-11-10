@@ -44,6 +44,9 @@ wf: {
 output "follows" = follows;
 output "own" = own;
 output "write" = wf::write;
+-- REGISTERED: each ledger's width and start. With `own` and `follows`, these are the indexes
+-- a resolver keeps beside the manifest, and can rebuild from it.
+output "registered" = registrations | map((id, (_, width, start, _)) -> (id, (width, start)));
 
 -- INVARIANTS: each of these must be empty.
 
