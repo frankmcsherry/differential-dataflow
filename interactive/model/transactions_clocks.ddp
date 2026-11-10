@@ -1,0 +1,171 @@
+-- Ordered atomic transactions, resolved separately for each ledger id, with clocks.
+-- This is transactions_keyed.ddp with one addition: a ledger may follow a clock.
+-- A clock is an ordinary ledger, usually one that holds no data, and clocks may follow clocks.
+-- A ledger's write frontier is the join of its own last upper with the write frontiers of
+-- every clock above it, as they stood when this round began.
+-- An append to a clock therefore advances all its followers at once, with no row for any of them,
+-- and takes effect after this round's appends to those followers.
+-- Input 3 says which clock each ledger follows; a ledger with no row follows none.
+-- Input 0 is a derived view of committed write frontiers, which change with every append.
+-- Input 1 holds grouped transactions; UUID words replace the byte lists in transactions.ddp.
+-- Input 2 is a derived view of committed registration starts, which change only with creations.
+-- Ledger ids are two signed words, each biased by its sign bit to preserve UUID byte order.
+-- Frontiers use uniformly padded integer products; public and durable UUIDs remain byte lists.
+-- Group ids must increase strictly, transaction keys must be unique, and both inputs are sets.
+--
+-- Every valid group is checked, even while its transaction is rejected elsewhere.
+-- Rejection suppresses effects, not checks, and is recomputed rather than accumulated.
+-- A transaction's verdict depends only on earlier transactions' effects.
+-- This gives a unique fixed point, including when a speculative rejection becomes acceptance.
+-- Empty transactions commit; structural invalidity takes precedence over state-dependent failures.
+
+type Payload = Empty | Inline List(int) | Blob List(int);
+type Change = Create (List(int), List(List(int)))
+            | Append (List(List(int)), List(List(int)), Payload)
+            | CreateAppend (List(int), List(List(int)), List(List(int)), Payload);
+type Failure = Write List(List(int)) | Exists (int, int) | UnknownLedger (int, int) | Invalid;
+type TxnResult = Committed | Aborted (int, Failure);
+-- Base state sorts before floors, and floors before proposals, which sort by transaction key without a sentinel key.
+type Row = Base List(List(int)) | Floor List(List(int)) | Proposal (int, int, int, List(List(int)), List(List(int)), int);
+
+let initial = input 0 : (((int, int)), (List(List(int))));
+let submitted = input 1 : ((int), (List(((int, int), Change))));
+let registered = input 2 : (((int, int)), (List(List(int))));
+let follows = input 3 : (((int, int)), ((int, int)));
+-- Canonicalize command frontiers once; committed starts and writes already have this invariant.
+let transactions = submitted | map((txn, (groups)) ->
+    let groups = groups map ((id, change) ->
+        let change = change match (
+            Create ((shape, start) -> (shape, start call frontier_normalize) inject Create),
+            Append ((lower, upper, batch) ->
+                (lower call frontier_normalize, upper call frontier_normalize, batch) inject Append),
+            CreateAppend ((shape, start, upper, batch) ->
+                (shape, start call frontier_normalize, upper call frontier_normalize, batch) inject CreateAppend)) in
+        (id, change)) in
+    (txn, (groups)));
+
+-- Structural validation is independent of committed state and speculative outcomes.
+let invalid = transactions | map((txn, (groups)) ->
+    let first = (0, 0) in
+    let checked = ((first, 0, 0, -1), groups) fold (((previous, seen, index, failure), (id, change)) ->
+        let ordered = (seen, (previous, id) lt, 1) select in
+        let bounds = change match (
+            Create (_ -> 1),
+            Append ((lower, upper, _) -> (lower, upper) call frontier_lt),
+            CreateAppend ((_, start, upper, _) -> (start, upper) call frontier_lt)) in
+        let bad = ((ordered, bounds) and, 0) eq in
+        (id, 1, (index, 1) add, (((failure, 0) lt, bad) and, index, failure) select)) in
+    (txn, (checked.3))) | filter((_, (index)) -> (index, 0) ge);
+let invalid_transactions = transactions | join(invalid, (txn, groups, _) -> (txn, groups));
+let valid = transactions - invalid_transactions;
+let groups = valid | flatmap((txn, (groups)) -> groups)
+                   | map(((txn), (index, (id, change))) -> ((txn), (id, index, change)));
+-- Project control metadata once; opaque shapes and payloads stay outside the recursion.
+let checks = groups | map((txn, (id, index, change)) ->
+    let (kind, lower, upper) = change match (
+        Create ((_, start) -> (0, start, start)),
+        Append ((lower, upper, _) -> (1, lower, upper)),
+        CreateAppend ((_, start, upper, _) -> (2, start, upper))) in
+    (txn, (id, index, kind, lower, upper)));
+let touched = checks | map((_, (id, _, _, _, _)) -> ((id), ())) | distinct;
+-- Probe the resident write frontiers once, at the touched ledgers; later uses read this small collection.
+let probed = initial | join(touched, (id, (write), ()) -> (id, (write)));
+let bases = probed | map((id, (write)) -> (id, write inject Base));
+
+-- Every clock above a touched ledger: the clock it follows, the clock that one follows, and so on.
+-- Only touched ledgers climb the tree, so an idle follower costs nothing here.
+up: {
+    let next = above | map(((id), (clock)) -> ((clock), (id)))
+                     | join(follows, ((clock), (id), (parent)) -> ((id), (parent)));
+    set above = ((touched | join(follows, ((id), (), (clock)) -> ((id), (clock)))) + next) | distinct;
+}
+-- Each such clock's own write frontier, from the resident state, becomes a floor under the ledger.
+let floors = up::above | map(((id), (clock)) -> ((clock), (id)))
+           | join(initial, ((clock), (id), (write)) -> ((id), write inject Floor));
+
+res: {
+    let excluded = checks | join(rejected, (txn, group, ()) -> (txn, group));
+    let proposals = ((checks - excluded) | map(((txn), (id, index, kind, lower, upper)) ->
+                        ((id), (txn, index, kind, lower, upper, 1) inject Proposal)))
+                  + (excluded | map(((txn), (id, index, kind, lower, upper)) ->
+                        ((id), (txn, index, kind, lower, upper, 0) inject Proposal)));
+
+    -- A ledger carries only existence and its write frontier through its proposals.
+    -- Local failures cannot change state, even before rejection propagates from other ledgers.
+    let bad = (bases + floors + proposals) | reduce(((id), vals) ->
+        let no_frontier = [] : List(List(int)) in
+        let entries = vals map ((row, _) -> row) in
+        let final = ((0, no_frontier), entries) foldscan ((state, row) ->
+            (state, row) cap_sum match (
+                Base (((_, _), write) -> ((1, write), (0, 0, 0, write))),
+                Floor (((known, write), floor) ->
+                    ((known, (known, (write, floor) call frontier_join, write) select), (0, 0, 0, floor))),
+                Proposal (((known, write), (txn, index, kind, lower, upper, eligible)) ->
+                    let creating = (kind, 1) ne in
+                    let matches = (lower, write) call frontier_eq in
+                    let code = (creating,
+                        (known, 2, 0) select,
+                        (known, (matches, 0, 1) select, 3) select) select in
+                    let apply = ((code, 0) eq, eligible) and in
+                    let next_known = ((apply, creating) and, 1, known) select in
+                    let next_write = (apply, upper, write) select in
+                    ((next_known, next_write), (txn, index, code, write))))) in
+        let failed = (final.1 map ((_, _, code, _) -> (code, 0) ne), final.1) zip filter in
+        (id, failed) cap_list map ((id, (txn, index, code, write)) ->
+            let failure = ((code, 1) eq, write inject Write,
+                ((code, 2) eq, id inject Exists, id inject UnknownLedger) select) select in
+            ((txn, index, failure), 1)))
+        | map((_, (txn, index, failure)) -> ((txn), (index, failure)));
+    set rejected = bad | map((txn, _) -> (txn, ())) | distinct;
+}
+
+-- Choose the first failing group after all speculative decisions have stabilized.
+let failures = res::bad | min;
+let rejected = res::rejected;
+let accepted = valid - (valid | join(rejected, (txn, changes, ()) -> (txn, changes)));
+let committed_groups = groups - (groups | join(rejected, (txn, group, ()) -> (txn, group)));
+
+-- Successful creations supply starts for all accepted effects on their new ledgers.
+let registry_add = committed_groups | flatmap((_, (id, _, change)) -> (id, change) cap_sum match (
+    Create ((id, (shape, start)) -> ((id), (shape, start)) enlist),
+    Append (_ -> [] : List((((int, int)), (List(int), List(List(int)))))),
+    CreateAppend ((id, (shape, start, _, _)) -> ((id), (shape, start)) enlist)))
+    | map((_, (_, row)) -> row);
+-- Probe the resident catalog before projecting; a row projection would scan the whole cohort.
+let starts = (registered | join(touched, (id, (start), ()) -> (id, (start))))
+           + (registry_add | map((id, (_, start)) -> (id, (start))));
+let effects = committed_groups | map(((txn), (id, index, change)) -> ((id), (txn, index, change)))
+              | join(starts, ((id), (txn, index, change), (start)) -> ((txn, index), (id, start, change)));
+
+let aborted = (failures | map((txn, failure) -> (txn, (failure inject Aborted))))
+            + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
+output "results" = (accepted | map((txn, _) -> (txn, (() inject Committed)))) + aborted;
+output "aborted" = aborted;
+output "registry_add" = registry_add;
+let manifest_ordered = effects | flatmap((_, (id, start, change)) -> ((id, start), change) cap_sum match (
+    Create (_ ->
+        let empty = [] : List((((int, int)), (List(List(int)), List(List(int)), List(List(int))))) in
+        empty map ((id, (lo, hi, since)) -> (id, (lo, hi, since, () inject Empty)))),
+    Append (((id, start), (lower, upper, batch)) -> ((id), (lower, upper, start, batch)) enlist),
+    CreateAppend (((id, start), (_, lower, upper, batch)) -> ((id), (lower, upper, start, batch)) enlist)))
+    | map((key, (_, ((id), (lower, upper, since, batch)))) -> (key, (id, lower, upper, since, batch)));
+output "manifest_ordered" = manifest_ordered;
+output "manifest_add" = manifest_ordered | map((_, (id, lower, upper, since, batch)) -> ((id), (lower, upper, since, batch)));
+
+-- Feed these conclusions into input 0 after retracting this batch's commands.
+-- Values sort by transaction key, so the final element is the latest accepted effect.
+-- Selecting it directly avoids negating transaction keys, including the minimum integer.
+let next_initial = effects | map(((txn, _), (id, _, change)) ->
+    let write = change match (
+        Create ((_, lower) -> lower),
+        Append ((_, upper, _) -> upper),
+        CreateAppend ((_, _, upper, _) -> upper)) in
+    ((id), (txn, write)))
+    | reduce((_, vals) ->
+        let entries = vals map ((entry, _) -> entry) in
+        let last = ((entries len, 1) sub enlist, entries) gather in
+        last map ((_, write) -> ((write), 1)));
+let old_initial = next_initial | join(probed, (id, _, old) -> (id, old));
+output "initial_delta" = next_initial - old_initial;
+-- Feed these into input 2: starts of ledgers this batch creates.
+output "registered_delta" = registry_add | map((id, (_, start)) -> (id, (start)));

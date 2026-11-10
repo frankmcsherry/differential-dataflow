@@ -1,0 +1,78 @@
+# Ledger transactions with clocks, on the stock server (see interactive/model/transactions_clocks.ddp).
+#
+# A clock is an ordinary ledger. A ledger that follows a clock has, as its write frontier, the join of its
+# own last upper and the clock's write frontier as it stood when the round began. One append to a clock
+# advances every follower, with no row for any of them.
+#
+# Each round loads the rules against the catalog, feeds transactions, ticks, reads the rejections,
+# feeds the conclusions back into the catalog, and drops the rules.
+#
+#   ./target/release/ddir_server < interactive/server/demo/ledger_clocks.txt
+
+load cat begin
+let current = input 0 : (((int, int)), (List(List(int))));
+let registered = input 1 : (((int, int)), (List(List(int))));
+let follows = input 2 : (((int, int)), ((int, int)));
+output "current" = current;
+output "registered" = registered;
+output "follows" = follows;
+cat end-load
+# Ledgers 1 and 2 follow clock 9; clock 9 follows clock 8; ledger 3 follows nothing.
+feed cat 0 begin
+tuple(tuple(0,1)) val=tuple(list(list(0)))
+tuple(tuple(0,2)) val=tuple(list(list(0)))
+tuple(tuple(0,3)) val=tuple(list(list(0)))
+tuple(tuple(0,8)) val=tuple(list(list(0)))
+tuple(tuple(0,9)) val=tuple(list(list(0)))
+end-feed
+feed cat 1 begin
+tuple(tuple(0,1)) val=tuple(list(list(0)))
+tuple(tuple(0,2)) val=tuple(list(list(0)))
+tuple(tuple(0,3)) val=tuple(list(list(0)))
+tuple(tuple(0,8)) val=tuple(list(list(0)))
+tuple(tuple(0,9)) val=tuple(list(list(0)))
+end-feed
+feed cat 2 begin
+tuple(tuple(0,1)) val=tuple(tuple(0,9))
+tuple(tuple(0,2)) val=tuple(tuple(0,9))
+tuple(tuple(0,9)) val=tuple(tuple(0,8))
+end-feed
+tick
+# Round 1: ledger 2 appends [0,3) and clock 9 advances [0,5) in the same round: both commit.
+load res from interactive/model/transactions_clocks.ddp input0=cat::current input2=cat::registered input3=cat::follows
+feed res 1 begin
+10 val=tuple(list(tuple(tuple(0,2),inject(1,tuple(list(list(0)),list(list(3)),inject(0,tuple()))))))
+20 val=tuple(list(tuple(tuple(0,9),inject(1,tuple(list(list(0)),list(list(5)),inject(0,tuple()))))))
+end-feed
+tick
+peek res::aborted
+feed cat 0 from res::initial_delta
+drop res
+tick
+peek cat::current
+# Round 2: ledger 1 at its own frontier [0] fails (clock says 5); ledger 2 at its own [3] fails; both at [5] commit;
+# ledger 3 follows nothing and appends at [0]; clock 8 advances to [7], which lifts 9's followers next round.
+load res from interactive/model/transactions_clocks.ddp input0=cat::current input2=cat::registered input3=cat::follows
+feed res 1 begin
+10 val=tuple(list(tuple(tuple(0,1),inject(1,tuple(list(list(0)),list(list(6)),inject(0,tuple()))))))
+20 val=tuple(list(tuple(tuple(0,2),inject(1,tuple(list(list(3)),list(list(6)),inject(0,tuple()))))))
+30 val=tuple(list(tuple(tuple(0,1),inject(1,tuple(list(list(5)),list(list(6)),inject(0,tuple()))))))
+40 val=tuple(list(tuple(tuple(0,3),inject(1,tuple(list(list(0)),list(list(1)),inject(0,tuple()))))))
+50 val=tuple(list(tuple(tuple(0,8),inject(1,tuple(list(list(0)),list(list(7)),inject(0,tuple()))))))
+end-feed
+tick
+peek res::aborted
+feed cat 0 from res::initial_delta
+drop res
+tick
+peek cat::current
+# Round 3: ledger 2 (own [3], clock 9 at [5], clock 8 at [7]) must now start at [7].
+load res from interactive/model/transactions_clocks.ddp input0=cat::current input2=cat::registered input3=cat::follows
+feed res 1 begin
+10 val=tuple(list(tuple(tuple(0,2),inject(1,tuple(list(list(5)),list(list(8)),inject(0,tuple()))))))
+20 val=tuple(list(tuple(tuple(0,2),inject(1,tuple(list(list(7)),list(list(8)),inject(0,tuple()))))))
+end-feed
+tick
+peek res::aborted
+peek res::manifest_add
+exit
