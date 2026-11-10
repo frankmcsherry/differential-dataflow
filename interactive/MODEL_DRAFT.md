@@ -21,6 +21,7 @@ A SPAN is a durable statement about part of a ledger: `(seqno, lower, upper, sin
 * `since` is a frontier; the span's updates accumulate correctly at any time at or after `since`.
 * `batch` says where the updates are: nowhere, because there are none; inline; or in a blob named by its hash.
 * `seqno` numbers the ledger's spans: 0, 1, 2 and so on.
+  It lets a reader tell a span that is missing from a stretch of time that a clock passed over.
 
 A ledger's VERSION is the number of its spans.
 A ledger is identified by an id, which reveals nothing about it.
@@ -186,7 +187,9 @@ None of this is built.
 ## Not settled
 
 1. **Rounds are weaker than serial transactions,** as described under Rounds. This follows from letting a clock's advance not contend with appends; is it acceptable as stated?
-2. **Spans carry `seqno`.** The agreed sketch of `spans` had no `seqno`; it is added here so that invariant 3 can be stated and readers can check completeness. A compacted span would carry a range.
+2. **Which frontier a rejection reports.** The rules report the write frontier as it stood when the rejected action was judged, which may already be stale: a transaction with a later key in the same round may have advanced the ledger.
+   In the resolver demo a writer whose keys sort before the winner's is told the old frontier every round, and never catches up until the winner stops.
+   Reporting the frontier as the round leaves it would fix that.
 3. **Width and clocks.** A follower must have its clock's width, so a follower's width could be taken from its clock instead of stated.
 4. **What a root's register holds.** Perhaps the list of the root manifest's spans, or the hash of a blob that holds it.
 5. **Whether DDIR's own times should be ints.** Ledger times are ints and DDIR's are unsigned. They match in structure, and the question is put off.
@@ -203,6 +206,9 @@ None of this is built.
   what a ledger follows is fed to it directly, not taken from `Create`;
   it pads times with the most negative int;
   and it requires a transaction's ledgers in increasing id order.
+* `server/demo/ledger_resolver.py` runs a resolver fed by nine client sessions and pumped by a tenth, all on the stock server.
+  Clients create ledgers, append to many at once, contend on a shared ledger, advance a clock, and append to a follower behind it; every outcome is checked.
+  It leans on three things the server does not do itself: clients choose their own transaction keys, an outside session pumps the rounds, and outcomes pile up in a program nobody trims.
 * The frontier kernels stop the server when asked to join frontiers of different widths.
   So the width check of `Create` must run before any join, and the `mismatched` view cannot be shown failing.
 * Nothing in the server commits a round durably, confirms outcomes afterwards, or rebuilds its state from a manifest.

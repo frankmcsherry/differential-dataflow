@@ -139,6 +139,8 @@ let effects = committed_groups | map(((txn), (id, index, change)) -> ((id), (txn
 
 let aborted = (failures | map((txn, failure) -> (txn, (failure inject Aborted))))
             + (invalid | map((txn, (index)) -> (txn, ((index, () inject Invalid) inject Aborted))));
+-- The requests this round took, so that whoever holds them can retract them.
+output "taken" = submitted;
 output "results" = (accepted | map((txn, _) -> (txn, (() inject Committed)))) + aborted;
 output "aborted" = aborted;
 output "registry_add" = registry_add;
