@@ -528,6 +528,23 @@ where
     (chunk.len_() > 0).then(|| settle_one(chunk))
 }
 
+/// Build a `ChunkBatch<CorgiChunk>` from runs of columns that are each sorted and consolidated,
+/// and that follow one another in order: nothing is sorted, and each update is copied at most
+/// once, as the runs are packed into chunks. `None` if the runs hold nothing.
+pub(crate) fn sorted_runs_to_batch<T, R>(runs: impl Iterator<Item = (CValue, CValue, ColTimes<T>, Vec<R>)>) -> Option<ChunkBatch<CorgiChunk<T, R>>>
+where
+    T: ColTime,
+    R: Semigroup + Clone + 'static,
+{
+    let mut input: VecDeque<_> = runs.filter(|run| !run.3.is_empty())
+        .map(|(keys, vals, times, diffs)| CorgiChunk::from_parts(keys, hold_wide(vals), times, diffs))
+        .collect();
+    if input.is_empty() { return None; }
+    let mut output = VecDeque::new();
+    CorgiChunk::settle(&mut input, true, &mut output);
+    Some(ChunkBatch::new(output.into()))
+}
+
 /// As [`columns_to_nonempty_batch`], for tests whose columns are known to hold updates.
 #[cfg(test)]
 pub(crate) fn columns_to_batch<T, R>(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> ChunkBatch<CorgiChunk<T, R>>
@@ -642,6 +659,7 @@ pub(crate) fn ident(keys: &CValue) -> &[i64] {
 
 /// The integer identifier of each row of a [`present_key`] column: the key's own values when it is
 /// an integer, and the prepended hash lane otherwise. Never re-hashes.
+#[cfg(test)]
 pub(crate) fn key_ids(keys: &CValue) -> Vec<i64> {
     ident(keys).to_vec()
 }

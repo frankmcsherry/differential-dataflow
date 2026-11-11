@@ -58,7 +58,7 @@ use corgi::{Bounds, Demand, Graph, NumOp, Shape, Value as CValue};
 
 use crate::runtime::col_times::{ColTime, ColTimes};
 use crate::runtime::search::matching_ranges;
-use crate::runtime::chunk::{colliding_keys, columns_to_nonempty_batch, ident, key_ids, key_is_hashed, recover_key, recover_key_ref, CorgiChunk};
+use crate::runtime::chunk::{colliding_keys, columns_to_nonempty_batch, ident, sorted_runs_to_batch, key_is_hashed, recover_key, recover_key_ref, CorgiChunk};
 use crate::lambda::compile_reduce;
 use crate::ir::{Diff, Reducer};
 
@@ -171,6 +171,10 @@ pub(crate) struct CorgiReduceBackend<T> {
     rows: (Vec<(usize, usize)>, Vec<u64>, ColTimes<T>, Vec<Diff>),
     /// The output of the keys completed here, as columns, in no order and not consolidated.
     completed: Vec<Columns<T>>,
+    /// Whether the retire's output so far is only the reducer's rows for keys with no output
+    /// before. While it is, those rows are kept in key order, as they may then be sorted and
+    /// consolidated as they stand, which `finish` tests.
+    fresh: bool,
     /// Input records per window, bounding what the presentations cost at once.
     window_size: usize,
     /// The retire in progress.
@@ -261,6 +265,7 @@ impl<T> CorgiReduceBackend<T> {
             key_columns: Vec::new(),
             rows: (Vec::new(), Vec::new(), ColTimes::default(), Vec::new()),
             completed: Vec::new(),
+            fresh: true,
             window_size: window_size.max(1),
             retire: Retire::default(),
         }
@@ -382,10 +387,24 @@ where
 }
 
 /// A retire's keys, ascending: those the novel batches touch, and those the harness says are due.
+///
+/// Each chunk holds its keys in order, so its distinct keys are read in one pass, and the chunks'
+/// lists and the due keys are sorted together only if there is more than one of them.
 fn retire_keys<T: ColTime>(novel_chunks: &[&CorgiChunk<T, Diff>], due: &Due<T, i64>) -> Vec<i64> {
-    let mut keys: Vec<i64> = novel_chunks.iter().flat_map(|chunk| key_ids(chunk.keys())).chain(due.keys()).collect();
-    keys.sort_unstable();
-    keys.dedup();
+    let (mut keys, mut lists) = (Vec::new(), 0);
+    for chunk in novel_chunks {
+        let (lane, before) = (ident(chunk.keys()), keys.len());
+        keys.extend(lane.iter().enumerate().filter(|(row, key)| *row == 0 || lane[row - 1] != **key).map(|(_, key)| *key));
+        lists += (keys.len() > before) as usize;
+    }
+    let before = keys.len();
+    keys.extend(due.keys());
+    lists += (keys.len() > before) as usize;
+    if lists > 1 {
+        // A stable sort merges runs that are already in order.
+        keys.sort();
+        keys.dedup();
+    }
     keys
 }
 
@@ -725,6 +744,7 @@ where
     fn begin(&mut self, _description: Description<T>) {
         self.rows = (Vec::new(), Vec::new(), ColTimes::default(), Vec::new());
         self.completed.clear();
+        self.fresh = true;
     }
 
     fn next_window(&mut self, instance: &ReduceInstance<'_, T, CBatch<T>, CBatch<T>>, due: &Due<T, i64>, from: &mut KeyPosition<i64>, window: &mut ReduceWindow<T, Diff, Diff, i64>, pended: &mut Vec<(T, i64)>) {
@@ -927,6 +947,21 @@ where
         let select: Vec<usize> = (0..out_rows.labels.len()).filter(|row| !out_rows.before[*row] && is_direct(out_rows.labels[*row] as usize)).collect();
         net(&out_rows, &select, &out_chunks, &self.output.columns[..out_chunks.len()], &direct, keys, |_, _, _| unreachable!("the selected rows are not at or before their key's time"), pended);
 
+        self.fresh &= out_rows.labels.is_empty() && window.input.is_empty() && window.output.is_empty();
+        // The lists in key order, while that may spare the output a sort.
+        if self.fresh && !lists.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            let mut order: Vec<usize> = (0..lists.len()).collect();
+            order.sort_by_key(|list| lists[*list].0);
+            let (old_ends, old_chunks, old_rows, old_diffs) = (std::mem::take(&mut ends), std::mem::take(&mut chunks), std::mem::take(&mut rows), std::mem::take(&mut diffs));
+            for list in order.iter() {
+                let range = (if *list == 0 { 0 } else { old_ends[list - 1] })..old_ends[*list];
+                chunks.extend_from_slice(&old_chunks[range.clone()]);
+                rows.extend_from_slice(&old_rows[range.clone()]);
+                diffs.extend_from_slice(&old_diffs[range]);
+                ends.push(rows.len());
+            }
+            lists = order.into_iter().map(|list| lists[list]).collect();
+        }
         // The reducer's rows, each at its key's time.
         if !lists.is_empty() {
             let (vals, diffs, ends) = self.reduce_rows(ends, &chunks, &rows, diffs, lists.iter().map(|list| list.1).collect());
@@ -1156,6 +1191,18 @@ where
         // tactic emitted for the keys it was presented.
         let (key_rows, ids, times, diffs) = std::mem::take(&mut self.rows);
         let mut parts = std::mem::take(&mut self.completed);
+        // Parts whose keys' identifiers strictly ascend, within each and from each to the next,
+        // hold one update to a key, in order: they are sorted and consolidated as they stand.
+        // A hydration's are, when its reducer gives each key one value.
+        if times.is_empty() {
+            let mut last = None;
+            let ascending = parts.iter().all(|part| {
+                part.diffs.iter().all(|diff| *diff != 0) && ident(&part.keys).iter().all(|id| last.replace(*id).is_none_or(|before| before < *id))
+            });
+            if ascending {
+                return sorted_runs_to_batch(parts.into_iter().map(|part| (part.keys, part.vals, part.times, part.diffs))).map(Rc::new);
+            }
+        }
         if !times.is_empty() {
             let keys = gather_refs(&self.key_columns, key_rows.into_iter());
             parts.push(Columns { keys, vals: self.output.gather(&ids), times, diffs });
@@ -1183,6 +1230,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::chunk::key_ids;
     use std::collections::{BTreeMap, BTreeSet};
     use crate::runtime::chunk::present_key;
     use crate::ir::Time;
