@@ -197,38 +197,13 @@ impl<T> ColTimes<T> {
         Ordering::Equal
     }
 
-    /// Whether every row of `rows` is the time with coordinates `time`, zero beyond their length.
-    pub(crate) fn all_equal(&self, rows: std::ops::Range<usize>, time: &[u64]) -> bool {
-        (0..self.lanes.len().max(time.len())).all(|j| {
-            let coordinate = time.get(j).copied().unwrap_or(0);
-            match self.lanes.get(j) {
-                Some(lane) => lane[rows.clone()].iter().all(|&x| x == coordinate),
-                None => coordinate == 0 || rows.is_empty(),
-            }
-        })
-    }
-
-    /// Whether every row of `rows` is less than or equal, in the partial order, to the time with
-    /// coordinates `time`, zero beyond their length.
-    pub(crate) fn all_less_equal(&self, rows: std::ops::Range<usize>, time: &[u64]) -> bool {
-        self.lanes.iter().enumerate().all(|(j, lane)| {
-            let coordinate = time.get(j).copied().unwrap_or(0);
-            lane[rows.clone()].iter().all(|&x| x <= coordinate)
-        })
+    /// Whether the rows of `rows` are all one time.
+    pub(crate) fn uniform(&self, rows: std::ops::Range<usize>) -> bool {
+        self.lanes.iter().all(|lane| lane[rows.clone()].iter().all(|x| *x == lane[rows.start]))
     }
 
     /// Coordinate `j` of row `i`, zero beyond the column's width.
     pub(crate) fn coordinate(&self, j: usize, i: usize) -> u64 { self.at(j, i) }
-
-    /// Whether row `i` is less than or equal, in the partial order, to the time with coordinates `time`.
-    pub(crate) fn less_equal_coordinates(&self, i: usize, time: &[u64]) -> bool {
-        self.lanes.iter().enumerate().all(|(j, lane)| lane[i] <= time.get(j).copied().unwrap_or(0))
-    }
-
-    /// The owned time at row `i` joined with the time with coordinates `time`.
-    pub(crate) fn get_joined_coordinates(&self, i: usize, time: &[u64]) -> T where T: Lanes {
-        T::from_coordinates((0..self.lanes.len().max(time.len())).map(|j| self.at(j, i).max(time.get(j).copied().unwrap_or(0))))
-    }
 
     /// Whether row `i` is less than or equal to row `j` in the partial order.
     fn less_equal(&self, i: usize, j: usize) -> bool {
