@@ -2,8 +2,13 @@
 //!
 //! A conventional differential reduce against ordered, copyable proxies.
 //! The backend supplies their interpretation.
+//!
+//! The backend asks for the tactic's help a key at a time.
+//! It may *complete* a key itself where [`direct`] finds the one time the key can change at in the retire, or *present* the key for the tactic to sweep.
+//! A completed key costs the backend one evaluation over records it need not name, time, or order for anyone else.
+//! What the tactic offers is the schedule for a key with several times to evaluate at: which they are, in what order, and what each must read.
 
-use super::pending::Pending;
+use super::pending::{Due, Pending};
 
 use timely::progress::{Antichain, Timestamp};
 use timely::progress::frontier::AntichainRef;
@@ -25,6 +30,144 @@ pub struct ReduceInstance<'a, T, B1, B2> {
     pub output_batches: &'a [B2],
     /// The compaction frontier for loading (the retire's lower bound).
     pub lower: AntichainRef<'a, T>,
+    /// The retire's upper bound: times at or beyond it are carried, not evaluated.
+    pub upper: AntichainRef<'a, T>,
+    /// The backend must present every key, and complete none itself.
+    ///
+    /// Set by a caller that reads the presentations other than as the backend stores them,
+    /// as [`BackendFrontier`](super::BackendFrontier) does for a retire it reads as of a frontier.
+    pub present_all: bool,
+}
+
+impl<T, B1, B2> Clone for ReduceInstance<'_, T, B1, B2> {
+    fn clone(&self) -> Self { *self }
+}
+impl<T, B1, B2> Copy for ReduceInstance<'_, T, B1, B2> {}
+
+/// The one time a key's reduction can change at in a retire, if there is such a time.
+///
+/// `seeds` are the key's due times and the raw times of its novel updates, and `records` the times of its input and output records.
+/// The answer is `Some(at)` when `at` is the key's only seed, is not at or beyond `upper`, and every record is either at or before `at`,
+/// or joins with `at` to a time at or beyond `upper`.
+///
+/// Each interesting time of the key is a join of a seed with records. Here that is `at`, or the join of `at` with records
+/// not at or before it, which the retire does not reach. So the retire evaluates the key at `at` alone, where the accumulations
+/// are the records at or before `at`. The other records' joins with `at` are times to carry to later retires.
+/// Records that net to nothing, once those of one value are advanced to their joins with `at`, carry no time.
+///
+/// A backend may complete such a key itself rather than present it: evaluate once over the records at or before `at`,
+/// commit the difference at `at`, and report the times to carry.
+/// This function is the test, so that no backend restates it; a backend that reads times in its own layout must agree with it.
+pub fn direct<'a, T: Timestamp + Lattice>(
+    seeds: impl IntoIterator<Item = &'a T>,
+    records: impl IntoIterator<Item = &'a T>,
+    upper: AntichainRef<'_, T>,
+) -> Option<&'a T> {
+    let mut seeds = seeds.into_iter();
+    let at = seeds.next()?;
+    (seeds.all(|seed| seed == at)
+        && !upper.less_equal(at)
+        && records.into_iter().all(|time| time.less_equal(at) || upper.less_equal(&time.join(at)))
+    ).then_some(at)
+}
+
+/// The times a completed key's `records` carry: the joins with `at` of those not at or before it,
+/// less the ones whose records net to nothing once advanced so.
+fn carry<T: Timestamp + Lattice, K: Copy, V: Copy + Ord, R: Semigroup + Clone>(
+    key: K,
+    at: &T,
+    records: &[((K, V), T, R)],
+    scratch: &mut Vec<((V, T), R)>,
+    pended: &mut Vec<(T, K)>,
+) {
+    scratch.clear();
+    scratch.extend(records.iter().filter(|record| !record.1.less_equal(at)).map(|record| ((record.0.1, record.1.join(at)), record.2.clone())));
+    crate::consolidation::consolidate(scratch);
+    pended.extend(scratch.drain(..).map(|((_, time), _)| (time, key)));
+}
+
+/// Completes the [`direct`] keys of a wholly presented `window`, and leaves presented those that are not.
+///
+/// The reference way for a backend to complete keys: `next_window` presents every key, as it would when asked to
+/// present all, and then calls this. Each direct key is evaluated once through the backend's own
+/// [`reduce_corrections`](ProxyReduceBackend::reduce_corrections) and removed from the window. The corrections are
+/// returned, consolidated and at each key's time, for the backend to commit as [`emit`](ProxyReduceBackend::emit)
+/// would; they are not emitted here, as a backend may need them in key order with the window's later ones.
+/// The times the completed keys carry are added to `pended`.
+///
+/// A backend that can find its direct keys before presenting them saves the presentation too, which this does not.
+pub fn complete_direct<T, B1, B2, Bk>(
+    backend: &mut Bk,
+    instance: &ReduceInstance<'_, T, B1, B2>,
+    due: &Due<T, Bk::Key>,
+    window: &mut ReduceWindow<T, Bk::RIn, Bk::ROut, Bk::Key, Bk::VIn, Bk::VOut>,
+    pended: &mut Vec<(T, Bk::Key)>,
+) -> Vec<((Bk::Key, Bk::VOut), T, Bk::ROut)>
+where
+    T: Timestamp + Lattice,
+    Bk: ProxyReduceBackend<T, B1, B2> + ?Sized,
+{
+    let mut deltas = Vec::new();
+    if instance.present_all { return deltas; }
+    let ReduceWindow { input, seeds, output } = window;
+    // The direct keys' brackets, and the time of each.
+    let (mut keys, mut ats) = (Vec::new(), Vec::new());
+    let (mut in_ends, mut in_all, mut out_ends, mut out_all) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut in_carry, mut out_carry) = (Vec::new(), Vec::new());
+    // Read and write positions in each presentation: kept keys move down over completed ones.
+    let (mut is, mut ns, mut os, mut ds) = (0, 0, 0, 0);
+    let (mut iw, mut nw, mut ow) = (0, 0, 0);
+    while let Some(key) = [
+        input.get(is).map(|record| record.0.0),
+        seeds.get(ns).map(|seed| seed.0),
+        output.get(os).map(|record| record.0.0),
+    ].into_iter().flatten().min() {
+        let (i0, n0, o0) = (is, ns, os);
+        while is < input.len() && input[is].0.0 == key { is += 1; }
+        while ns < seeds.len() && seeds[ns].0 == key { ns += 1; }
+        while os < output.len() && output[os].0.0 == key { os += 1; }
+        while ds < due.rows.len() && due.rows[ds].0 < key { ds += 1; }
+        let d0 = ds;
+        while ds < due.rows.len() && due.rows[ds].0 == key { ds += 1; }
+        let at = direct(
+            due.rows[d0..ds].iter().map(|row| &due.times[row.1]).chain(seeds[n0..ns].iter().map(|seed| &seed.1)),
+            input[i0..is].iter().map(|record| &record.1).chain(output[o0..os].iter().map(|record| &record.1)),
+            instance.upper,
+        ).cloned();
+        if let Some(at) = at {
+            let (in_start, out_start) = (in_all.len(), out_all.len());
+            in_all.extend(input[i0..is].iter().filter(|record| record.1.less_equal(&at)).map(|record| (record.0.1, record.2.clone())));
+            out_all.extend(output[o0..os].iter().filter(|record| record.1.less_equal(&at)).map(|record| (record.0.1, record.2.clone())));
+            carry(key, &at, &input[i0..is], &mut in_carry, pended);
+            carry(key, &at, &output[o0..os], &mut out_carry, pended);
+            crate::consolidation::consolidate_from(&mut in_all, in_start);
+            crate::consolidation::consolidate_from(&mut out_all, out_start);
+            // As in the sweep: with nothing to read there is nothing to evaluate.
+            if in_all.len() > in_start || out_all.len() > out_start {
+                keys.push(key);
+                ats.push(at);
+                in_ends.push(in_all.len());
+                out_ends.push(out_all.len());
+            }
+        } else {
+            for i in i0..is { input.swap(iw, i); iw += 1; }
+            for n in n0..ns { seeds.swap(nw, n); nw += 1; }
+            for o in o0..os { output.swap(ow, o); ow += 1; }
+        }
+    }
+    input.truncate(iw);
+    seeds.truncate(nw);
+    output.truncate(ow);
+    if !keys.is_empty() {
+        let (corrections, ends) = backend.reduce_corrections(&keys, &in_ends, &in_all, &out_ends, &out_all);
+        let mut start = 0;
+        for ((key, at), end) in keys.iter().zip(&ats).zip(ends) {
+            deltas.extend(corrections[start..end].iter().map(|(id, diff)| ((*key, *id), at.clone(), diff.clone())));
+            start = end;
+        }
+        crate::consolidation::consolidate_updates(&mut deltas);
+    }
+    deltas
 }
 
 /// One window of the key space: the presentations a bounded, key-contiguous snip needs.
@@ -86,16 +229,21 @@ pub trait ProxyReduceBackend<T, B1, B2> {
     /// work in progress, until `finish()` is called.
     fn begin(&mut self, description: Description<T>);
 
-    /// Present the next window of the key space, and advance `from` past it.
+    /// Work through the next window of the key space, and advance `from` past it.
     ///
     /// On entry `from` is `Start` or an inclusive `At(key)` lower bound on keys still to be covered.
     /// The backend writes the window's exclusive upper bound as `At(key)`, or `End` when exhausted.
     /// Each call must strictly advance `from`.
     ///
-    /// The window must cover every key in `[from_before, from_after)` that carries a novel update or appears in `changed`.
-    /// For each key, present merged input (novel and prior together, netted), raw novel time support in `seeds`, and accumulated output.
+    /// The window must cover every key in `[from_before, from_after)` that carries a novel update or is `due`.
+    /// The backend treats each such key in one of two ways.
+    /// It *presents* the key: merged input (novel and prior together, netted), raw novel time support in `seeds`, and accumulated output.
+    /// Or it *completes* the key, which it may do where [`direct`] finds the key's one time, unless [`ReduceInstance::present_all`] is set:
+    /// it evaluates the key once over its input and output at or before that time, commits the difference at that time to the batch
+    /// in progress, as [`emit`](Self::emit) would, and adds to `pended` the times the key carries, as [`direct`] describes.
+    /// A completed key is absent from the window. [`complete_direct`] does this for a window already presented.
     /// A key must be reported entirely within the window that first mentions it: splitting one across windows drops the interaction between the halves.
-    /// `changed` is ascending; the harness reads no key outside the window's range, so a backend that keeps its own key order need not consult the whole space.
+    /// `due` is ascending by key; the harness reads no key outside the window's range, so a backend that keeps its own key order need not consult the whole space.
     ///
     /// `seeds` must be recorded from the novel batches before any consolidation or advancement:
     /// a novel record that nets to zero against compacted history vanishes from `input`, but its
@@ -106,9 +254,10 @@ pub trait ProxyReduceBackend<T, B1, B2> {
     fn next_window(
         &mut self,
         instance: &ReduceInstance<'_, T, B1, B2>,
-        changed: &[Self::Key],
+        due: &Due<T, Self::Key>,
         from: &mut KeyPosition<Self::Key>,
         window: &mut ReduceWindow<T, Self::RIn, Self::ROut, Self::Key, Self::VIn, Self::VOut>,
+        pended: &mut Vec<(T, Self::Key)>,
     );
 
     /// A wave of input-output reconciliation, in which the backend supplies necessary edits.
@@ -190,26 +339,26 @@ where
             input_batches: &input_batches,
             output_batches: &output_batches,
             lower: lower.borrow(),
+            upper: upper.borrow(),
+            present_all: false,
         };
 
         // Split the carried interesting times against `upper`.
-        // A time below it is DUE: its key must be re-evaluated this retire, so the key is `changed`.
+        // A time below it is DUE: its key must be re-evaluated this retire.
         // A time at or beyond it remains carried in `self.pending`.
         // Activate time groups before visiting their keys. Due rows index a shared time table.
+        // The due keys are those the harness knows must be revisited. The backend adds those its novel
+        // batches touch, which it discovers while reading them; neither side scans the whole key space.
         let due = self.pending.activate(upper.borrow());
-        // The keys the harness knows must be revisited. The backend adds those its novel batches
-        // touch, which it discovers while reading them; neither side scans the whole key space.
-        let mut changed: Vec<K> = due.rows.iter().map(|r| r.0).collect();
-        changed.dedup();
         let mut deferred = Vec::new();
         let mut due_pos = 0;
 
         // Nothing due and nothing novel: no time in the interval can be interesting, so there is no
         // work and no output. Return the frontier bounding the times still withheld — NOT an empty
-        // one. This is exactly where a due-only `changed` differs from the whole pending set: times
+        // one. This is exactly where the due times differ from the whole pending set: times
         // beyond `upper` can remain when nothing is due, and releasing their capabilities would
         // strand them (see the frontier clause of the `ReduceTactic::retire` contract).
-        if changed.is_empty() && instance.input_batches.is_empty() {
+        if due.rows.is_empty() && instance.input_batches.is_empty() {
             return (None, self.pending.frontier());
         }
 
@@ -239,7 +388,9 @@ where
         while from != KeyPosition::End {
             let before = from;
             window.clear();
-            self.backend.next_window(&instance, &changed, &mut from, &mut window);
+            self.backend.next_window(&instance, &due, &mut from, &mut window, &mut deferred);
+            // The times the backend's completed keys carry.
+            self.pending.insert(std::mem::take(&mut deferred));
             let p_in = &mut window.input;
             let seeds = &window.seeds;
             let p_out = &mut window.output;
@@ -267,12 +418,13 @@ where
             deltas.clear();
 
             // The window's keys are the proxies its presentations mention: the least of the three
-            // heads, each iteration, until all three are drained. A `changed` key that appears in
-            // none of them has no records at all, so its reduction has nothing to read and nothing
+            // heads, each iteration, until all three are drained. Keys the backend completed itself
+            // are absent, and done. A due key that appears in none of the presentations and was not
+            // completed has no records at all, so its reduction has nothing to read and nothing
             // to retract — the time its due moment would raise reaches the evaluation gate with an
             // empty input and an empty output, and produces nothing. Skipping it is exactly what
-            // visiting it would do. (`changed` is still the backend's instruction about which keys
-            // to present; it is just not a source of keys here.)
+            // visiting it would do. (`due` is still the backend's instruction about which keys
+            // to cover; it is just not a source of keys here.)
             //
             // Each key gets a `Sweep`, which discovers and evaluates in ONE ascending pass,
             // suspending where the conventional reduce would call user logic. Slots are reused

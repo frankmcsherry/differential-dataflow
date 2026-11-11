@@ -937,3 +937,101 @@ fn reduce_as_of_frontier_in_n5() {
     }
     println!("reduce over N5: {units} retires; {exact} exact by the claims; {crossing} where the bound crosses F, of which {} differ exactly: {differ:?}", differ.len());
 }
+
+// ===== Completing and presenting =====
+//
+// A backend may complete a key itself or present it to the tactic. Either way the output is the
+// same collection, and for the reduce the same times are carried. These tests run one backend both
+// ways: as it is, completing what it may, and asked to present every key.
+
+use differential_dataflow::operators::int_proxy::reduce::{ProxyReduceBackend, ReduceInstance, ReduceWindow};
+use differential_dataflow::operators::int_proxy::Due;
+use differential_dataflow::trace::Description;
+
+/// A reduce backend asked to present every key, so that the tactic does all of the work.
+struct PresentAll<B>(B);
+impl<T, B1, B2, B: ProxyReduceBackend<T, B1, B2>> ProxyReduceBackend<T, B1, B2> for PresentAll<B> {
+    type Key = B::Key;
+    type VIn = B::VIn;
+    type VOut = B::VOut;
+    type RIn = B::RIn;
+    type ROut = B::ROut;
+    fn begin(&mut self, description: Description<T>) { self.0.begin(description) }
+    fn next_window(&mut self, instance: &ReduceInstance<'_, T, B1, B2>, due: &Due<T, B::Key>, from: &mut KeyPosition<B::Key>, window: &mut ReduceWindow<T, B::RIn, B::ROut, B::Key, B::VIn, B::VOut>, pended: &mut Vec<(T, B::Key)>) {
+        self.0.next_window(&ReduceInstance { present_all: true, ..*instance }, due, from, window, pended)
+    }
+    fn reduce_corrections(&mut self, keys: &[B::Key], in_ends: &[usize], input: &[(B::VIn, B::RIn)], out_ends: &[usize], output: &[(B::VOut, B::ROut)]) -> (Vec<(B::VOut, B::ROut)>, Vec<usize>) {
+        self.0.reduce_corrections(keys, in_ends, input, out_ends, output)
+    }
+    fn emit(&mut self, records: &[((B::Key, B::VOut), T, B::ROut)]) { self.0.emit(records) }
+    fn finish(&mut self) -> Option<B2> { self.0.finish() }
+}
+
+/// A small deterministic generator.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) % bound
+    }
+}
+
+/// Retires over product times, where a batch holds times incomparable to later seeds, so keys are
+/// direct, swept, and carried: the completing backend and the presenting one must produce the same
+/// batches and carry the same times, retire by retire.
+#[test]
+fn reduce_completing_matches_presenting() {
+    type T = Product<u64, u64>;
+    type Rows = Vec<((u64, u64), T, i64)>;
+    let (mut completed_some, mut swept_some) = (false, false);
+    for seed in 0..20u64 {
+        let mut rng = Lcg(seed);
+        // Retire `i` covers the times at or beyond `(i, i)` and not at or beyond `(i + 1, i + 1)`.
+        let rounds = 5u64;
+        let keys = 1 + rng.next(40);
+        let mut batches: Vec<Rows> = Vec::new();
+        for i in 0..rounds {
+            let mut rows = Rows::new();
+            for _ in 0..rng.next(3 * keys + 1) {
+                // A time on the interval's lower-left boundary: one coordinate is `i`, the other at least `i`.
+                let other = i + rng.next(rounds + 1 - i);
+                let time = if rng.next(2) == 0 { T::new(i, other) } else { T::new(other, i) };
+                rows.push(((rng.next(keys), rng.next(4)), time, if rng.next(3) == 0 { -1 } else { 1 }));
+            }
+            consolidate_updates(&mut rows);
+            batches.push(rows);
+        }
+        for window in [1, usize::MAX] {
+            let run = |present: bool| {
+                let mut completing = ProxyReduceTactic::new(VecReduceBackend::with_window(max_logic as MaxLogic, window));
+                let mut presenting = ProxyReduceTactic::new(PresentAll(VecReduceBackend::with_window(max_logic as MaxLogic, window)));
+                let (mut source, mut outputs, mut produced, mut carried) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut pending: Antichain<T> = Antichain::new();
+                for i in 0..=rounds {
+                    let lower = Antichain::from_elem(T::new(i, i));
+                    // The last retire has no input, and runs to the end of time to evaluate what is carried.
+                    let upper = if i == rounds { Antichain::new() } else { Antichain::from_elem(T::new(i + 1, i + 1)) };
+                    let input: Vec<_> = batches.get(i as usize).filter(|rows| !rows.is_empty()).map(|rows| hbatch(rows.clone(), T::new(i, i), T::new(i + 1, i + 1))).into_iter().collect();
+                    let mut held = pending.clone();
+                    held.insert(T::new(i, i));
+                    let tactic: &mut dyn ReduceTactic<T, _, _> = if present { &mut presenting } else { &mut completing };
+                    let (span, frontier) = tactic.retire(source.clone(), outputs.clone(), input.clone(), &lower, &upper, &held);
+                    let batch: Vec<_> = span.into_iter().filter_map(|s| s.inner).collect();
+                    produced.push(hread(&batch));
+                    carried.push(frontier.clone());
+                    outputs.extend(batch);
+                    source.extend(input);
+                    pending = frontier;
+                }
+                (produced, carried)
+            };
+            let (completed, carried) = run(false);
+            let (presented, carried_presented) = run(true);
+            assert_eq!(completed, presented, "seed {seed}, window {window}: outputs differ");
+            assert_eq!(carried, carried_presented, "seed {seed}, window {window}: carried times differ");
+            swept_some |= carried.iter().any(|frontier| !frontier.is_empty());
+            completed_some |= completed.iter().any(|rows| !rows.is_empty());
+        }
+    }
+    assert!(completed_some && swept_some, "the workload must both produce output and carry times");
+}

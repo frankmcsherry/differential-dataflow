@@ -7,6 +7,12 @@
 //! The tactics elicit proxies, perform time and difference computations, and return proxies to the backend for interpretation.
 //! The backend is oblivious to the navigation of time, and the operator to the backend's implementation.
 //!
+//! A reduce backend asks for this assistance a key at a time, and only where it needs it.
+//! Navigating a key's history matters when the key has many times in play.
+//! A key with one time in play has an output the backend can state itself.
+//! The reduce backend trait therefore lets the backend *complete* a key, or *present* it as proxies for the tactic.
+//! The reduce tactic sees only the presented keys.
+//!
 //! The default proxy types remain `u64`, with the interpretation described below.
 //! Exact key proxies do not require collision handling.
 //!
@@ -71,7 +77,8 @@ pub fn debug_assert_sorted_bridge<T: Ord, R, K: Copy + Ord, V: Copy + Ord>(bridg
 }
 
 pub use join::{JoinInstance, ProxyJoinBackend, ProxyJoinTactic};
-pub use reduce::{ProxyReduceBackend, ProxyReduceTactic, ReduceInstance, ReduceWindow};
+pub use reduce::{complete_direct, direct, ProxyReduceBackend, ProxyReduceTactic, ReduceInstance, ReduceWindow};
+pub use pending::Due;
 pub use frontier::{read_as_of, BackendFrontier};
 
 /// A position between windows of an ordered key space.

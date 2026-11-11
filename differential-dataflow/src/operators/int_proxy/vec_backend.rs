@@ -18,6 +18,11 @@
 //! retraction cancels against its own history. They are minted after the walk consolidates, so a value
 //! whose records all cancel never reaches the tactic and never spends an identifier.
 //!
+//! The backend then completes the window's direct keys itself ([`complete_direct`]), and leaves the
+//! tactic the keys with more than one time to evaluate at. It presents first and completes after, which is
+//! the plainest way to meet the contract; a backend built for speed finds its direct keys before it
+//! presents them.
+//!
 //! The backend clones keys and values like it is being paid to waste cycles.
 //! Generally, this is not a high-performance backend, but shouldn't be abysmal.
 
@@ -35,7 +40,7 @@ use crate::trace::chunk::ChunkBatch;
 use crate::trace::chunk::vec::VecChunk;
 use crate::trace::Description;
 
-use super::{KeyPosition, ProxyReduceBackend, ReduceInstance, ReduceWindow};
+use super::{complete_direct, Due, KeyPosition, ProxyReduceBackend, ReduceInstance, ReduceWindow};
 
 /// The batch type of a hash-keyed [`ChunkSpine`](crate::trace::chunk::vec::ChunkSpine): updates
 /// `D` is `(K, V)` on the input side and `(K, W)` on the output side.
@@ -68,6 +73,9 @@ pub struct VecReduceBackend<K, V, W, T, R, L> {
     chunks: Vec<VecChunk<u64, (K, W), T, R>>,
     /// Scratch to re-order one `emit`'s output by types, rather than transient identifiers.
     stage: Vec<((u64, (K, W)), T, R)>,
+    /// The current window's completed keys' corrections, held to be committed in order with the
+    /// window's presented keys'.
+    done: Vec<((u64, (K, W)), T, R)>,
 }
 
 impl<K, V, W, T, R, L> VecReduceBackend<K, V, W, T, R, L> {
@@ -87,6 +95,7 @@ impl<K, V, W, T, R, L> VecReduceBackend<K, V, W, T, R, L> {
             out_ids: HashMap::new(),
             chunks: Vec::new(),
             stage: Vec::new(),
+            done: Vec::new(),
         }
     }
 }
@@ -109,17 +118,22 @@ where
 
     fn begin(&mut self, _description: Description<T>) {
         self.chunks.clear();
+        self.done.clear();
     }
 
     #[inline(never)]
     fn next_window(
         &mut self,
         instance: &ReduceInstance<'_, T, VBatch<(K, V), T, R>, VBatch<(K, W), T, R>>,
-        changed: &[u64],
+        due: &Due<T, u64>,
         from: &mut KeyPosition<u64>,
         window: &mut ReduceWindow<T, R, R>,
+        pended: &mut Vec<(T, u64)>,
     ) {
+        // The last window's completed keys, if no `emit` followed to commit them.
+        self.commit(&[]);
         let start = match *from { KeyPosition::Start => 0, KeyPosition::At(key) => key, KeyPosition::End => return };
+        let changed: Vec<u64> = due.keys().collect();
 
         // Populating the input bridge and the seeds.
         self.in_pool.clear();
@@ -129,7 +143,7 @@ where
         let mut walk = MergedWalk::new(
             instance.input_batches,
             instance.source_batches,
-            changed,
+            &changed,
             start,
             instance.lower,
         );
@@ -200,6 +214,10 @@ where
         // The two passes each contribute in ascending order, but one after the other.
         self.collisions.sort_unstable();
         self.collisions.dedup();
+
+        // Complete the keys with one time to evaluate at, and hold their corrections for `commit`.
+        let completed = complete_direct(self, instance, due, window, pended);
+        self.done.extend(completed.into_iter().map(|((h, vid), t, d)| ((h, self.out_pool[vid as usize].clone()), t, d)));
     }
 
     #[inline(never)]
@@ -283,8 +301,31 @@ where
     }
 
     #[inline(never)]
-    fn emit(&mut self, records: &[((u64, u64), T, R)]) {
+    fn emit(&mut self, records: &[((u64, u64), T, R)]) { self.commit(records) }
+
+    #[inline(never)]
+    fn finish(&mut self) -> Option<VBatch<(K, W), T, R>> {
+        self.commit(&[]);
+        self.in_pool.clear();
+        self.out_pool.clear();
+        self.out_ids.clear();
+        let chunks = std::mem::take(&mut self.chunks);
+        if chunks.is_empty() { None } else { Some(Rc::new(ChunkBatch::new(chunks))) }
+    }
+}
+
+impl<K, V, W, T, R, L> VecReduceBackend<K, V, W, T, R, L>
+where
+    K: Ord + Clone + 'static,
+    W: Ord + Clone + 'static,
+    T: Lattice + Timestamp,
+    R: Semigroup + Clone + 'static,
+{
+    /// Commit a window's corrections to the batch in progress: those of the keys it completed,
+    /// and `records`, those of the keys it presented, in order together.
+    fn commit(&mut self, records: &[((u64, u64), T, R)]) {
         self.stage.clear();
+        self.stage.append(&mut self.done);
         for ((h, vid), t, d) in records {
             let row = self.out_pool[*vid as usize].clone();
             self.stage.push(((*h, row), t.clone(), d.clone()));
@@ -298,15 +339,6 @@ where
             }
             chunks.last_mut().expect("pushed above if absent").push_into(update);
         }
-    }
-
-    #[inline(never)]
-    fn finish(&mut self) -> Option<VBatch<(K, W), T, R>> {
-        self.in_pool.clear();
-        self.out_pool.clear();
-        self.out_ids.clear();
-        let chunks = std::mem::take(&mut self.chunks);
-        if chunks.is_empty() { None } else { Some(Rc::new(ChunkBatch::new(chunks))) }
     }
 }
 

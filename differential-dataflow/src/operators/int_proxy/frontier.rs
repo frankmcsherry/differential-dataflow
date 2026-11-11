@@ -55,6 +55,13 @@
 //!   `since`, which is all a trace read as of `since` promises its readers anyway: for `t'` beyond
 //!   `since`, `advance(t ∨ c) ≤ t' ⟺ t ≤ t' ∧ c ≤ t'`, and `c ≤ lower ≤` the fresh time `≤ t'`.
 //!
+//! # Keys the inner backend completes
+//!
+//! A reduce backend may complete a key itself rather than present it, and the wrapper sees only
+//! what is presented. Where the wrapper changes nothing, it need not see anything, and the inner
+//! backend is free to complete what it likes. For a retire the wrapper reads, it asks the inner
+//! backend to present every key (`present_all`).
+//!
 //! # The join reads both inputs
 //!
 //! Reading one input of a join as of `since` and reading both agree at every time beyond `since`,
@@ -71,7 +78,7 @@ use crate::trace::Description;
 
 use super::join::{JoinInstance, JoinMatches, ProxyJoinBackend};
 use super::reduce::{ProxyReduceBackend, ReduceInstance, ReduceWindow};
-use super::{KeyPosition, ProxyBridge};
+use super::{Due, KeyPosition, ProxyBridge};
 
 /// A backend whose inputs are read as of `since`: every time the inner backend draws is advanced
 /// by it, and what then coincides is consolidated.
@@ -194,14 +201,18 @@ where
     fn next_window(
         &mut self,
         instance: &ReduceInstance<'_, T, B1, B2>,
-        changed: &[Self::Key],
+        due: &Due<T, Self::Key>,
         from: &mut KeyPosition<Self::Key>,
         window: &mut ReduceWindow<T, Self::RIn, Self::ROut, Self::Key, Self::VIn, Self::VOut>,
+        pended: &mut Vec<(T, Self::Key)>,
     ) {
-        self.inner.next_window(instance, changed, from, window);
         // The retire evaluates only at times at or beyond `lower`; beyond `since`, a record and
         // its advanced self accumulate and synthesize alike.
-        if self.since.is_empty() || instance.lower.iter().all(|time| self.since.less_equal(time)) { return; }
+        if self.since.is_empty() || instance.lower.iter().all(|time| self.since.less_equal(time)) {
+            return self.inner.next_window(instance, due, from, window, pended);
+        }
+        // What is read as of `since` must be presented to be read.
+        self.inner.next_window(&ReduceInstance { present_all: true, ..*instance }, due, from, window, pended);
         // The input, novel and prior merged, is read as of `since`; so is the novel time support,
         // which seeds the retire's interesting times. The output is the operator's own, at times
         // beyond `since` already.
