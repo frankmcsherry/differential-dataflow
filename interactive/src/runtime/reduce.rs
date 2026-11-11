@@ -3,9 +3,19 @@
 //! The tactic (differential's `operators::int_proxy::reduce`) owns the navigation of times over
 //! integer proxies `(key_id, value_id, time, diff)`, for the keys that need it. A key with one
 //! time to evaluate at is *direct* (differential's `int_proxy::direct`): the backend finds these
-//! by comparing time lanes, before it presents anything, and completes them itself. It sorts and
-//! nets their values as for any key, but presents nothing, and builds a time only for a record
-//! that is not at or before the key's time, to report the time it carries.
+//! by comparing time lanes, before it presents anything, and completes them itself.
+//!
+//! A direct key stays in corgi: chunks in, the reducer's graph, columns out.
+//!   * Its input is rows of the input chunks. Where one chunk holds the key, at the key's time,
+//!     the rows are already its values in order, netted: the reducer reads them where they lie.
+//!     Otherwise the key's rows are sorted and netted by value across chunks, as for any key.
+//!     Either way the rows are named by where they are, and gathered once, into the graph.
+//!   * Its output is not matched against what the key has. The reducer's rows are recorded at the
+//!     key's time, and beside them the key's existing output, negated, at that time. The batch is
+//!     sorted and consolidated when it is sealed, which nets the two.
+//!   * A time is built only for a record that is not at or before the key's time, to report the
+//!     time it carries.
+//!
 //! For the keys it presents, this backend supplies only:
 //!
 //!   * ids — a key's id is the identifier its arrangement is sorted by (the key itself when it is a
@@ -48,7 +58,7 @@ use corgi::{Bounds, Demand, Graph, NumOp, Shape, Value as CValue};
 
 use crate::runtime::col_times::{ColTime, ColTimes};
 use crate::runtime::search::matching_ranges;
-use crate::runtime::chunk::{colliding_keys, columns_to_batch, ident, key_ids, key_is_hashed, recover_key, recover_key_ref, CorgiChunk};
+use crate::runtime::chunk::{colliding_keys, columns_to_nonempty_batch, ident, key_ids, key_is_hashed, recover_key, recover_key_ref, CorgiChunk};
 use crate::lambda::compile_reduce;
 use crate::ir::{Diff, Reducer};
 
@@ -159,10 +169,20 @@ pub(crate) struct CorgiReduceBackend<T> {
     key_columns: Vec<CValue>,
     /// The output emitted so far: key rows in `key_columns`, value ids, times, and diffs.
     rows: (Vec<(usize, usize)>, Vec<u64>, ColTimes<T>, Vec<Diff>),
+    /// The output of the keys completed here, as columns, in no order and not consolidated.
+    completed: Vec<Columns<T>>,
     /// Input records per window, bounding what the presentations cost at once.
     window_size: usize,
     /// The retire in progress.
     retire: Retire,
+}
+
+/// Updates as columns: keys in their arrangement form, values, times and diffs.
+struct Columns<T> {
+    keys: CValue,
+    vals: CValue,
+    times: ColTimes<T>,
+    diffs: Vec<Diff>,
 }
 
 /// A retire's keys and where its input chunks hold them, found once by its first window.
@@ -240,6 +260,7 @@ impl<T> CorgiReduceBackend<T> {
             output_keys: Vec::new(),
             key_columns: Vec::new(),
             rows: (Vec::new(), Vec::new(), ColTimes::default(), Vec::new()),
+            completed: Vec::new(),
             window_size: window_size.max(1),
             retire: Retire::default(),
         }
@@ -270,24 +291,27 @@ fn search<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], keys: &[i64]) -> Matches 
 /// at holds that key.
 ///
 /// The keys `direct` marks are not presented. Each is to be evaluated once, at its time, so its
-/// values are netted over their records at or before that time, and go to `brackets` as
-/// `(key index, id, diff)`, in the same order. Its other records carry their joins with that
-/// time, less those that net to nothing for a value, which go to `pended`.
+/// values are netted over their records at or before that time, and go to `brackets`, if there
+/// are any, as `(key index, id, diff)`, in the same order. Its other records carry their joins
+/// with that time, less those that net to nothing for a value, which go to `pended`.
+/// The keys `skip` marks (by index; empty when none are) are not read at all.
 fn present<T: ColTime + Ord>(
     chunks: &[&CorgiChunk<T, Diff>],
     keys: &[i64],
     matches: &Matches,
     colliding: &[bool],
     direct: &Direct,
+    skip: &[bool],
     projected: Option<&[CValue]>,
     refs: &mut Vec<(usize, usize)>,
     bridge: &mut ProxyBridge<T, Diff, i64>,
-    brackets: &mut Vec<(usize, u64, Diff)>,
+    mut brackets: Option<&mut Vec<(usize, u64, Diff)>>,
     pended: &mut Vec<(T, i64)>,
 ) {
     // The matched `(chunk, row)`s, key by key, and each one's key index.
     let mut runs: Vec<_> = matches.iter().enumerate()
         .flat_map(|(chunk, found)| found.iter().map(move |(key, rows)| (*key, chunk, rows.clone())))
+        .filter(|run| !skip.get(run.0).copied().unwrap_or(false))
         .collect();
     runs.sort_by_key(|run| run.0);
     let (mut labels, mut rows) = (Vec::new(), Vec::new());
@@ -332,9 +356,11 @@ fn present<T: ColTime + Ord>(
             } else {
                 diff = members.iter().map(|&i| chunks[rows[i].0].diffs()[rows[i].1]).sum();
             }
-            if diff != 0 {
-                brackets.push((key, refs.len() as u64, diff));
-                refs.push(rows[members[0]]);
+            if let Some(brackets) = brackets.as_deref_mut() {
+                if diff != 0 {
+                    brackets.push((key, refs.len() as u64, diff));
+                    refs.push(rows[members[0]]);
+                }
             }
             continue;
         }
@@ -504,6 +530,44 @@ impl<T> CorgiReduceBackend<T>
 where
     T: ColTime + Ord,
 {
+    /// The lambda's graph over lists of input rows, one list to a key.
+    ///
+    /// The lists end at `ends`, none of them empty. Their rows are `rows` of the input `chunks`
+    /// (by index), each counted `diffs` times, with distinct values ascending in each list where
+    /// the values are read whole. `keys` are each list's key, as a row of `key_columns`.
+    /// The values are gathered once, projected, from where they are stored.
+    /// Returns the output values, their diffs, and each list's end among them.
+    fn reduce_rows(&self, ends: Vec<usize>, chunks: &[usize], rows: &[usize], diffs: Vec<Diff>, keys: Vec<(usize, usize)>) -> (CValue, Vec<Diff>, Vec<usize>) {
+        let vals = match self.reads.value {
+            Demand::None => CValue::Unit(rows.len()),
+            _ => {
+                let sources: Vec<Option<&CValue>> = self.input.columns.iter().map(Some).collect();
+                gather_lanes(&sources, chunks, rows)
+            }
+        };
+        // Projected values may tie; whole ones ascend.
+        if cfg!(debug_assertions) && self.reads.value == Demand::All {
+            let mut start = 0;
+            for &end in &ends {
+                for i in start + 1..end {
+                    assert!(compare_at(&vals, i - 1, &vals, i).is_lt(), "reduce: a list's values are not strictly ascending");
+                }
+                start = end;
+            }
+            assert!(diffs.iter().all(|&diff| diff != 0), "reduce: a list holds a zero diff");
+        }
+        let keys = if self.reads.key { recover_key(&gather_refs(&self.key_columns, keys.into_iter())) } else { CValue::Unit(keys.len()) };
+        let lists = CValue::List(Bounds::offsets(ends), Box::new(CValue::Prod(vec![vals, CValue::i64(diffs)])));
+        let argument = self.reads.argument.project(CValue::Prod(vec![keys, lists])).expect("the reduce's input has the shape its demand is on");
+        let shape = corgi::shape_of_value(&argument);
+        assert!(shape == self.reads.shape, "reduce: input read as {shape} reached an operator narrowed to {}", self.reads.shape);
+        let (bounds, elems) = corgi::eval_graph(&self.graph, argument).into_list("reduce output").unwrap();
+        let mut fields = elems.into_prod("reduce output").unwrap();
+        let out_diffs = fields.pop().unwrap().into_i64("reduce output diffs").unwrap().to_vec();
+        let out_vals = fields.pop().unwrap();
+        (out_vals, out_diffs, bounds.to_vec())
+    }
+
     /// The expression crossing for a wave: every
     /// bracket's key and its values, as a list of `(val, diff)`, through the lambda's graph at once.
     /// Returns the output values, their diffs, and each bracket's end among them.
@@ -529,34 +593,12 @@ where
         if blocks.is_empty() {
             return (CValue::Unit(0), Vec::new(), vec![0; ends.len()]);
         }
-        let vals = match self.reads.value {
-            Demand::None => CValue::Unit(input.len()),
-            _ => self.input.gather(&input.iter().map(|&(id, _)| id).collect::<Vec<_>>()),
-        };
-        let diffs = CValue::i64(input.iter().map(|&(_, diff)| diff).collect());
-        // Projected values may tie; whole ones ascend.
-        if cfg!(debug_assertions) && self.reads.value == Demand::All {
-            let mut start = 0;
-            for &(_, end) in &blocks {
-                for i in start + 1..end {
-                    assert!(compare_at(&vals, i - 1, &vals, i).is_lt(), "reduce: a bracket's values are not strictly ascending");
-                }
-                start = end;
-            }
-            assert!(input.iter().all(|&(_, diff)| diff != 0), "reduce: a bracket holds a zero diff");
-        }
-        let keys = if self.reads.key { recover_key(&gather_refs(&self.key_columns, key_refs.into_iter())) } else { CValue::Unit(key_refs.len()) };
-        let lists = CValue::List(Bounds::offsets(blocks.iter().map(|b| b.1).collect()), Box::new(CValue::Prod(vec![vals, diffs])));
-        let argument = self.reads.argument.project(CValue::Prod(vec![keys, lists])).expect("the reduce's input has the shape its demand is on");
-        let shape = corgi::shape_of_value(&argument);
-        assert!(shape == self.reads.shape, "reduce: input read as {shape} reached an operator narrowed to {}", self.reads.shape);
-        let (bounds, elems) = corgi::eval_graph(&self.graph, argument).into_list("reduce output").unwrap();
-        let mut fields = elems.into_prod("reduce output").unwrap();
-        let out_diffs = fields.pop().unwrap().into_i64("reduce output diffs").unwrap().to_vec();
-        let out_vals = fields.pop().unwrap();
+        let (chunks, rows): (Vec<usize>, Vec<usize>) = input.iter().map(|&(id, _)| self.input.refs[id as usize]).unzip();
+        let diffs = input.iter().map(|&(_, diff)| diff).collect();
+        let block_ends: Vec<usize> = blocks.iter().map(|b| b.1).collect();
+        let (out_vals, out_diffs, list_ends) = self.reduce_rows(block_ends, &chunks, &rows, diffs, key_refs);
 
         // Each bracket's end among the output rows; brackets without input add none.
-        let list_ends = bounds.to_vec();
         let (mut out_ends, mut blocks, mut emitted) = (Vec::with_capacity(ends.len()), blocks.iter().zip(list_ends).peekable(), 0);
         for bi in 0..ends.len() {
             if let Some((_, end)) = blocks.next_if(|((b, _), _)| *b == bi) { emitted = end; }
@@ -578,6 +620,7 @@ where
 
     fn begin(&mut self, _description: Description<T>) {
         self.rows = (Vec::new(), Vec::new(), ColTimes::default(), Vec::new());
+        self.completed.clear();
     }
 
     fn next_window(&mut self, instance: &ReduceInstance<'_, T, CBatch<T>, CBatch<T>>, due: &Due<T, i64>, from: &mut KeyPosition<i64>, window: &mut ReduceWindow<T, Diff, Diff, i64>, pended: &mut Vec<(T, i64)>) {
@@ -662,48 +705,101 @@ where
         // survives in `window.seeds` above. Input ids name rows for this window only.
         self.input.refs.clear();
         let projected = (self.project_values && self.reads.value != Demand::All).then_some(&self.input.columns[..]);
-        let (mut direct_input, mut direct_output) = (Vec::new(), Vec::new());
-        present(&in_chunks, keys, &matches, colliding, &direct, projected, &mut self.input.refs, &mut window.input, &mut direct_input, pended);
+        // A direct key is plain when one input chunk holds it, with every row at the key's
+        // time. A chunk holds a value once at a time, so the rows are the key's values, in order
+        // and netted: there is nothing to sort, and the reducer reads them where they lie.
+        let mut plain = vec![false; direct.keys.len()];
+        if !plain.is_empty() {
+            let mut holders = vec![0u32; keys.len()];
+            for (index, _) in matches.iter().flatten() { holders[*index] += 1; }
+            for (chunk, found) in matches.iter().enumerate() {
+                for (index, rows) in found {
+                    plain[*index] = direct.is(*index) && !direct.carries[*index] && holders[*index] == 1
+                        && (chunk >= prior || in_chunks[chunk].times().all_equal(rows.clone(), direct.time(*index)));
+                }
+            }
+        }
+        // A direct key's existing output is read below, where it lies. It is read here only to
+        // find the times it carries.
+        let settled: Vec<bool> = (0..direct.keys.len()).map(|index| direct.keys[index] && !direct.carries[index]).collect();
+
+        let mut direct_input = Vec::new();
+        present(&in_chunks, keys, &matches, colliding, &direct, &plain, projected, &mut self.input.refs, &mut window.input, Some(&mut direct_input), pended);
         // The output history, same keys. Output ids name rows for the whole retire, and the rows
         // that hold their keys are at the same positions of the output chunks' key columns.
         let fresh = self.output.refs.len();
-        present(&out_chunks, keys, &out_matches, colliding, &direct, None, &mut self.output.refs, &mut window.output, &mut direct_output, pended);
+        present(&out_chunks, keys, &out_matches, colliding, &direct, &settled, None, &mut self.output.refs, &mut window.output, None, pended);
         self.output_keys.extend(self.output.refs[fresh..].iter().map(|&(chunk, row)| (in_chunks.len() + chunk, row)));
 
         *from = retire.keys.get(retire.window.end).map_or(KeyPosition::End, |key| KeyPosition::At(*key));
+        if direct.keys.is_empty() { return; }
 
-        // Complete the direct keys: one evaluation each over its netted input and output at or
-        // before its time, as one wave, with the difference recorded at that time. A key with
-        // nothing to read has nothing to evaluate, as in the tactic's sweep.
-        let (mut wave_keys, mut wave_indices) = (Vec::new(), Vec::new());
-        let (mut in_ends, mut input, mut out_ends, mut output) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let (mut ins, mut outs) = (direct_input.into_iter().peekable(), direct_output.into_iter().peekable());
-        for index in (0..keys.len()).filter(|index| is_direct(*index)) {
-            let read = input.len() + output.len();
-            while let Some((_, id, diff)) = ins.next_if(|entry| entry.0 == index) { input.push((id, diff)); }
-            while let Some((_, id, diff)) = outs.next_if(|entry| entry.0 == index) { output.push((id, diff)); }
-            if input.len() + output.len() > read {
-                wave_keys.push(keys[index]);
-                wave_indices.push(index);
-                in_ends.push(input.len());
-                out_ends.push(output.len());
+        // Complete the direct keys. The reducer's input is one list of rows to a key: a plain
+        // key's rows as its chunk holds them, and any other's as sorted and netted above. A limit
+        // keeps each list's first rows. A key with nothing to read has nothing to evaluate, as in
+        // the tactic's sweep.
+        let limit = self.limit.unwrap_or(usize::MAX);
+        let (mut lists, mut ends, mut diffs) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut chunks, mut rows) = (Vec::new(), Vec::new());
+        for (chunk, found) in matches.iter().enumerate() {
+            for (index, range) in found {
+                if !plain[*index] { continue; }
+                let range = range.start..range.end.min(range.start.saturating_add(limit));
+                chunks.extend(std::iter::repeat_n(chunk, range.len()));
+                diffs.extend_from_slice(&in_chunks[chunk].diffs()[range.clone()]);
+                lists.push((*index, (chunk, range.start)));
+                rows.extend(range);
+                ends.push(rows.len());
             }
         }
-        if wave_keys.is_empty() { return; }
-        let (corrections, ends) = self.reduce_corrections(&wave_keys, &in_ends, &input, &out_ends, &output);
-        let (key_rows, ids, times, diffs) = &mut self.rows;
-        let mut start = 0;
-        for (index, end) in wave_indices.into_iter().zip(ends) {
-            if end > start {
-                let time = T::from_coordinates(direct.time(index).iter().copied());
-                for &(id, diff) in &corrections[start..end] {
-                    key_rows.push(self.output_keys[id as usize]);
-                    ids.push(id);
-                    times.push(&time);
-                    diffs.push(diff);
-                }
+        for group in direct_input.chunk_by(|a, b| a.0 == b.0) {
+            lists.push((group[0].0, self.input.refs[group[0].1 as usize]));
+            for &(_, id, diff) in group.iter().take(limit) {
+                let (chunk, row) = self.input.refs[id as usize];
+                chunks.push(chunk);
+                rows.push(row);
+                diffs.push(diff);
             }
-            start = end;
+            ends.push(rows.len());
+        }
+        // The reducer's rows, each at its key's time.
+        if !lists.is_empty() {
+            let (vals, diffs, ends) = self.reduce_rows(ends, &chunks, &rows, diffs, lists.iter().map(|list| list.1).collect());
+            let mut lanes = vec![Vec::with_capacity(diffs.len()); direct.width];
+            let mut key_rows = Vec::with_capacity(diffs.len());
+            let mut start = 0;
+            for ((index, key), end) in lists.into_iter().zip(ends) {
+                key_rows.extend(std::iter::repeat_n(key, end - start));
+                for (lane, coordinate) in lanes.iter_mut().zip(direct.time(index)) { lane.extend(std::iter::repeat_n(*coordinate, end - start)); }
+                start = end;
+            }
+            let times = ColTimes::from_raw_lanes(lanes, diffs.len());
+            self.completed.push(Columns { keys: gather_refs(&self.key_columns, key_rows.into_iter()), vals, times, diffs });
+        }
+        // The direct keys' existing output at or before their times, negated, at their times.
+        // Sealing the batch nets it against the reducer's rows.
+        let mut lanes = vec![Vec::new(); direct.width];
+        let (mut chunks, mut rows, mut diffs) = (Vec::new(), Vec::new(), Vec::new());
+        for (chunk, found) in out_matches.iter().enumerate() {
+            for (index, range) in found {
+                if !direct.is(*index) { continue; }
+                let (at, before) = (direct.time(*index), rows.len());
+                if direct.carries[*index] {
+                    rows.extend(range.clone().filter(|row| out_chunks[chunk].times().less_equal_coordinates(*row, at)));
+                } else {
+                    rows.extend(range.clone());
+                }
+                chunks.extend(std::iter::repeat_n(chunk, rows.len() - before));
+                diffs.extend(rows[before..].iter().map(|row| -out_chunks[chunk].diffs()[*row]));
+                for (lane, coordinate) in lanes.iter_mut().zip(at) { lane.extend(std::iter::repeat_n(*coordinate, rows.len() - before)); }
+            }
+        }
+        if !rows.is_empty() {
+            let keys = gather_refs(&self.key_columns, chunks.iter().map(|chunk| in_chunks.len() + chunk).zip(rows.iter().copied()));
+            let sources: Vec<Option<&CValue>> = self.output.columns[..out_chunks.len()].iter().map(Some).collect();
+            let vals = gather_lanes(&sources, &chunks, &rows);
+            let times = ColTimes::from_raw_lanes(lanes, diffs.len());
+            self.completed.push(Columns { keys, vals, times, diffs });
         }
     }
 
@@ -897,10 +993,31 @@ where
     }
 
     fn finish(&mut self) -> Option<CBatch<T>> {
+        // The retire's output: what the keys completed here recorded as columns, and what the
+        // tactic emitted for the keys it was presented.
         let (key_rows, ids, times, diffs) = std::mem::take(&mut self.rows);
-        if times.is_empty() { return None; }
-        let keys = gather_refs(&self.key_columns, key_rows.into_iter());
-        Some(Rc::new(columns_to_batch(keys, self.output.gather(&ids), times, diffs)))
+        let mut parts = std::mem::take(&mut self.completed);
+        if !times.is_empty() {
+            let keys = gather_refs(&self.key_columns, key_rows.into_iter());
+            parts.push(Columns { keys, vals: self.output.gather(&ids), times, diffs });
+        }
+        let whole = if parts.len() > 1 {
+            let (mut tags, mut offs) = (Vec::new(), Vec::new());
+            let (mut times, mut diffs) = (ColTimes::default(), Vec::new());
+            for (tag, part) in parts.iter().enumerate() {
+                tags.extend(std::iter::repeat_n(tag, part.diffs.len()));
+                offs.extend(0..part.diffs.len());
+                times.push_range(&part.times, 0, part.diffs.len());
+                diffs.extend_from_slice(&part.diffs);
+            }
+            let keys = gather_lanes(&parts.iter().map(|part| Some(&part.keys)).collect::<Vec<_>>(), &tags, &offs);
+            let vals = gather_lanes(&parts.iter().map(|part| Some(&part.vals)).collect::<Vec<_>>(), &tags, &offs);
+            Columns { keys, vals, times, diffs }
+        } else {
+            parts.pop()?
+        };
+        // The parts may net to nothing, as a key's rows may repeat what it has.
+        columns_to_nonempty_batch(whole.keys, whole.vals, whole.times, whole.diffs).map(Rc::new)
     }
 }
 
@@ -1004,7 +1121,7 @@ mod tests {
                 let owned = chunks(&rows, size, key_shape, val_shape);
                 let chunks: Vec<_> = owned.iter().collect();
                 let (mut refs, mut bridge) = (Vec::new(), Vec::new());
-                present(&chunks, &keys, &search(&chunks, &keys), &[], &Direct::none(), None, &mut refs, &mut bridge, &mut Vec::new(), &mut Vec::new());
+                present(&chunks, &keys, &search(&chunks, &keys), &[], &Direct::none(), &[], None, &mut refs, &mut bridge, None, &mut Vec::new());
                 assert!(bridge.windows(2).all(|w| (w[0].0, &w[0].1) < (w[1].0, &w[1].1)));
                 let pool = Pool { columns: chunks.iter().map(|chunk| chunk.vals().clone()).collect(), refs };
                 let values = rows_of(&pool.gather(&bridge.iter().map(|r| r.0.1).collect::<Vec<_>>()));
