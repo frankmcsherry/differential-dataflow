@@ -55,6 +55,13 @@
 //!   `since`, which is all a trace read as of `since` promises its readers anyway: for `t'` beyond
 //!   `since`, `advance(t ∨ c) ≤ t' ⟺ t ≤ t' ∧ c ≤ t'`, and `c ≤ lower ≤` the fresh time `≤ t'`.
 //!
+//! # Keys the inner backend completes
+//!
+//! A join backend may complete a key itself rather than present it, and the wrapper sees only
+//! what is presented. Where the wrapper changes nothing, it need not see anything, and the inner
+//! backend is free to complete what it likes. For a block the wrapper reads, it asks the inner
+//! backend to present every key (`present_all`).
+//!
 //! # The join reads both inputs
 //!
 //! Reading one input of a join as of `since` and reading both agree at every time beyond `since`,
@@ -148,14 +155,18 @@ where
 
     fn advance(
         &mut self,
-        instance: &JoinInstance<T, B0, B1>,
+        instance: &JoinInstance<'_, T, B0, B1>,
         from: &mut KeyPosition<Self::Key>,
         bridge0: &mut ProxyBridge<T, Self::R0, Self::Key, Self::V0>,
         bridge1: &mut ProxyBridge<T, Self::R1, Self::Key, Self::V1>,
+        output: &mut Vec<Self::Output>,
     ) {
-        self.inner.advance(instance, from, bridge0, bridge1);
         // Every output time is at or beyond the fresh input's times, hence `lower`: beyond `since`.
-        if self.since.is_empty() || self.since.less_equal(&instance.lower) { return; }
+        if self.since.is_empty() || self.since.less_equal(instance.lower) {
+            return self.inner.advance(instance, from, bridge0, bridge1, output);
+        }
+        // What is read as of `since` must be presented to be read.
+        self.inner.advance(&JoinInstance { present_all: true, ..*instance }, from, bridge0, bridge1, output);
         // A key whose updates net away on one side has nothing to match, and the harness requires
         // the bridges' keys to agree.
         let moved0 = read_as_of(bridge0, &self.since);
@@ -168,7 +179,7 @@ where
 
     fn cross(
         &mut self,
-        instance: &JoinInstance<T, B0, B1>,
+        instance: &JoinInstance<'_, T, B0, B1>,
         matches: &mut JoinMatches<T, Self::ROut, Self::Key, Self::V0, Self::V1>,
         output: &mut Vec<Self::Output>,
     ) {

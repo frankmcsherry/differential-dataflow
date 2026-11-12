@@ -1,10 +1,17 @@
 //! The corgi JOIN backend for the `int_proxy` proxy-join seam.
 //!
-//! [`CorgiJoinBackend`] implements [`ProxyJoinBackend`]: `advance` draws blocks of the two
-//! inputs' key intersection as `((group, coord), time, diff)` bridges, and `cross` redeems
+//! [`CorgiJoinBackend`] implements [`ProxyJoinBackend`]: `advance` stages blocks of the two
+//! inputs' key intersection as `(coord, time, diff)` entries, and `cross` redeems
 //! matched IDs into primitive columns or gathers coordinates from the instance's chunks, runs the
 //! compiled projection, and cuts `TARGET_OUT`-sized [`CorgiContainer`]s. Peak state is one
 //! block's bridges plus one container, however large the unit.
+//!
+//! `advance` completes a key itself when either side holds fewer than [`COMPLETE_BELOW`] rows
+//! of it. Such a key is not staged at all: its output is every pair of its rows, which `advance`
+//! records as row coordinates, and the block's pairs are then gathered from the chunks' columns,
+//! with times joined lane-wise, straight into the projection. Nothing is named, consolidated,
+//! or built a row at a time. Only a key with long histories on both sides is staged and presented
+//! in the bridges, for the tactic's replay.
 //!
 //! # Tokens
 //!
@@ -45,7 +52,7 @@ use crate::runtime::search::matching_ranges;
 use corgi::{shape_of_value, Demand, Graph, NumOp, Shape, Value as CValue};
 
 use crate::runtime::chunk::{colliding_keys, int_lane, key_is_hashed, recover_key_ref, rewrap, CorgiChunk};
-use crate::runtime::col_times::ColTime;
+use crate::runtime::col_times::{ColTime, ColTimes};
 use crate::runtime::container::CorgiContainer;
 use crate::lambda::compile_projection;
 use crate::ir::{Diff, Lambda};
@@ -54,6 +61,10 @@ type CBatch<T> = Rc<ChunkBatch<CorgiChunk<T, Diff>>>;
 
 /// Matches per output container cut by `cross` (mirrors the chunk grading `TARGET`).
 const TARGET_OUT: usize = 1 << 18;
+/// A key with fewer rows than this on either side is completed by `advance`, as every pair of
+/// its rows. The tactic's replay can only pay for itself on a key at or above this on both sides,
+/// where it bounds the work by the netted accumulations rather than the histories.
+const COMPLETE_BELOW: usize = 16;
 /// Coordinate packing: chunk index in the high bits, row in the low `COORD_BITS`.
 pub(super) const COORD_BITS: u32 = 48;
 
@@ -91,7 +102,53 @@ pub(crate) struct CorgiJoinBackend<T: ColTime> {
     graph: Graph<NumOp>,
     /// What the graph reads of its input.
     reads: Reads,
+    /// The row pairs of the keys `advance` completes, crossed before it returns; held for its allocations.
+    completed: Pairs,
     _t: PhantomData<T>,
+}
+
+/// Pairs of rows, one of each input, as `(chunk, row)` coordinates in four columns.
+#[derive(Default)]
+struct Pairs {
+    chunk0: Vec<usize>,
+    row0: Vec<usize>,
+    chunk1: Vec<usize>,
+    row1: Vec<usize>,
+}
+
+impl Pairs {
+    fn clear(&mut self) {
+        self.chunk0.clear();
+        self.row0.clear();
+        self.chunk1.clear();
+        self.row1.clear();
+    }
+
+    /// Every pair of a row of `runs0` with a row of `runs1`, runs of the first and second input.
+    fn cross<T: ColTime>(&mut self, runs0: &[RunRef<'_, T>], runs1: &[RunRef<'_, T>]) {
+        for run0 in runs0 {
+            for run1 in runs1 {
+                for row0 in run0.s..run0.e {
+                    let rows = run1.e - run1.s;
+                    self.chunk0.extend(std::iter::repeat_n(run0.cid, rows));
+                    self.row0.extend(std::iter::repeat_n(row0, rows));
+                    self.chunk1.extend(std::iter::repeat_n(run1.cid, rows));
+                    self.row1.extend(run1.s..run1.e);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a key with these runs on its two sides is completed as every pair of its rows.
+///
+/// Either side must be short. A side whose values the projection reads only in part is staged
+/// to net the rows that the projection cannot tell apart, unless it is one row, with nothing to net.
+fn completes<T: ColTime>(runs: (&[RunRef<'_, T>], &[RunRef<'_, T>])) -> bool {
+    let rows = |runs: &[RunRef<'_, T>]| runs.iter().map(|run| run.e - run.s).sum::<usize>();
+    let (rows0, rows1) = (rows(runs.0), rows(runs.1));
+    let plain = |runs: &[RunRef<'_, T>], rows: usize| rows == 1 || runs.iter().all(|run| run.kind == ProjKind::Whole);
+    (rows0 < COMPLETE_BELOW || rows1 < COMPLETE_BELOW) && plain(runs.0, rows0) && plain(runs.1, rows1)
 }
 
 impl<T: ColTime> CorgiJoinBackend<T> {
@@ -103,7 +160,43 @@ impl<T: ColTime> CorgiJoinBackend<T> {
         let input = Shape::Prod(vec![k, v0, v1]);
         let narrowed = corgi::narrow(compiled, &Demand::All)
             .unwrap_or_else(|e| panic!("join projection: narrowing a compiled graph at {input}: {e}"));
-        CorgiJoinBackend { colliding: Vec::new(), graph: narrowed.graph, reads: Reads::new(narrowed.input, &input), _t: PhantomData }
+        CorgiJoinBackend { colliding: Vec::new(), graph: narrowed.graph, reads: Reads::new(narrowed.input, &input), completed: Pairs::default(), _t: PhantomData }
+    }
+
+    /// The output of row `pairs` of the two inputs' chunks: their columns gathered into the
+    /// projection, times joined lane-wise with each other and with `lower`, and diffs multiplied.
+    fn cross_rows(&self, chunks0: &[&CorgiChunk<T, Diff>], chunks1: &[&CorgiChunk<T, Diff>], pairs: &Pairs, lower: &T, output: &mut Vec<CorgiContainer<T, Diff>>) {
+        let [dk, d0, d1] = &self.reads.columns;
+        let keys0 = demanded(dk, chunks0.iter().map(|c| recover_key_ref(c.keys())));
+        let vals0 = demanded(d0, chunks0.iter().map(|c| c.vals()));
+        let vals1 = demanded(d1, chunks1.iter().map(|c| c.vals()));
+        let keys0: Vec<Option<&CValue>> = keys0.iter().map(|c| Some(&**c)).collect();
+        let vals0: Vec<Option<&CValue>> = vals0.iter().map(|c| Some(&**c)).collect();
+        let vals1: Vec<Option<&CValue>> = vals1.iter().map(|c| Some(&**c)).collect();
+        let bound: Vec<u64> = lower.coordinates().collect();
+        let width = chunks0.iter().chain(chunks1).map(|c| c.times().width()).max().unwrap_or(0).max(bound.len());
+        let mut start = 0;
+        while start < pairs.row0.len() {
+            let end = (start + TARGET_OUT).min(pairs.row0.len());
+            let (chunk0, row0, chunk1, row1) = (&pairs.chunk0[start..end], &pairs.row0[start..end], &pairs.chunk1[start..end], &pairs.row1[start..end]);
+            let rows = end - start;
+            let kc = if *dk == Demand::None { CValue::Unit(rows) } else { gather_lanes(&keys0, chunk0, row0) };
+            let v0 = if *d0 == Demand::None { CValue::Unit(rows) } else { gather_lanes(&vals0, chunk0, row0) };
+            let v1 = if *d1 == Demand::None { CValue::Unit(rows) } else { gather_lanes(&vals1, chunk1, row1) };
+            let argument = self.reads.argument.project(CValue::Prod(vec![kc, v0, v1])).expect("the join's input has the shape its demand is on");
+            let shape = shape_of_value(&argument);
+            assert!(shape == self.reads.shape, "join projection: input read as {shape} reached an operator narrowed to {}", self.reads.shape);
+            let mut cols = corgi::eval_graph(&self.graph, argument).into_prod("corgi join projection").unwrap();
+            let nv = cols.pop().unwrap();
+            let nk = cols.pop().unwrap();
+            let lanes = (0..width).map(|j| {
+                let low = bound.get(j).copied().unwrap_or(0);
+                (0..rows).map(|i| chunks0[chunk0[i]].times().coordinate(j, row0[i]).max(chunks1[chunk1[i]].times().coordinate(j, row1[i])).max(low)).collect()
+            }).collect();
+            let diffs = (0..rows).map(|i| chunks0[chunk0[i]].diffs()[row0[i]] * chunks1[chunk1[i]].diffs()[row1[i]]).collect();
+            output.push(CorgiContainer { keys: nk, vals: nv, times: ColTimes::from_raw_lanes(lanes, rows), diffs });
+            start = end;
+        }
     }
 }
 
@@ -122,6 +215,7 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
         from: &mut KeyPosition<i64>,
         bridge0: &mut ProxyBridge<T, Diff, i64>,
         bridge1: &mut ProxyBridge<T, Diff, i64>,
+        output: &mut Vec<CorgiContainer<T, Diff>>,
     ) {
         let mut next = match *from {
             KeyPosition::Start => Some(i64::MIN),
@@ -129,8 +223,8 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
             KeyPosition::End => return,
         };
         self.colliding.clear();
-        let chunks0 = side_chunks(&instance.batches0);
-        let chunks1 = side_chunks(&instance.batches1);
+        let chunks0 = side_chunks(instance.batches0);
+        let chunks1 = side_chunks(instance.batches1);
         if chunks0.is_empty() || chunks1.is_empty() {
             *from = KeyPosition::End;
             return;
@@ -154,17 +248,25 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
         // reads the projected columns at the token's coordinate, which any row of the token serves.
         let proj0 = SideProj::new(&chunks0, &self.reads.columns[1]);
         let proj1 = SideProj::new(&chunks1, &self.reads.columns[2]);
+        let mut completed = std::mem::take(&mut self.completed);
         advance_leaf(
             &chunks0,
             &chunks1,
-            &instance.lower,
+            instance.lower,
             &mut next,
             bridge0,
             bridge1,
             &mut self.colliding,
             (&proj0, &proj1),
+            (!instance.present_all).then_some(&mut completed),
         );
         *from = next.map_or(KeyPosition::End, KeyPosition::At);
+        // The completed keys' pairs are crossed here, as the tactic's matches are in `cross`.
+        if !completed.row0.is_empty() {
+            self.cross_rows(&chunks0, &chunks1, &completed, instance.lower, output);
+            completed.clear();
+        }
+        self.completed = completed;
     }
 
     fn cross(
@@ -173,8 +275,8 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
         matches: &mut JoinMatches<T, Diff, i64>,
         output: &mut Vec<CorgiContainer<T, Diff>>,
     ) {
-        let chunks0 = side_chunks(&instance.batches0);
-        let chunks1 = side_chunks(&instance.batches1);
+        let chunks0 = side_chunks(instance.batches0);
+        let chunks1 = side_chunks(instance.batches1);
         // Project columns before gathering; collision checks still compare the original keys.
         let [dk, d0, d1] = &self.reads.columns;
         let keys0 = demanded(dk, chunks0.iter().map(|c| recover_key_ref(c.keys())));
@@ -602,14 +704,29 @@ impl<T: ColTime> SideScratch<T> {
     }
 }
 
-/// Stage a non-colliding key, emitting it only when both sides survive consolidation.
+/// Where `advance` records the row pairs of the keys it completes, if it may complete any.
+///
+/// The sides a block walks are in driver and probee order; `swapped` says the driver is the
+/// join's second input, as pairs name the first input's row first.
+type Completed<'a> = Option<(&'a mut Pairs, bool)>;
+
+/// Work through a non-colliding key: complete it as every pair of its rows, if `completed`
+/// allows and [`completes`] says so, or else stage it, and present it in the bridges if both
+/// sides survive consolidation.
 fn stage_pair<T: ColTime>(
     token: i64,
     runs: (&[RunRef<'_, T>], &[RunRef<'_, T>]),
     lower: &T,
     scratch: (&mut SideScratch<T>, &mut SideScratch<T>),
     bridges: (&mut ProxyBridge<T, Diff, i64>, &mut ProxyBridge<T, Diff, i64>),
+    completed: Completed<'_>,
 ) {
+    if let Some((pairs, swapped)) = completed {
+        if completes(runs) {
+            if swapped { pairs.cross(runs.1, runs.0) } else { pairs.cross(runs.0, runs.1) }
+            return;
+        }
+    }
     scratch.0.stage_runs(runs.0, lower);
     scratch.1.stage_runs(runs.1, lower);
     if !scratch.0.entries.is_empty() && !scratch.1.entries.is_empty() {
@@ -819,6 +936,7 @@ fn advance_leaf<T: ColTime>(
     bridge1: &mut ProxyBridge<T, Diff, i64>,
     colliding: &mut Vec<i64>,
     (proj0, proj1): (&SideProj, &SideProj),
+    completed: Option<&mut Pairs>,
 ) {
     let start = from.expect("advance called on an exhausted unit");
     let hashed = key_is_hashed(chunks0[0].keys());
@@ -846,7 +964,7 @@ fn advance_leaf<T: ColTime>(
         let h = block_horizon(dchunks, dstarts, PULL);
         let dviews = views(dchunks, dstarts, &block_ends(dchunks, h), dproj);
         let (bd, bp) = if drive0 { (bridge0, bridge1) } else { (bridge1, bridge0) };
-        leaf_probe(dviews, pchunks, pproj, lower, h, from, bd, bp, hashed, colliding)
+        leaf_probe(dviews, pchunks, pproj, lower, h, from, bd, bp, hashed, colliding, completed.map(|matches| (matches, !drive0)))
     } else {
         // Symmetric: both sides are read, so both bound the block.
         let h = block_horizon(chunks0, &start0, PULL).into_iter()
@@ -854,7 +972,7 @@ fn advance_leaf<T: ColTime>(
             .min();
         let views0 = views(chunks0, &start0, &block_ends(chunks0, h), proj0);
         let views1 = views(chunks1, &start1, &block_ends(chunks1, h), proj1);
-        leaf_merge(views0, views1, lower, h, from, bridge0, bridge1, hashed, colliding)
+        leaf_merge(views0, views1, lower, h, from, bridge0, bridge1, hashed, colliding, completed.map(|matches| (matches, false)))
     }
 }
 
@@ -871,6 +989,7 @@ fn leaf_probe<'a, T: ColTime>(
     bridge_p: &mut ProxyBridge<T, Diff, i64>,
     hashed: bool,
     colliding: &mut Vec<i64>,
+    mut completed: Completed<'_>,
 ) {
     // Merge the driver block's keys (strictly below the horizon) into the distinct key
     // list and each key's runs.
@@ -945,7 +1064,7 @@ fn leaf_probe<'a, T: ColTime>(
             }
             continue;
         }
-        stage_pair(k, (drefs, prefs), lower, (&mut sd, &mut sp), (bridge_d, bridge_p));
+        stage_pair(k, (drefs, prefs), lower, (&mut sd, &mut sp), (bridge_d, bridge_p), completed.as_mut().map(|(pairs, swapped)| (&mut **pairs, *swapped)));
     }
     // The block ran to the horizon; resume there (`None` = the driver is exhausted, and
     // with it the intersection).
@@ -964,11 +1083,12 @@ fn leaf_merge<'a, T: ColTime>(
     bridge1: &mut ProxyBridge<T, Diff, i64>,
     hashed: bool,
     colliding: &mut Vec<i64>,
+    mut completed: Completed<'_>,
 ) {
     if !hashed {
         // Integer identifiers are exact keys: keep the streaming path, without staging block
         // metadata for comparisons that do not exist.
-        leaf_merge_primitive(views0, views1, lower, h, from, bridge0, bridge1);
+        leaf_merge_primitive(views0, views1, lower, h, from, bridge0, bridge1, completed);
         return;
     }
     let (mut refs0, mut refs1): (Vec<(usize, usize, usize)>, Vec<(usize, usize, usize)>) = (Vec::new(), Vec::new());
@@ -1013,7 +1133,7 @@ fn leaf_merge<'a, T: ColTime>(
             }
             continue;
         }
-        stage_pair(k, (&r0, &r1), lower, (&mut s0, &mut s1), (bridge0, bridge1));
+        stage_pair(k, (&r0, &r1), lower, (&mut s0, &mut s1), (bridge0, bridge1), completed.as_mut().map(|(pairs, swapped)| (&mut **pairs, *swapped)));
     }
     *from = h;
 }
@@ -1027,6 +1147,7 @@ fn leaf_merge_primitive<'a, T: ColTime>(
     from: &mut Option<i64>,
     bridge0: &mut ProxyBridge<T, Diff, i64>,
     bridge1: &mut ProxyBridge<T, Diff, i64>,
+    mut completed: Completed<'_>,
 ) {
     let (mut s0, mut s1) = (SideScratch::new(), SideScratch::new());
     let (mut refs0, mut refs1): (Vec<(usize, usize, usize)>, Vec<(usize, usize, usize)>) = (Vec::new(), Vec::new());
@@ -1043,7 +1164,7 @@ fn leaf_merge_primitive<'a, T: ColTime>(
         if refs0.is_empty() || refs1.is_empty() { continue; }
         let r0: smallvec::SmallVec<[RunRef<T>; 4]> = refs0.iter().map(|&(vi, s, e)| views0[vi].run_ref(s, e)).collect();
         let r1: smallvec::SmallVec<[RunRef<T>; 4]> = refs1.iter().map(|&(vi, s, e)| views1[vi].run_ref(s, e)).collect();
-        stage_pair(k, (&r0, &r1), lower, (&mut s0, &mut s1), (bridge0, bridge1));
+        stage_pair(k, (&r0, &r1), lower, (&mut s0, &mut s1), (bridge0, bridge1), completed.as_mut().map(|(pairs, swapped)| (&mut **pairs, *swapped)));
     }
 }
 
@@ -1091,18 +1212,18 @@ mod tests {
                     keys, vals, [row].into_iter().collect(), vec![if row == 0 { 2 } else { -3 }],
                 )]))
             };
-            let instance = JoinInstance { batches0: vec![make(true, 0), make(true, 1)], batches1: vec![make(false, 0), make(false, 1)], lower: 5 };
+            let instance = Unit { batches0: vec![make(true, 0), make(true, 1)], batches1: vec![make(false, 0), make(false, 1)], lower: 5 };
             let shapes = [if hashed { pair() } else { Shape::Prod(vec![Shape::Int]) }, Shape::Prod(vec![Shape::Int; 4]), Shape::Prod(vec![Shape::Int])];
             for body in ["((), c)", "(k, c)", "(k, v)", "((), ())", if hashed { "let (x, y) = k in (x, c)" } else { "(k, (v, c))" }] {
                 let lambda = Lambda::new(format!("let (k, (a, b, c, d), v) = input in {body}"), &corgi::Scope::default());
                 let mut narrowed = CorgiJoinBackend::new(&lambda, shapes.clone());
                 let mut original = CorgiJoinBackend {
                     colliding: Vec::new(), graph: compile_projection(&lambda, &shapes).unwrap().graph().clone(),
-                    reads: Reads::new(Demand::All, &Shape::Prod(shapes.to_vec())), _t: PhantomData,
+                    reads: Reads::new(Demand::All, &Shape::Prod(shapes.to_vec())), completed: Pairs::default(), _t: PhantomData,
                 };
                 let run = |backend: &mut CorgiJoinBackend<u64>| {
                     let (mut left, mut right) = (Vec::new(), Vec::new());
-                    backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right);
+                    backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
                     let mut matches = JoinMatches::default();
                     for a in &left {
                         for b in &right {
@@ -1114,7 +1235,7 @@ mod tests {
                         }
                     }
                     let mut output = Vec::new();
-                    backend.cross(&instance, &mut matches, &mut output);
+                    backend.cross(&instance.instance(), &mut matches, &mut output);
                     // Tokens minted on projected values can merge rows before `cross`: compare
                     // the consolidated updates, not the column layout.
                     let mut rows: Vec<_> = output.into_iter().flat_map(|c| c.into_updates()).collect();
@@ -1123,6 +1244,20 @@ mod tests {
                 };
                 assert_eq!(run(&mut narrowed), run(&mut original), "hashed={hashed}, body={body}");
             }
+        }
+    }
+
+    /// A unit of work, owned. Its backend must present every key, as these tests read the
+    /// presentations.
+    struct Unit {
+        batches0: Vec<CBatch<u64>>,
+        batches1: Vec<CBatch<u64>>,
+        lower: u64,
+    }
+
+    impl Unit {
+        fn instance(&self) -> JoinInstance<'_, u64, CBatch<u64>, CBatch<u64>> {
+            JoinInstance { batches0: &self.batches0, batches1: &self.batches1, lower: &self.lower, present_all: true }
         }
     }
 
@@ -1155,12 +1290,12 @@ mod tests {
                 ints(vec![7]), CValue::Prod(vec![ints(vec![1]), ints(vec![noise]), ints(vec![3])]),
                 [0].into_iter().collect(), vec![diff],
             )]));
-            let instance = JoinInstance { batches0: vec![make(10, -1), make(11, 1)], batches1: vec![make(12, 1)], lower: 0 };
+            let instance = Unit { batches0: vec![make(10, -1), make(11, 1)], batches1: vec![make(12, 1)], lower: 0 };
             let lambda = Lambda::new(format!("let (k, (a, _, c), _) = input in {body}"), &corgi::Scope::default());
             let shape = Shape::Prod(vec![Shape::Int; 3]);
             let mut backend = CorgiJoinBackend::new(&lambda, [Shape::Int, shape.clone(), shape]);
             let (mut left, mut right) = (Vec::new(), Vec::new());
-            backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right);
+            backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
             assert!(left.is_empty() && right.is_empty(), "{body}");
         }
     }
@@ -1190,7 +1325,7 @@ mod tests {
                         make(compound, vec![0, i64::MIN as u64, u64::MAX], vec![1, 1, 2], 0),
                         make(compound, vec![0, i64::MIN as u64], vec![-1, -1], 3),
                     ];
-                    let mut instance = JoinInstance { batches0: side(compound0), batches1: side(compound1), lower: 5 };
+                    let mut instance = Unit { batches0: side(compound0), batches1: side(compound1), lower: 5 };
                     if let Some(right) = padded_side {
                         let extra = CorgiChunk::from_columns(
                             wrap(ints(vec![8; 20])), values(vec![0; 20], if right { compound1 } else { compound0 }),
@@ -1202,14 +1337,14 @@ mod tests {
                     let shape = |v: &CValue| corgi::shape_of_value(v);
                     let mut backend = backend([shape(&wrap(ints(vec![7]))), shape(&values(vec![0], compound0)), shape(&values(vec![0], compound1))]);
                     let (mut left, mut right) = (Vec::new(), Vec::new());
-                    backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right);
+                    backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
                     assert_eq!((left.len(), right.len()), (1, 1));
                     assert_eq!((left[0].1, left[0].2), (5, 2));
                     if !compound0 { assert_eq!(left[0].0.1, u64::MAX); }
                     if !compound1 { assert_eq!(right[0].0.1, u64::MAX); }
                     let mut matches = JoinMatches { ids: vec![(7, (left[0].0.1, right[0].0.1))], times: vec![5], diffs: vec![4] };
                     let mut output = Vec::new();
-                    backend.cross(&instance, &mut matches, &mut output);
+                    backend.cross(&instance.instance(), &mut matches, &mut output);
                     assert_eq!(output.len(), 1);
                     assert_eq!(output[0].keys, wrap(ints(vec![7])));
                     assert_eq!(output[0].vals, CValue::Prod(vec![values(vec![u64::MAX], compound0), values(vec![u64::MAX], compound1)]));
@@ -1217,7 +1352,7 @@ mod tests {
                     assert_eq!(output[0].times.get(0), 5);
                     instance.batches0.push(make(compound0, vec![u64::MAX], vec![-2], 3));
                     left.clear(); right.clear();
-                    backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right);
+                    backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
                     assert!(left.is_empty() && right.is_empty(), "suppress a fully cancelled key");
                 }
             }
@@ -1230,11 +1365,11 @@ mod tests {
         let make = |keys: Vec<i64>| Rc::new(ChunkBatch::new(vec![CorgiChunk::from_columns(
             CValue::i64(keys.clone()), CValue::i64(keys.clone()), keys.iter().map(|_| 0u64).collect(), vec![1; keys.len()],
         )]));
-        let instance = JoinInstance { batches0: vec![make(vec![i64::MIN, -5, 3])], batches1: vec![make(vec![-5, -1, 3])], lower: 0 };
+        let instance = Unit { batches0: vec![make(vec![i64::MIN, -5, 3])], batches1: vec![make(vec![-5, -1, 3])], lower: 0 };
         let mut backend = backend([Shape::Int, Shape::Int, Shape::Int]);
         let (mut from, mut left, mut right) = (KeyPosition::Start, Vec::new(), Vec::new());
         while from != KeyPosition::End {
-            backend.advance(&instance, &mut from, &mut left, &mut right);
+            backend.advance(&instance.instance(), &mut from, &mut left, &mut right, &mut Vec::new());
         }
         let keys = |bridge: &ProxyBridge<u64, Diff, i64>| bridge.iter().map(|r| r.0.0).collect::<Vec<_>>();
         assert_eq!((keys(&left), keys(&right)), (vec![-5, 3], vec![-5, 3]));
@@ -1263,14 +1398,14 @@ mod tests {
                 vec![if chunk < 4 { 1 } else { -1 }; rows.len()],
             )]))
         }).collect();
-        let instance = JoinInstance { batches0: batches.clone(), batches1: batches, lower: 5 };
+        let instance = Unit { batches0: batches.clone(), batches1: batches, lower: 5 };
         let mut backend = backend([Shape::Int, pair(), pair()]);
         let (mut left, mut right) = (Vec::new(), Vec::new());
-        backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right);
+        backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
         let expected: Vec<_> = (1..6).flat_map(|key| std::iter::repeat_n((key, 5, if key == 5 { 3 } else { 1 }), 3)).collect();
         assert_eq!(left.iter().map(|r| (r.0.0, r.1, r.2)).collect::<Vec<_>>(), expected);
         assert_eq!(left, right);
-        assert_eq!(cross_bridges(&mut backend, &instance, &left, &right), 5 * 3 * 3);
+        assert_eq!(cross_bridges(&mut backend, &instance.instance(), &left, &right), 5 * 3 * 3);
     }
 
     #[test]
@@ -1350,7 +1485,7 @@ mod tests {
         let collision = PULL as u64 + 1;
         let mut rows: Vec<_> = (0..collision).map(|id| (id, id, 0)).collect();
         rows.extend([(collision, 7, 0), (collision, 8, 0)]);
-        let instance = JoinInstance {
+        let instance = Unit {
             batches0: vec![batch(&rows)],
             batches1: vec![batch(&rows)],
             lower: 0,
@@ -1359,15 +1494,15 @@ mod tests {
         let mut from = KeyPosition::Start;
         let (mut left, mut right) = (Vec::new(), Vec::new());
 
-        backend.advance(&instance, &mut from, &mut left, &mut right);
+        backend.advance(&instance.instance(), &mut from, &mut left, &mut right, &mut Vec::new());
         assert!(from != KeyPosition::End, "the first block must leave work for the collision block");
         assert!(backend.colliding.is_empty());
 
         left.clear();
         right.clear();
-        backend.advance(&instance, &mut from, &mut left, &mut right);
+        backend.advance(&instance.instance(), &mut from, &mut left, &mut right, &mut Vec::new());
         assert_eq!(backend.colliding, vec![collision as i64]);
-        assert_eq!(cross_bridges(&mut backend, &instance, &left, &right), 2);
+        assert_eq!(cross_bridges(&mut backend, &instance.instance(), &left, &right), 2);
     }
 
     /// Singleton runs can disagree across sides or chunks even though each is internally one
@@ -1375,7 +1510,7 @@ mod tests {
     #[test]
     fn block_checks_compare_real_keys_across_sides_and_chunks() {
         for padded in [None, Some(false), Some(true)] {
-            let mut instance = JoinInstance {
+            let mut instance = Unit {
                 batches0: vec![batch(&[(4, 1, 0), (5, 2, 0), (6, 3, 0)])],
                 batches1: vec![batch(&[(4, 9, 0), (5, 2, 0), (6, 3, 0)]), batch(&[(6, 4, 0)])],
                 lower: 0,
@@ -1386,9 +1521,9 @@ mod tests {
             }
             let mut backend = backend([pair(), Shape::Int, Shape::Int]);
             let (mut left, mut right) = (Vec::new(), Vec::new());
-            backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right);
+            backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
             assert_eq!(backend.colliding, vec![4, 6]);
-            assert_eq!(cross_bridges(&mut backend, &instance, &left, &right), 2);
+            assert_eq!(cross_bridges(&mut backend, &instance.instance(), &left, &right), 2);
         }
     }
 
@@ -1398,7 +1533,7 @@ mod tests {
         let left_rows = [(collision, 7, 0), (collision, 8, 0)];
         let mut right_rows: Vec<_> = (0..8).map(|id| (id, id, 0)).collect();
         right_rows.extend([(collision, 7, 0), (collision, 8, 0)]);
-        let instance = JoinInstance {
+        let instance = Unit {
             batches0: vec![batch(&left_rows)],
             batches1: vec![batch(&right_rows)],
             lower: 0,
@@ -1407,8 +1542,8 @@ mod tests {
         let mut from = KeyPosition::Start;
         let (mut left, mut right) = (Vec::new(), Vec::new());
 
-        backend.advance(&instance, &mut from, &mut left, &mut right);
+        backend.advance(&instance.instance(), &mut from, &mut left, &mut right, &mut Vec::new());
         assert_eq!(backend.colliding, vec![collision as i64]);
-        assert_eq!(cross_bridges(&mut backend, &instance, &left, &right), 2);
+        assert_eq!(cross_bridges(&mut backend, &instance.instance(), &left, &right), 2);
     }
 }

@@ -7,6 +7,12 @@
 //! The tactics elicit proxies, perform time and difference computations, and return proxies to the backend for interpretation.
 //! The backend is oblivious to the navigation of time, and the operator to the backend's implementation.
 //!
+//! A join backend asks for this assistance a key at a time, and only where it needs it.
+//! Navigating a key's history matters when the key has many updates on both sides.
+//! A key with few updates on a side has an output the backend can state itself: every pair of its updates.
+//! The join backend trait therefore lets the backend *complete* a key, or *present* it as proxies for the tactic.
+//! The join tactic sees only the presented keys.
+//!
 //! The default proxy types remain `u64`, with the interpretation described below.
 //! Exact key proxies do not require collision handling.
 //!

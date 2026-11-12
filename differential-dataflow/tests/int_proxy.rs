@@ -670,13 +670,13 @@ impl ProxyJoinBackend<u64, Pairs, Pairs> for PairJoin {
     type R1 = i64;
     type ROut = i64;
     type Output = Joined;
-    fn advance(&mut self, instance: &JoinInstance<u64, Pairs, Pairs>, from: &mut KeyPosition<u64>, bridge0: &mut ProxyBridge<u64, i64, u64, (u64, u64)>, bridge1: &mut ProxyBridge<u64, i64, u64, (u64, u64)>) {
+    fn advance(&mut self, instance: &JoinInstance<u64, Pairs, Pairs>, from: &mut KeyPosition<u64>, bridge0: &mut ProxyBridge<u64, i64, u64, (u64, u64)>, bridge1: &mut ProxyBridge<u64, i64, u64, (u64, u64)>, _output: &mut Vec<Self::Output>) {
         fn draw(batches: &[Pairs]) -> ProxyBridge<u64, i64, u64, (u64, u64)> {
             let mut rows: Vec<_> = hread(batches).into_iter().map(|(kv, t, r)| ((kv.0.hashed(), kv), t, r)).collect();
             consolidate_updates(&mut rows);
             rows
         }
-        let (b0, b1) = (draw(&instance.batches0), draw(&instance.batches1));
+        let (b0, b1) = (draw(instance.batches0), draw(instance.batches1));
         bridge0.extend(b0.iter().filter(|r| b1.iter().any(|s| s.0.0 == r.0.0)).cloned());
         bridge1.extend(b1.iter().filter(|r| b0.iter().any(|s| s.0.0 == r.0.0)).cloned());
         *from = KeyPosition::End;
@@ -795,8 +795,15 @@ fn antichains() -> Vec<Antichain<N5>> {
 }
 
 /// A join backend over hash-keyed pairs at any time, which either presents stored times or
-/// consolidates on load by `instance.lower`, as the contract allows either.
-struct PairJoinAt<T> { apply_lower: bool, _t: std::marker::PhantomData<T> }
+/// consolidates on load by `instance.lower`, as the contract allows either. It completes the keys
+/// whose identifier `complete` accepts, unless it must present them all, and presents the others.
+struct PairJoinAt<T> { apply_lower: bool, complete: fn(u64) -> bool, _t: std::marker::PhantomData<T> }
+impl<T> PairJoinAt<T> {
+    /// A backend that presents every key.
+    fn presenting(apply_lower: bool) -> Self { PairJoinAt { apply_lower, complete: |_| false, _t: std::marker::PhantomData } }
+    /// A backend that completes every key it is allowed to.
+    fn completing(apply_lower: bool) -> Self { PairJoinAt { apply_lower, complete: |_| true, _t: std::marker::PhantomData } }
+}
 type PairsAt<T> = Span<u64, (u64, u64), T, i64>;
 type JoinedAt<T> = Vec<((u64, ((u64, u64), (u64, u64))), T, i64)>;
 impl<T: Lattice + Timestamp> ProxyJoinBackend<T, PairsAt<T>, PairsAt<T>> for PairJoinAt<T> {
@@ -807,18 +814,27 @@ impl<T: Lattice + Timestamp> ProxyJoinBackend<T, PairsAt<T>, PairsAt<T>> for Pai
     type R1 = i64;
     type ROut = i64;
     type Output = JoinedAt<T>;
-    fn advance(&mut self, instance: &JoinInstance<T, PairsAt<T>, PairsAt<T>>, from: &mut KeyPosition<u64>, bridge0: &mut ProxyBridge<T, i64, u64, (u64, u64)>, bridge1: &mut ProxyBridge<T, i64, u64, (u64, u64)>) {
+    fn advance(&mut self, instance: &JoinInstance<T, PairsAt<T>, PairsAt<T>>, from: &mut KeyPosition<u64>, bridge0: &mut ProxyBridge<T, i64, u64, (u64, u64)>, bridge1: &mut ProxyBridge<T, i64, u64, (u64, u64)>, output: &mut Vec<Self::Output>) {
         let draw = |batches: &[PairsAt<T>]| {
             let mut rows: Vec<_> = hread(batches).into_iter().map(|(kv, mut t, r)| {
-                if self.apply_lower { t.join_assign(&instance.lower); }
+                if self.apply_lower { t.join_assign(instance.lower); }
                 ((kv.0.hashed(), kv), t, r)
             }).collect();
             consolidate_updates(&mut rows);
             rows
         };
-        let (b0, b1) = (draw(&instance.batches0), draw(&instance.batches1));
-        bridge0.extend(b0.iter().filter(|r| b1.iter().any(|s| s.0.0 == r.0.0)).cloned());
-        bridge1.extend(b1.iter().filter(|r| b0.iter().any(|s| s.0.0 == r.0.0)).cloned());
+        let (b0, b1) = (draw(instance.batches0), draw(instance.batches1));
+        let complete = |key: u64| !instance.present_all && (self.complete)(key);
+        // A completed key's output is every pair of its updates, times joined and diffs multiplied.
+        let mut completed = Vec::new();
+        for r in b0.iter().filter(|r| complete(r.0.0)) {
+            for s in b1.iter().filter(|s| s.0.0 == r.0.0) {
+                completed.push(((r.0.0, (r.0.1, s.0.1)), r.1.join(&s.1), r.2 * s.2));
+            }
+        }
+        if !completed.is_empty() { output.push(completed); }
+        bridge0.extend(b0.iter().filter(|r| !complete(r.0.0) && b1.iter().any(|s| s.0.0 == r.0.0)).cloned());
+        bridge1.extend(b1.iter().filter(|r| !complete(r.0.0) && b0.iter().any(|s| s.0.0 == r.0.0)).cloned());
         *from = KeyPosition::End;
     }
     fn cross(&mut self, _instance: &JoinInstance<T, PairsAt<T>, PairsAt<T>>, matches: &mut JoinMatches<T, i64, u64, (u64, u64), (u64, u64)>, output: &mut Vec<Self::Output>) {
@@ -861,14 +877,17 @@ fn join_as_of_frontier_in_n5() {
             for t1 in N5::ALL.into_iter().filter(|t| lower.less_equal(t)) {   // the fresh input's time
                 for t0 in N5::ALL {
                     for apply_lower in [false, true] {
-                        let backend = || PairJoinAt::<N5> { apply_lower, _t: std::marker::PhantomData };
+                        // The wrapped backend would complete every key: the wrapper must have it present
+                        // what is read as of the frontier. The reference presents, so the tactic matches.
+                        let backend = || PairJoinAt::<N5>::completing(apply_lower);
+                        let reference = || PairJoinAt::<N5>::presenting(apply_lower);
                         // The history: one key with two values, one of them retracted at `t1`, so that
                         // consolidation after advancing has something to do; the other input at `t1`.
                         let history = vec![((7u64, 3u64), t0, 1i64), ((7, 3), t1, -1), ((7, 4), t0, 1)];
                         let other = vec![((7u64, 70u64), t1, 1i64)];
                         let as_of = |rows: &Vec<((u64, u64), N5, i64)>| rows.iter().map(|(d, t, r)| (*d, advanced_n5(*t, &frontier), *r)).collect::<Vec<_>>();
                         let got = joined_at(ProxyJoinTactic::new(BackendFrontier::new(backend(), frontier.clone())).prep(vec![hbatch(history.clone(), N5(0), N5(0))], vec![hbatch(other.clone(), N5(0), N5(0))], Fresh::Input1, lower));
-                        let want = joined_at(ProxyJoinTactic::new(backend()).prep(vec![hbatch(as_of(&history), N5(0), N5(0))], vec![hbatch(as_of(&other), N5(0), N5(0))], Fresh::Input1, lower));
+                        let want = joined_at(ProxyJoinTactic::new(reference()).prep(vec![hbatch(as_of(&history), N5(0), N5(0))], vec![hbatch(as_of(&other), N5(0), N5(0))], Fresh::Input1, lower));
                         units += 1;
                         let identical = agree_beyond(&got, &want, &frontier, "join");
                         // Exact when the backend presents stored times, when `F` has one element, or
@@ -936,4 +955,47 @@ fn reduce_as_of_frontier_in_n5() {
         }
     }
     println!("reduce over N5: {units} retires; {exact} exact by the claims; {crossing} where the bound crosses F, of which {} differ exactly: {differ:?}", differ.len());
+}
+
+// ===== Completing and presenting =====
+//
+// A join backend may complete a key itself or present it to the tactic. Either way the output is
+// the same collection.
+
+/// A small deterministic generator.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) % bound
+    }
+}
+
+/// A join over product times in which some keys are completed by the backend and the rest matched
+/// by the tactic: the output is the one a backend that presents every key produces.
+#[test]
+fn join_completing_matches_presenting() {
+    type T = Product<u64, u64>;
+    for seed in 0..20u64 {
+        let mut rng = Lcg(seed);
+        let mut side = |rows: u64| -> Vec<((u64, u64), T, i64)> {
+            let mut out: Vec<_> = (0..rows).map(|_| ((rng.next(6), rng.next(5)), T::new(rng.next(3), rng.next(3)), if rng.next(4) == 0 { -1 } else { 1 })).collect();
+            consolidate_updates(&mut out);
+            out
+        };
+        // Enough rows that some keys take the tactic's replay, with sixteen or more on both sides.
+        let (rows0, rows1) = (side(200), side(200));
+        let lower = T::new(0, 0);
+        let run = |backend: PairJoinAt<T>| {
+            let rows = ProxyJoinTactic::new(backend).prep(vec![hbatch(rows0.clone(), lower, lower)], vec![hbatch(rows1.clone(), lower, lower)], Fresh::Input0, lower);
+            let mut out: Vec<_> = rows.flatten().map(|((_, (x, y)), t, r)| ((x, y), t, r)).collect();
+            consolidate_updates(&mut out);
+            out
+        };
+        let want = run(PairJoinAt::presenting(false));
+        assert!(!want.is_empty());
+        assert_eq!(run(PairJoinAt::completing(false)), want, "seed {seed}: completing every key");
+        // Some keys each way, in one block.
+        assert_eq!(run(PairJoinAt { apply_lower: true, complete: |key| key % 2 == 0, _t: std::marker::PhantomData }), want, "seed {seed}: completing some keys");
+    }
 }
