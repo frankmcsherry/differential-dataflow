@@ -102,8 +102,6 @@ pub(crate) struct CorgiJoinBackend<T: ColTime> {
     graph: Graph<NumOp>,
     /// What the graph reads of its input.
     reads: Reads,
-    /// The row pairs of the keys `advance` completes, crossed before it returns; held for its allocations.
-    completed: Pairs,
     _t: PhantomData<T>,
 }
 
@@ -117,13 +115,6 @@ struct Pairs {
 }
 
 impl Pairs {
-    fn clear(&mut self) {
-        self.chunk0.clear();
-        self.row0.clear();
-        self.chunk1.clear();
-        self.row1.clear();
-    }
-
     /// Every pair of a row of `runs0` with a row of `runs1`, runs of the first and second input.
     fn cross(&mut self, runs0: &[Run], runs1: &[Run]) {
         for &(chunk0, s0, e0) in runs0 {
@@ -160,7 +151,7 @@ impl<T: ColTime> CorgiJoinBackend<T> {
         let input = Shape::Prod(vec![k, v0, v1]);
         let narrowed = corgi::narrow(compiled, &Demand::All)
             .unwrap_or_else(|e| panic!("join projection: narrowing a compiled graph at {input}: {e}"));
-        CorgiJoinBackend { colliding: Vec::new(), graph: narrowed.graph, reads: Reads::new(narrowed.input, &input), completed: Pairs::default(), _t: PhantomData }
+        CorgiJoinBackend { colliding: Vec::new(), graph: narrowed.graph, reads: Reads::new(narrowed.input, &input), _t: PhantomData }
     }
 
     /// The output of row `pairs` of the two inputs' chunks: their columns gathered into the
@@ -248,7 +239,9 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
         // reads the projected columns at the token's coordinate, which any row of the token serves.
         let proj0 = SideProj::new(&chunks0, &self.reads.columns[1]);
         let proj1 = SideProj::new(&chunks1, &self.reads.columns[2]);
-        let mut completed = std::mem::take(&mut self.completed);
+        // The row pairs of the keys this block completes. They are not kept between blocks:
+        // one fat block would pin its pairs' memory for the life of the operator.
+        let mut completed = Pairs::default();
         advance_leaf(
             &chunks0,
             &chunks1,
@@ -264,9 +257,7 @@ impl<T: ColTime> ProxyJoinBackend<T, CBatch<T>, CBatch<T>> for CorgiJoinBackend<
         // The completed keys' pairs are crossed here, as the tactic's matches are in `cross`.
         if !completed.row0.is_empty() {
             self.cross_rows(&chunks0, &chunks1, &completed, instance.lower, output);
-            completed.clear();
         }
-        self.completed = completed;
     }
 
     fn cross(
@@ -1095,7 +1086,7 @@ mod tests {
                 let mut narrowed = CorgiJoinBackend::new(&lambda, shapes.clone());
                 let mut original = CorgiJoinBackend {
                     colliding: Vec::new(), graph: compile_projection(&lambda, &shapes).unwrap().graph().clone(),
-                    reads: Reads::new(Demand::All, &Shape::Prod(shapes.to_vec())), completed: Pairs::default(), _t: PhantomData,
+                    reads: Reads::new(Demand::All, &Shape::Prod(shapes.to_vec())), _t: PhantomData,
                 };
                 let run = |backend: &mut CorgiJoinBackend<u64>| {
                     let (mut left, mut right) = (Vec::new(), Vec::new());
