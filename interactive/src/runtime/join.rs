@@ -47,7 +47,7 @@ use differential_dataflow::operators::int_proxy::{KeyPosition, JoinInstance, Pro
 use differential_dataflow::operators::int_proxy::join::JoinMatches;
 use differential_dataflow::trace::chunk::{Chunk, ChunkBatch};
 
-use corgi::arrange::{compare_at, equal_idx, gather_lanes};
+use corgi::arrange::{compare_at, equal_idx, gather_lanes, sort_blocks};
 use crate::runtime::search::matching_ranges;
 use corgi::{shape_of_value, Demand, Graph, NumOp, Shape, Value as CValue};
 
@@ -64,6 +64,7 @@ const TARGET_OUT: usize = 1 << 18;
 /// A key with fewer rows than this on either side is completed by `advance`, as every pair of
 /// its rows. The tactic's replay can only pay for itself on a key at or above this on both sides,
 /// where it bounds the work by the netted accumulations rather than the histories.
+/// A completed key with rows of both signs on one side has that side netted first ([`net_side`]).
 const COMPLETE_BELOW: usize = 16;
 /// Coordinate packing: chunk index in the high bits, row in the low `COORD_BITS`.
 pub(super) const COORD_BITS: u32 = 48;
@@ -112,6 +113,10 @@ struct Pairs {
     row0: Vec<usize>,
     chunk1: Vec<usize>,
     row1: Vec<usize>,
+    /// The diffs of the pairs from `netted_from` on, which are of rows netted before pairing.
+    /// The pairs before it take the product of their two rows' stored diffs.
+    netted_from: Option<usize>,
+    diffs: Vec<Diff>,
 }
 
 impl Pairs {
@@ -140,6 +145,61 @@ fn completes(runs: (&[Run], &[Run]), kinds: (ProjKind, ProjKind)) -> bool {
     let (rows0, rows1) = (rows(runs.0), rows(runs.1));
     let plain = |kind: ProjKind, rows: usize| rows == 1 || kind == ProjKind::Whole;
     (rows0 < COMPLETE_BELOW || rows1 < COMPLETE_BELOW) && plain(kinds.0, rows0) && plain(kinds.1, rows1)
+}
+
+/// Whether the rows of `runs` have diffs of both signs.
+///
+/// Rows of one side can only cancel when they do: a value added in one batch and taken away
+/// in a later one. Every pair of such a key's rows would carry the cancelling rows on to the
+/// next operator, so the side is netted before its rows are paired ([`net_side`]).
+/// Rows of one sign cannot cancel, whatever their values.
+fn mixed_signs<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], runs: &[Run]) -> bool {
+    let (mut positive, mut negative) = (false, false);
+    for &(chunk, s, e) in runs {
+        for &diff in &chunks[chunk].diffs()[s..e] {
+            positive |= diff > 0;
+            negative |= diff < 0;
+        }
+    }
+    positive && negative
+}
+
+/// One side's rows of several keys, netted: for each key of `keys`, in order, the rows that are
+/// left once equal values at equal times, advanced by `lower`, have their diffs summed and the
+/// zeros dropped. Each is `(key's index in keys, chunk, row, diff)`, the row standing for all
+/// the rows summed into it.
+///
+/// This is one sort of all the keys' rows, by value and time within each key, and not a pass
+/// for each key.
+fn net_side<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], lower: &T, keys: &[&[Run]]) -> Vec<(usize, usize, usize, Diff)> {
+    let (mut labels, mut tags, mut offs) = (Vec::new(), Vec::new(), Vec::new());
+    for (label, runs) in keys.iter().enumerate() {
+        for &(chunk, s, e) in runs.iter() {
+            labels.extend(std::iter::repeat_n(label as u64, e - s));
+            tags.extend(std::iter::repeat_n(chunk, e - s));
+            offs.extend(s..e);
+        }
+    }
+    let vals: Vec<Option<&CValue>> = chunks.iter().map(|c| Some(c.vals())).collect();
+    let bound: Vec<u64> = lower.coordinates().collect();
+    let width = chunks.iter().map(|c| c.times().width()).max().unwrap_or(0).max(bound.len());
+    let mut fields = vec![gather_lanes(&vals, &tags, &offs)];
+    // The times only need to group, not to order, so each lane is read as it is stored.
+    fields.extend((0..width).map(|j| {
+        let low = bound.get(j).copied().unwrap_or(0);
+        CValue::i64(tags.iter().zip(&offs).map(|(&chunk, &row)| chunks[chunk].times().coordinate(j, row).max(low) as i64).collect())
+    }));
+    let (perm, groups) = sort_blocks(&labels, &CValue::Prod(fields));
+    let mut kept = Vec::new();
+    let mut start = 0;
+    for group in groups.chunk_by(|a, b| a == b) {
+        let end = start + group.len();
+        let diff: Diff = perm[start..end].iter().map(|&i| chunks[tags[i]].diffs()[offs[i]]).sum();
+        // The sort keeps each key's rows in the key's place, so the label there is still the key's.
+        if diff != 0 { kept.push((labels[start] as usize, tags[perm[start]], offs[perm[start]], diff)); }
+        start = end;
+    }
+    kept
 }
 
 impl<T: ColTime> CorgiJoinBackend<T> {
@@ -184,7 +244,10 @@ impl<T: ColTime> CorgiJoinBackend<T> {
                 let low = bound.get(j).copied().unwrap_or(0);
                 (0..rows).map(|i| chunks0[chunk0[i]].times().coordinate(j, row0[i]).max(chunks1[chunk1[i]].times().coordinate(j, row1[i])).max(low)).collect()
             }).collect();
-            let diffs = (0..rows).map(|i| chunks0[chunk0[i]].diffs()[row0[i]] * chunks1[chunk1[i]].diffs()[row1[i]]).collect();
+            let diffs = (0..rows).map(|i| match pairs.netted_from {
+                Some(from) if start + i >= from => pairs.diffs[start + i - from],
+                _ => chunks0[chunk0[i]].diffs()[row0[i]] * chunks1[chunk1[i]].diffs()[row1[i]],
+            }).collect();
             output.push(CorgiContainer { keys: nk, vals: nv, times: ColTimes::from_raw_lanes(lanes, rows), diffs });
             start = end;
         }
@@ -1006,6 +1069,8 @@ fn advance_leaf<T: ColTime>(
     let kinds = (proj0.kind, proj1.kind);
     let (view0, view1) = (SideView::new(chunks0, proj0), SideView::new(chunks1, proj1));
     let (mut scratch0, mut scratch1) = (SideScratch::new(), SideScratch::new());
+    // The completed keys with a side to net first: their runs, and which sides.
+    let mut netting: Vec<(&[Run], &[Run], (bool, bool))> = Vec::new();
     for (m, &(j0, j1)) in both.iter().enumerate() {
         let key = runs0.keys[j0];
         let (of0, of1) = (runs0.of(j0), runs1.of(j1));
@@ -1022,7 +1087,8 @@ fn advance_leaf<T: ColTime>(
         }
         if let Some(pairs) = completed.as_mut() {
             if completes((of0, of1), kinds) {
-                pairs.cross(of0, of1);
+                let mixed = (mixed_signs(chunks0, of0), mixed_signs(chunks1, of1));
+                if mixed == (false, false) { pairs.cross(of0, of1); } else { netting.push((of0, of1, mixed)); }
                 continue;
             }
         }
@@ -1031,6 +1097,46 @@ fn advance_leaf<T: ColTime>(
         if !scratch0.entries.is_empty() && !scratch1.entries.is_empty() {
             scratch0.emit(key, bridge0);
             scratch1.emit(key, bridge1);
+        }
+    }
+
+    // The keys set aside: each side with both signs is netted, all such keys at once, and what
+    // is left is paired, with the diffs the netting gave.
+    if !netting.is_empty() {
+        let pairs = completed.expect("a key is only set aside to net when keys are completed");
+        let net0 = net_side(chunks0, lower, &netting.iter().filter(|key| key.2.0).map(|key| key.0).collect::<Vec<_>>());
+        let net1 = net_side(chunks1, lower, &netting.iter().filter(|key| key.2.1).map(|key| key.1).collect::<Vec<_>>());
+        // One side's rows of a key: the next netted key's, or its stored rows as they are.
+        fn side_rows<T: ColTime>(
+            rows: &mut Vec<(usize, usize, Diff)>, chunks: &[&CorgiChunk<T, Diff>], runs: &[Run],
+            mixed: bool, net: &[(usize, usize, usize, Diff)], at: &mut usize, label: &mut usize,
+        ) {
+            rows.clear();
+            if mixed {
+                while *at < net.len() && net[*at].0 == *label {
+                    rows.push((net[*at].1, net[*at].2, net[*at].3));
+                    *at += 1;
+                }
+                *label += 1;
+            } else {
+                for &(chunk, s, e) in runs { rows.extend((s..e).map(|row| (chunk, row, chunks[chunk].diffs()[row]))); }
+            }
+        }
+        pairs.netted_from = Some(pairs.row0.len());
+        let (mut rows0, mut rows1) = (Vec::new(), Vec::new());
+        let (mut at0, mut at1, mut label0, mut label1) = (0, 0, 0, 0);
+        for &(of0, of1, (mixed0, mixed1)) in &netting {
+            side_rows(&mut rows0, chunks0, of0, mixed0, &net0, &mut at0, &mut label0);
+            side_rows(&mut rows1, chunks1, of1, mixed1, &net1, &mut at1, &mut label1);
+            for &(chunk0, row0, diff0) in &rows0 {
+                for &(chunk1, row1, diff1) in &rows1 {
+                    pairs.chunk0.push(chunk0);
+                    pairs.row0.push(row0);
+                    pairs.chunk1.push(chunk1);
+                    pairs.row1.push(row1);
+                    pairs.diffs.push(diff0 * diff1);
+                }
+            }
         }
     }
 }
@@ -1165,6 +1271,36 @@ mod tests {
             backend.advance(&instance.instance(), &mut KeyPosition::Start, &mut left, &mut right, &mut Vec::new());
             assert!(left.is_empty() && right.is_empty(), "{body}");
         }
+    }
+
+    /// A value added in one batch and taken away in a later one nets to nothing before the key
+    /// is matched, though the key is small enough to complete. Rows of one sign are completed.
+    #[test]
+    fn completed_keys_do_not_carry_cancelling_rows() {
+        let make = |val, diff| Rc::new(ChunkBatch::new(vec![CorgiChunk::from_columns(
+            ints(vec![7]), ints(vec![val]), [0].into_iter().collect(), vec![diff],
+        )]));
+        for (diffs, rows) in [([1, -1], 0), ([1, 1], 2), ([-1, -1], 2)] {
+            let (batches0, batches1) = (vec![make(1, diffs[0]), make(1, diffs[1])], vec![make(2, 1)]);
+            let instance = JoinInstance { batches0: &batches0, batches1: &batches1, lower: &0, present_all: false };
+            let mut backend = backend([Shape::Int, Shape::Int, Shape::Int]);
+            let (mut left, mut right, mut output) = (Vec::new(), Vec::new(), Vec::new());
+            backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right, &mut output);
+            assert!(left.is_empty() && right.is_empty(), "{diffs:?}");
+            assert_eq!(output.iter().map(|container| container.diffs.len()).sum::<usize>(), rows, "{diffs:?}");
+        }
+        // What does not cancel is kept, with its summed diff, and nothing is presented:
+        // value 1 nets to +2, value 3 to nothing, value 4 stays -1; the other side nets 2 to +1.
+        let batches0 = vec![make(1, 3), make(1, -1), make(3, 1), make(3, -1), make(4, -1)];
+        let batches1 = vec![make(2, 2), make(2, -1)];
+        let instance = JoinInstance { batches0: &batches0, batches1: &batches1, lower: &0, present_all: false };
+        let mut backend = backend([Shape::Int, Shape::Int, Shape::Int]);
+        let (mut left, mut right, mut output) = (Vec::new(), Vec::new(), Vec::new());
+        backend.advance(&instance, &mut KeyPosition::Start, &mut left, &mut right, &mut output);
+        assert!(left.is_empty() && right.is_empty());
+        let mut diffs: Vec<Diff> = output.iter().flat_map(|container| container.diffs.iter().copied()).collect();
+        diffs.sort();
+        assert_eq!(diffs, vec![-1, 2]);
     }
 
     #[test]
