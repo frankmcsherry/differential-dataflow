@@ -63,6 +63,8 @@ struct Inner<T, R> {
     times: ColTimes<T>,
     /// Per-update diffs.
     diffs: Vec<R>,
+    /// Whether any diff is positive, and whether any is negative: found once, when first asked.
+    signs: std::cell::OnceCell<(bool, bool)>,
 }
 
 /// A sorted, consolidated run of `((key, val), time, diff)` with corgi-columnar key/val, shared via `Rc`.
@@ -74,7 +76,7 @@ impl<T, R> Clone for CorgiChunk<T, R> {
 
 impl<T, R> Default for CorgiChunk<T, R> {
     fn default() -> Self {
-        CorgiChunk(Rc::new(Inner { keys: CValue::Unit(0), vals: CValue::Unit(0), times: ColTimes::default(), diffs: Vec::new() }))
+        CorgiChunk(Rc::new(Inner { keys: CValue::Unit(0), vals: CValue::Unit(0), times: ColTimes::default(), diffs: Vec::new(), signs: Default::default() }))
     }
 }
 
@@ -88,7 +90,7 @@ fn split_kv(kv: CValue) -> (CValue, CValue) {
 
 impl<T, R> CorgiChunk<T, R> {
     fn from_parts(keys: CValue, vals: CValue, times: ColTimes<T>, diffs: Vec<R>) -> Self {
-        CorgiChunk(Rc::new(Inner { keys, vals, times, diffs }))
+        CorgiChunk(Rc::new(Inner { keys, vals, times, diffs, signs: Default::default() }))
     }
     /// The `(key, val)` sort payload as one corgi `Prod` column (cheap `Arc` bumps).
     fn kv(&self) -> CValue { CValue::Prod(vec![self.0.keys.clone(), self.0.vals.clone()]) }
@@ -100,6 +102,16 @@ impl<T, R> CorgiChunk<T, R> {
     pub(crate) fn vals(&self) -> &CValue { &self.0.vals }
     pub fn times(&self) -> &ColTimes<T> { &self.0.times }
     pub(crate) fn diffs(&self) -> &[R] { &self.0.diffs }
+}
+
+impl<T> CorgiChunk<T, crate::ir::Diff> {
+    /// Whether any diff is positive, and whether any is negative.
+    ///
+    /// A fact of the whole chunk, read once: a reader can rule out cancellation among a
+    /// chunk's rows without looking at them.
+    pub(crate) fn signs(&self) -> (bool, bool) {
+        *self.0.signs.get_or_init(|| (self.0.diffs.iter().any(|&diff| diff > 0), self.0.diffs.iter().any(|&diff| diff < 0)))
+    }
 }
 
 impl<T, R> CorgiChunk<T, R>
