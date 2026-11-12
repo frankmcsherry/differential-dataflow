@@ -154,12 +154,36 @@ fn completes(runs: (&[Run], &[Run]), kinds: (ProjKind, ProjKind)) -> bool {
 /// next operator, so the side is netted before its rows are paired ([`net_side`]).
 /// Rows of one sign cannot cancel, whatever their values.
 fn mixed_signs<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], runs: &[Run]) -> bool {
+    // One row has one sign.
+    if let [(_, s, e)] = runs { if e - s == 1 { return false; } }
     let (mut positive, mut negative) = (false, false);
     for &(chunk, s, e) in runs {
         for &diff in &chunks[chunk].diffs()[s..e] {
             positive |= diff > 0;
             negative |= diff < 0;
         }
+    }
+    positive && negative
+}
+
+/// Whether the chunks have diffs of both signs between them, by what each chunk knows of itself.
+///
+/// When they do not, no key has both signs on this side, and none need be asked.
+fn side_mixed_signs<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>]) -> bool {
+    let signs = chunks.iter().fold((false, false), |all, chunk| (all.0 | chunk.signs().0, all.1 | chunk.signs().1));
+    signs.0 && signs.1
+}
+
+/// Whether rows `starts[c]..ends[c]` of the chunks have diffs of both signs between them.
+///
+/// When they do not, no key of the block has both signs on this side, and none need be asked.
+fn block_mixed_signs<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], starts: &[usize], ends: &[usize]) -> bool {
+    if !side_mixed_signs(chunks) { return false; }
+    let (mut positive, mut negative) = (false, false);
+    for (c, chunk) in chunks.iter().enumerate() {
+        let diffs = &chunk.diffs()[starts[c]..ends[c]];
+        positive |= diffs.iter().any(|&diff| diff > 0);
+        negative |= diffs.iter().any(|&diff| diff < 0);
     }
     positive && negative
 }
@@ -1028,25 +1052,32 @@ fn advance_leaf<T: ColTime>(
         chunks.iter().zip(starts).map(|(c, &s)| c.len() - s).sum()
     };
     let (r0, r1) = (remaining(chunks0, &start0), remaining(chunks1, &start1));
-    let (h, runs0, runs1) = if r0.max(r1) >= 2 * r0.min(r1) {
+    // With each side's runs, whether its keys may have diffs of both signs. A side read in bulk
+    // is asked once for the block. A side that is searched is asked what its chunks know, and
+    // then key by key.
+    let (h, runs0, runs1, may_mix) = if r0.max(r1) >= 2 * r0.min(r1) {
         // Lopsided: only the driver is read in bulk, so only the driver bounds the block.
         if r0 <= r1 {
             let h = block_horizon(chunks0, &start0, PULL);
-            let runs0 = SideRuns::scan(chunks0, &start0, &block_ends(chunks0, h));
+            let end0 = block_ends(chunks0, h);
+            let runs0 = SideRuns::scan(chunks0, &start0, &end0);
             let runs1 = SideRuns::probe(chunks1, &runs0.keys);
-            (h, runs0, runs1)
+            (h, runs0, runs1, (block_mixed_signs(chunks0, &start0, &end0), side_mixed_signs(chunks1)))
         } else {
             let h = block_horizon(chunks1, &start1, PULL);
-            let runs1 = SideRuns::scan(chunks1, &start1, &block_ends(chunks1, h));
+            let end1 = block_ends(chunks1, h);
+            let runs1 = SideRuns::scan(chunks1, &start1, &end1);
             let runs0 = SideRuns::probe(chunks0, &runs1.keys);
-            (h, runs0, runs1)
+            (h, runs0, runs1, (side_mixed_signs(chunks0), block_mixed_signs(chunks1, &start1, &end1)))
         }
     } else {
         // Symmetric: both sides are read, so both bound the block.
         let h = block_horizon(chunks0, &start0, PULL).into_iter()
             .chain(block_horizon(chunks1, &start1, PULL))
             .min();
-        (h, SideRuns::scan(chunks0, &start0, &block_ends(chunks0, h)), SideRuns::scan(chunks1, &start1, &block_ends(chunks1, h)))
+        let (end0, end1) = (block_ends(chunks0, h), block_ends(chunks1, h));
+        let may_mix = (block_mixed_signs(chunks0, &start0, &end0), block_mixed_signs(chunks1, &start1, &end1));
+        (h, SideRuns::scan(chunks0, &start0, &end0), SideRuns::scan(chunks1, &start1, &end1), may_mix)
     };
     // The block ran to the horizon; resume there (`None` = a side is exhausted, and with it
     // the intersection).
@@ -1087,7 +1118,7 @@ fn advance_leaf<T: ColTime>(
         }
         if let Some(pairs) = completed.as_mut() {
             if completes((of0, of1), kinds) {
-                let mixed = (mixed_signs(chunks0, of0), mixed_signs(chunks1, of1));
+                let mixed = (may_mix.0 && mixed_signs(chunks0, of0), may_mix.1 && mixed_signs(chunks1, of1));
                 if mixed == (false, false) { pairs.cross(of0, of1); } else { netting.push((of0, of1, mixed)); }
                 continue;
             }
