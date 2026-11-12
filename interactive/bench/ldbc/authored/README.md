@@ -80,6 +80,21 @@ bind-plus-peek latencies and whether the answers match, and writes `report.json`
 instead of the CSVs, which is faster at SF1. To maintain an authored plan over
 the update stream, pass it to `update_stream.py --plan`.
 
+## Variants
+
+`variants/` holds alternative plans for some reads, under the same file names and the same
+contract. Point `--plans` at it to check and time one in place of the plan in `plans/`:
+
+```sh
+python3 interactive/bench/ldbc/authored/check.py --server target/release/ddir_server \
+    --snapshot /path/to/initial_snapshot --plans interactive/bench/ldbc/authored/variants \
+    --output /tmp/authored-variants ic5
+```
+
+| Query | Variant | Measured |
+| --- | --- | --- |
+| [IC5](variants/ic05.ddp) | Counted forums start from the circle's posts per forum and look each membership up by (person, forum); forums without posts read memberships from the shared index; titles are fetched for the 20 winners. The circle's memberships are never arranged. It keeps memberships by (person, forum) for all requests | SF0.1, one worker, three requests: bind 60 → 14 ms, release 62 → 13 ms, the tick after a release 83 → 6 ms; settling after load is about 35 ms slower across the 41-query suite. Not measured at SF1 or on other bindings |
+
 ## What each plan does
 
 "Same as the generated plan" means the same joins in the same order, the same
