@@ -2,6 +2,12 @@
 //!
 //! A conventional differential join against ordered, copyable proxies.
 //! The backend interprets proxies and is relieved of lattice-time reasoning.
+//!
+//! The backend asks for that relief a key at a time.
+//! It may *complete* a key itself, producing the key's whole output, or *present* the key for the tactic to match.
+//! A join has no schedule to get wrong: a key's output is every pair of its updates, at the join of their times, with the product of their diffs.
+//! A backend that can state that for a key, because the key's updates are few or share one time, need not present it.
+//! What the tactic offers is the replay that bounds the work on a key with a long history on both sides.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -18,8 +24,8 @@ use super::history::IdHistory;
 
 /// A type that can interpret and retire pairs of lists of batches, joined by keys.
 ///
-/// The harness repeatedly invokes [`advance`](Self::advance) to draw a block of the proxy collection,
-/// then [`cross`](Self::cross) to turn that block's matches into output containers, until `advance` reports the key space exhausted.
+/// The harness repeatedly invokes [`advance`](Self::advance) to work through a block of the key space,
+/// then [`cross`](Self::cross) to turn the matches of that block's presented keys into output containers, until `advance` reports the key space exhausted.
 pub trait ProxyJoinBackend<T, B0, B1> {
     /// Independent groups, common to both inputs.
     type Key: Copy + Ord;
@@ -36,19 +42,28 @@ pub trait ProxyJoinBackend<T, B0, B1> {
     /// The output container built from matched value ids.
     type Output;
 
-    /// Populates the two bridges with all updates for all keys that match in a returned range.
+    /// Works through the keys that match in a returned range, completing each or presenting it.
     ///
     /// The `from` position is `Start` or an inclusive `At(key)` lower bound.
     /// The backend writes the window's exclusive upper bound as `At(key)`, or `End` when exhausted.
     /// Each call must strictly advance `from`.
-    /// The returned bridges must contain all updates from both `instance` inputs for keys that are present in both inputs, and
-    /// which are greater or equal to the initial `from`, and not greater or equal to its value when returned.
+    ///
+    /// The range's keys are those present in both `instance` inputs, which are greater or equal to the initial `from`,
+    /// and not greater or equal to its value when returned.
+    /// The backend treats each such key in one of two ways.
+    /// It *completes* the key: `output` receives containers holding the key's whole output, every pair of its updates
+    /// from the two inputs, at the join of the two times, with the product of the two diffs.
+    /// Or it *presents* the key: the bridges receive all of its updates from both inputs, for the tactic to match and
+    /// hand back through [`Self::cross`].
+    /// Which keys to complete is the backend's choice, unless [`JoinInstance::present_all`] is set, when it presents them all.
+    /// Either way times may be advanced by `instance.lower`, and updates that then coincide consolidated.
     fn advance(
         &mut self,
-        instance: &JoinInstance<T, B0, B1>,
+        instance: &JoinInstance<'_, T, B0, B1>,
         from: &mut KeyPosition<Self::Key>,
         bridge0: &mut ProxyBridge<T, Self::R0, Self::Key, Self::V0>,
         bridge1: &mut ProxyBridge<T, Self::R1, Self::Key, Self::V1>,
+        output: &mut Vec<Self::Output>,
     );
 
     /// Interpret matches derived from the immediately preceding [`Self::advance`] call and place
@@ -57,23 +72,33 @@ pub trait ProxyJoinBackend<T, B0, B1> {
     /// block produced no matches, in which case the next `advance` may overwrite that state.
     fn cross(
         &mut self,
-        instance: &JoinInstance<T, B0, B1>,
+        instance: &JoinInstance<'_, T, B0, B1>,
         matches: &mut JoinMatches<T, Self::ROut, Self::Key, Self::V0, Self::V1>,
         output: &mut Vec<Self::Output>,
     );
 }
 
 /// A unit of proxied join work, for presentation to the backend.
-pub struct JoinInstance<T, B0, B1> {
+pub struct JoinInstance<'a, T, B0, B1> {
     /// The first input's batches.
-    pub batches0: Vec<B0>,
+    pub batches0: &'a [B0],
     /// The second input's batches.
-    pub batches1: Vec<B1>,
+    pub batches1: &'a [B1],
     /// A lower bound on the meet of pairs of update times.
     ///
     /// This can be applied when loading updates to consolidate on load.
-    pub lower: T,
+    pub lower: &'a T,
+    /// The backend must present every key, and complete none itself.
+    ///
+    /// Set by a caller that reads the presentations other than as the backend stores them,
+    /// as [`BackendFrontier`](super::BackendFrontier) does for a unit it reads as of a frontier.
+    pub present_all: bool,
 }
+
+impl<T, B0, B1> Clone for JoinInstance<'_, T, B0, B1> {
+    fn clone(&self) -> Self { *self }
+}
+impl<T, B0, B1> Copy for JoinInstance<'_, T, B0, B1> {}
 
 /// Presentation of discovered join matches.
 ///
@@ -120,7 +145,9 @@ where
     fn prep(&mut self, input0: Vec<B0>, input1: Vec<B1>, _fresh: Fresh, meet: T) -> Box<dyn Iterator<Item = Bk::Output>> {
         Box::new(ProxyJoinIter {
             backend: Rc::clone(&self.backend),
-            instance: JoinInstance { batches0: input0, batches1: input1, lower: meet },
+            batches0: input0,
+            batches1: input1,
+            lower: meet,
             from: KeyPosition::Start,
             p0: Vec::new(),
             p1: Vec::new(),
@@ -134,8 +161,9 @@ where
 
 /// Deferred proxy join computation, as an iterator of output containers.
 ///
-/// The iterator draws the proxy collection from the back-end a block at a time (`Bk::advance`).
-/// Each block is then translated to output updates with joined times and multiplied differences,
+/// The iterator has the back-end work through the key space a block at a time (`Bk::advance`).
+/// The back-end's own containers, for the keys it completed, are returned as they are.
+/// The keys it presented are translated to output updates with joined times and multiplied differences,
 /// which are provided to the back-end to translate into output containers, which are then returned.
 struct ProxyJoinIter<T, B0, B1, Bk>
 where
@@ -144,10 +172,12 @@ where
     /// The backend, shared across all outstanding iterators.
     backend: Rc<RefCell<Bk>>,
     /// The iterator's inputs, and the time at which they can consolidate as they load.
-    instance: JoinInstance<T, B0, B1>,
+    batches0: Vec<B0>,
+    batches1: Vec<B1>,
+    lower: T,
     /// Progress through the key space, from `Start` through inclusive key bounds to `End`.
     from: KeyPosition<Bk::Key>,
-    /// The current block: the two runs `advance` last drew, which one `next` consumes entirely.
+    /// The current block's presented keys: the two runs `advance` last drew, which one `next` consumes entirely.
     p0: ProxyBridge<T, Bk::R0, Bk::Key, Bk::V0>,
     p1: ProxyBridge<T, Bk::R1, Bk::Key, Bk::V1>,
     /// Per-key replay histories, held across the iterator and reloaded per key when needed.
@@ -172,6 +202,8 @@ where
             self.refill();
             self.work();
             if !self.matches.ids.is_empty() { self.cross(); }
+            // `next` serves from the back, so reverse to ship in the order the backend produced.
+            self.ready.reverse();
         }
         self.ready.pop()
     }
@@ -182,12 +214,14 @@ where
     T: Timestamp + Lattice,
     Bk: ProxyJoinBackend<T, B0, B1>,
 {
-    /// Draw the next block from the backend.
+    /// Have the backend work through the next block: its completed keys' containers are ready,
+    /// and its presented keys are drawn.
     fn refill(&mut self) {
         self.p0.clear();
         self.p1.clear();
         let before = self.from;
-        self.backend.borrow_mut().advance(&self.instance, &mut self.from, &mut self.p0, &mut self.p1);
+        let instance = JoinInstance { batches0: &self.batches0, batches1: &self.batches1, lower: &self.lower, present_all: false };
+        self.backend.borrow_mut().advance(&instance, &mut self.from, &mut self.p0, &mut self.p1, &mut self.ready);
         // Without progress the iterator would never retire, so this guards liveness as well as contract.
         debug_assert!(
             self.from > before,
@@ -215,7 +249,7 @@ where
         let (mut i, mut j) = (0usize, 0usize);
         while i < p0.len() && j < p1.len() {
             let ki = p0[i].0.0;
-            debug_assert!(ki == p1[j].0.0, "advance must report common keys");
+            debug_assert!(ki == p1[j].0.0, "advance must present common keys");
             let mut e0 = i;
             while e0 < p0.len() && p0[e0].0.0 == ki { e0 += 1; }
             let mut e1 = j;
@@ -229,13 +263,12 @@ where
 
     /// Turn the block's matches into containers, ready to be served one at a time.
     fn cross(&mut self) {
+        let instance = JoinInstance { batches0: &self.batches0, batches1: &self.batches1, lower: &self.lower, present_all: false };
         self.backend.borrow_mut().cross(
-            &self.instance,
+            &instance,
             &mut self.matches,
             &mut self.ready,
         );
-        // `next` serves from the back, so reverse to ship in the order the backend produced.
-        self.ready.reverse();
         self.matches.ids.clear();
         self.matches.times.clear();
         self.matches.diffs.clear();
