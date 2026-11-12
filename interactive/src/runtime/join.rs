@@ -125,15 +125,15 @@ impl Pairs {
     }
 
     /// Every pair of a row of `runs0` with a row of `runs1`, runs of the first and second input.
-    fn cross<T: ColTime>(&mut self, runs0: &[RunRef<'_, T>], runs1: &[RunRef<'_, T>]) {
-        for run0 in runs0 {
-            for run1 in runs1 {
-                for row0 in run0.s..run0.e {
-                    let rows = run1.e - run1.s;
-                    self.chunk0.extend(std::iter::repeat_n(run0.cid, rows));
+    fn cross(&mut self, runs0: &[Run], runs1: &[Run]) {
+        for &(chunk0, s0, e0) in runs0 {
+            for &(chunk1, s1, e1) in runs1 {
+                for row0 in s0..e0 {
+                    let rows = e1 - s1;
+                    self.chunk0.extend(std::iter::repeat_n(chunk0, rows));
                     self.row0.extend(std::iter::repeat_n(row0, rows));
-                    self.chunk1.extend(std::iter::repeat_n(run1.cid, rows));
-                    self.row1.extend(run1.s..run1.e);
+                    self.chunk1.extend(std::iter::repeat_n(chunk1, rows));
+                    self.row1.extend(s1..e1);
                 }
             }
         }
@@ -144,11 +144,11 @@ impl Pairs {
 ///
 /// Either side must be short. A side whose values the projection reads only in part is staged
 /// to net the rows that the projection cannot tell apart, unless it is one row, with nothing to net.
-fn completes<T: ColTime>(runs: (&[RunRef<'_, T>], &[RunRef<'_, T>])) -> bool {
-    let rows = |runs: &[RunRef<'_, T>]| runs.iter().map(|run| run.e - run.s).sum::<usize>();
+fn completes(runs: (&[Run], &[Run]), kinds: (ProjKind, ProjKind)) -> bool {
+    let rows = |runs: &[Run]| runs.iter().map(|run| run.2 - run.1).sum::<usize>();
     let (rows0, rows1) = (rows(runs.0), rows(runs.1));
-    let plain = |runs: &[RunRef<'_, T>], rows: usize| rows == 1 || runs.iter().all(|run| run.kind == ProjKind::Whole);
-    (rows0 < COMPLETE_BELOW || rows1 < COMPLETE_BELOW) && plain(runs.0, rows0) && plain(runs.1, rows1)
+    let plain = |kind: ProjKind, rows: usize| rows == 1 || kind == ProjKind::Whole;
+    (rows0 < COMPLETE_BELOW || rows1 < COMPLETE_BELOW) && plain(kinds.0, rows0) && plain(kinds.1, rows1)
 }
 
 impl<T: ColTime> CorgiJoinBackend<T> {
@@ -704,37 +704,6 @@ impl<T: ColTime> SideScratch<T> {
     }
 }
 
-/// Where `advance` records the row pairs of the keys it completes, if it may complete any.
-///
-/// The sides a block walks are in driver and probee order; `swapped` says the driver is the
-/// join's second input, as pairs name the first input's row first.
-type Completed<'a> = Option<(&'a mut Pairs, bool)>;
-
-/// Work through a non-colliding key: complete it as every pair of its rows, if `completed`
-/// allows and [`completes`] says so, or else stage it, and present it in the bridges if both
-/// sides survive consolidation.
-fn stage_pair<T: ColTime>(
-    token: i64,
-    runs: (&[RunRef<'_, T>], &[RunRef<'_, T>]),
-    lower: &T,
-    scratch: (&mut SideScratch<T>, &mut SideScratch<T>),
-    bridges: (&mut ProxyBridge<T, Diff, i64>, &mut ProxyBridge<T, Diff, i64>),
-    completed: Completed<'_>,
-) {
-    if let Some((pairs, swapped)) = completed {
-        if completes(runs) {
-            if swapped { pairs.cross(runs.1, runs.0) } else { pairs.cross(runs.0, runs.1) }
-            return;
-        }
-    }
-    scratch.0.stage_runs(runs.0, lower);
-    scratch.1.stage_runs(runs.1, lower);
-    if !scratch.0.entries.is_empty() && !scratch.1.entries.is_empty() {
-        scratch.0.emit(token, bridges.0);
-        scratch.1.emit(token, bridges.1);
-    }
-}
-
 /// The identifier column of a chunk's keys, as a sorted `i64` slice. Every arrangement key
 /// leads with its identifier ([`present_key`](crate::runtime::chunk::present_key)), so this is
 /// always available and always ordered — no gather, no copy.
@@ -777,55 +746,105 @@ fn block_ends<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], horizon: Option<i64>)
     }).collect()
 }
 
-/// View over one leaf-keyed chunk's rows for THIS block, `[base, end)`. The identifiers are
-/// borrowed from the chunk's own lane. Value comparison lanes also borrow the chunk,
-/// so selecting a block copies neither identifiers nor values.
-struct LeafView<'a, T: ColTime> {
-    chunk: &'a CorgiChunk<T, Diff>,
-    cid: usize,
-    /// Absolute row of `keys[0]`.
-    base: usize,
-    keys: &'a [i64],
-    /// The chunk's borrowed comparison lanes (the kept leaf lanes); `None` when vals are structured.
-    vals: Option<Vec<&'a [i64]>>,
-    /// The chunk's projected column, for structural compares of projected values.
-    pcol: Option<&'a CValue>,
-    kind: ProjKind,
-    /// Cursor within `keys`.
-    cur: usize,
-}
-
 /// Rows per chunk per block. Bounds the block's working set; nothing outside it is read.
 const PULL: usize = 1 << 14;
 
-impl<'a, T: ColTime> LeafView<'a, T> {
-    fn new(chunk: &'a CorgiChunk<T, Diff>, cid: usize, start: usize, end: usize, proj: &'a SideProj) -> Self {
-        let vals = if end > start { proj.lanes(chunk) } else { None };
-        LeafView { chunk, cid, base: start, keys: &ident(chunk)[start..end], vals, pcol: proj.pcol(cid), kind: proj.kind, cur: 0 }
+/// One key's rows in one chunk: the chunk, and its rows `[s, e)`.
+type Run = (usize, usize, usize);
+
+/// One side's keys in a block, ascending and distinct, each with its runs in chunk order.
+struct SideRuns {
+    keys: Vec<i64>,
+    /// The runs of `keys[j]` are `runs[ends[j - 1]..ends[j]]`.
+    ends: Vec<usize>,
+    runs: Vec<Run>,
+}
+
+impl SideRuns {
+    /// The runs of key `j`.
+    fn of(&self, j: usize) -> &[Run] {
+        &self.runs[if j == 0 { 0 } else { self.ends[j - 1] }..self.ends[j]]
     }
-    /// The key under the cursor, if any remains in this block.
-    fn cur_key(&self) -> Option<i64> {
-        self.keys.get(self.cur).copied()
+
+    /// Group `found`, runs with their keys, by key. The runs are in key order, or else in key
+    /// order within each chunk and the chunks in order.
+    fn group(mut found: Vec<(i64, Run)>) -> Self {
+        // A stable sort keeps a key's runs in chunk order.
+        if !found.is_sorted_by_key(|run| run.0) { found.sort_by_key(|run| run.0); }
+        let mut side = SideRuns { keys: Vec::new(), ends: Vec::new(), runs: Vec::with_capacity(found.len()) };
+        for (key, run) in found {
+            if side.keys.last() == Some(&key) { *side.ends.last_mut().unwrap() += 1; }
+            else { side.keys.push(key); side.ends.push(side.runs.len() + 1); }
+            side.runs.push(run);
+        }
+        side
     }
-    /// Take the run of `k` at the cursor, if that is the cursor's key: absolute `(start, end)`.
-    fn take_run(&mut self, k: i64) -> Option<(usize, usize)> {
-        if self.cur_key() != Some(k) { return None; }
-        let s = self.cur;
-        let e = s + self.keys[s..].partition_point(|&x| x == k);
-        self.cur = e;
-        Some((self.base + s, self.base + e))
+
+    /// The runs of rows `starts[c]..ends[c]` of each chunk `c`: one pass over each chunk's identifiers.
+    fn scan<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], starts: &[usize], ends: &[usize]) -> Self {
+        let mut found = Vec::new();
+        for (cid, chunk) in chunks.iter().enumerate() {
+            let lane = &ident(chunk)[..ends[cid]];
+            let mut s = starts[cid];
+            while s < lane.len() {
+                let key = lane[s];
+                let mut e = s + 1;
+                while e < lane.len() && lane[e] == key { e += 1; }
+                found.push((key, (cid, s, e)));
+                s = e;
+            }
+        }
+        Self::group(found)
     }
-    /// The run `[s, e)` as a [`RunRef`].
-    fn run_ref(&self, s: usize, e: usize) -> RunRef<'_, T> {
-        RunRef {
-            chunk: self.chunk,
-            cid: self.cid,
+
+    /// The runs of `keys`, ascending and distinct, in `chunks`: one search of each chunk.
+    /// Only the keys some chunk holds are kept.
+    fn probe<T: ColTime>(chunks: &[&CorgiChunk<T, Diff>], keys: &[i64]) -> Self {
+        let (mut found, mut ranges, mut scratch) = (Vec::new(), Vec::new(), Vec::new());
+        for (cid, chunk) in chunks.iter().enumerate() {
+            matching_ranges(keys, ident(chunk), &mut scratch, &mut ranges);
+            found.extend(ranges.iter().map(|(j, range)| (keys[*j], (cid, range.start, range.end))));
+        }
+        Self::group(found)
+    }
+}
+
+/// The keys both sides hold, ascending: each as its index in the one side and in the other.
+fn matched(side0: &SideRuns, side1: &SideRuns) -> Vec<(usize, usize)> {
+    let mut both = Vec::new();
+    let (mut j0, mut j1) = (0, 0);
+    while j0 < side0.keys.len() && j1 < side1.keys.len() {
+        match side0.keys[j0].cmp(&side1.keys[j1]) {
+            Ordering::Less => j0 += 1,
+            Ordering::Greater => j1 += 1,
+            Ordering::Equal => { both.push((j0, j1)); j0 += 1; j1 += 1; }
+        }
+    }
+    both
+}
+
+/// One side's chunks as the staging paths read them: each chunk's comparison lanes, borrowed.
+struct SideView<'a, T: ColTime> {
+    chunks: &'a [&'a CorgiChunk<T, Diff>],
+    proj: &'a SideProj,
+    lanes: Vec<Option<Vec<&'a [i64]>>>,
+}
+
+impl<'a, T: ColTime> SideView<'a, T> {
+    fn new(chunks: &'a [&'a CorgiChunk<T, Diff>], proj: &'a SideProj) -> Self {
+        SideView { chunks, proj, lanes: chunks.iter().map(|chunk| proj.lanes(chunk)).collect() }
+    }
+    /// `runs` as [`RunRef`]s.
+    fn refs(&self, runs: &[Run]) -> smallvec::SmallVec<[RunRef<'_, T>; 4]> {
+        runs.iter().map(|&(cid, s, e)| RunRef {
+            chunk: self.chunks[cid],
+            cid,
             s,
             e,
-            vals: self.vals.as_deref(),
-            pcol: self.pcol,
-            kind: self.kind,
-        }
+            vals: self.lanes[cid].as_deref(),
+            pcol: self.proj.pcol(cid),
+            kind: self.proj.kind,
+        }).collect()
     }
 }
 
@@ -923,10 +942,14 @@ pub(super) fn stage_collision<T: ColTime>(
 /// lane (the key itself or its carried hash), so blocks resume by seeking `from` and end at
 /// identifier boundaries.
 ///
+/// A block's work is passes over its keys, not a walk of them. Each side's runs are found chunk
+/// by chunk, the keys both sides hold by one merge, and the colliding keys by one comparison.
+/// What is left for each key is to record its pairs, or to stage it.
+///
 /// Two regimes: when one side is much smaller (the fresh delta against an accumulated
-/// trace), the small side DRIVES and the large side is presented only at the driver's keys
+/// trace), the small side DRIVES and the large side is searched only at the driver's keys
 /// (sorted probes — cost tracks the driver plus matches). When the sides are
-/// comparable, both sides are pulled and merged symmetrically instead.
+/// comparable, both sides are scanned instead.
 fn advance_leaf<T: ColTime>(
     chunks0: &[&CorgiChunk<T, Diff>],
     chunks1: &[&CorgiChunk<T, Diff>],
@@ -936,7 +959,7 @@ fn advance_leaf<T: ColTime>(
     bridge1: &mut ProxyBridge<T, Diff, i64>,
     colliding: &mut Vec<i64>,
     (proj0, proj1): (&SideProj, &SideProj),
-    completed: Option<&mut Pairs>,
+    mut completed: Option<&mut Pairs>,
 ) {
     let start = from.expect("advance called on an exhausted unit");
     let hashed = key_is_hashed(chunks0[0].keys());
@@ -951,220 +974,73 @@ fn advance_leaf<T: ColTime>(
         chunks.iter().zip(starts).map(|(c, &s)| c.len() - s).sum()
     };
     let (r0, r1) = (remaining(chunks0, &start0), remaining(chunks1, &start1));
-    fn views<'a, T: ColTime>(chunks: &[&'a CorgiChunk<T, Diff>], starts: &[usize], ends: &[usize], proj: &'a SideProj) -> Vec<LeafView<'a, T>> {
-        chunks.iter().enumerate()
-            .filter(|(cid, _)| ends[*cid] > starts[*cid])
-            .map(|(cid, c)| LeafView::new(c, cid, starts[cid], ends[cid], proj))
-            .collect()
-    }
-    if r0.max(r1) >= 2 * r0.min(r1) {
+    let (h, runs0, runs1) = if r0.max(r1) >= 2 * r0.min(r1) {
         // Lopsided: only the driver is read in bulk, so only the driver bounds the block.
-        let drive0 = r0 <= r1;
-        let (dchunks, dstarts, pchunks, dproj, pproj) = if drive0 { (chunks0, &start0, chunks1, proj0, proj1) } else { (chunks1, &start1, chunks0, proj1, proj0) };
-        let h = block_horizon(dchunks, dstarts, PULL);
-        let dviews = views(dchunks, dstarts, &block_ends(dchunks, h), dproj);
-        let (bd, bp) = if drive0 { (bridge0, bridge1) } else { (bridge1, bridge0) };
-        leaf_probe(dviews, pchunks, pproj, lower, h, from, bd, bp, hashed, colliding, completed.map(|matches| (matches, !drive0)))
+        if r0 <= r1 {
+            let h = block_horizon(chunks0, &start0, PULL);
+            let runs0 = SideRuns::scan(chunks0, &start0, &block_ends(chunks0, h));
+            let runs1 = SideRuns::probe(chunks1, &runs0.keys);
+            (h, runs0, runs1)
+        } else {
+            let h = block_horizon(chunks1, &start1, PULL);
+            let runs1 = SideRuns::scan(chunks1, &start1, &block_ends(chunks1, h));
+            let runs0 = SideRuns::probe(chunks0, &runs1.keys);
+            (h, runs0, runs1)
+        }
     } else {
         // Symmetric: both sides are read, so both bound the block.
         let h = block_horizon(chunks0, &start0, PULL).into_iter()
             .chain(block_horizon(chunks1, &start1, PULL))
             .min();
-        let views0 = views(chunks0, &start0, &block_ends(chunks0, h), proj0);
-        let views1 = views(chunks1, &start1, &block_ends(chunks1, h), proj1);
-        leaf_merge(views0, views1, lower, h, from, bridge0, bridge1, hashed, colliding, completed.map(|matches| (matches, false)))
-    }
-}
+        (h, SideRuns::scan(chunks0, &start0, &block_ends(chunks0, h)), SideRuns::scan(chunks1, &start1, &block_ends(chunks1, h)))
+    };
+    // The block ran to the horizon; resume there (`None` = a side is exhausted, and with it
+    // the intersection).
+    *from = h;
+    let both = matched(&runs0, &runs1);
+    if both.is_empty() { return; }
 
-/// Lopsided regime: the driver views are walked; the probee is presented only at the
-/// driver's sorted keys, one monotone search per probee chunk per block.
-fn leaf_probe<'a, T: ColTime>(
-    mut dviews: Vec<LeafView<'a, T>>,
-    pchunks: &[&CorgiChunk<T, Diff>],
-    pproj: &SideProj,
-    lower: &T,
-    h: Option<i64>,
-    from: &mut Option<i64>,
-    bridge_d: &mut ProxyBridge<T, Diff, i64>,
-    bridge_p: &mut ProxyBridge<T, Diff, i64>,
-    hashed: bool,
-    colliding: &mut Vec<i64>,
-    mut completed: Completed<'_>,
-) {
-    // Merge the driver block's keys (strictly below the horizon) into the distinct key
-    // list and each key's runs.
-    let mut keyset: Vec<i64> = Vec::new();
-    let mut druns: Vec<(usize, usize, usize, usize)> = Vec::new(); // (key idx, view idx, s, e)
-    loop {
-        let k = dviews.iter().filter_map(LeafView::cur_key).min();
-        let Some(k) = k.filter(|k| h.map_or(true, |h| *k < h)) else { break };
-        let j = keyset.len();
-        keyset.push(k);
-        for (vi, v) in dviews.iter_mut().enumerate() {
-            if let Some((s, e)) = v.take_run(k) {
-                druns.push((j, vi, s, e));
-            }
-        }
-    }
-    if keyset.is_empty() {
-        // Nothing below the horizon: the driver is spent (or the block was empty).
-        *from = h;
-        return;
-    }
-
-    // One batched probe of every probee chunk at the driver's keys.
-    let probes: Vec<Probe<T>> = pchunks.iter().enumerate()
-        .filter(|(_, c)| c.len() > 0)
-        .map(|(cid, c)| Probe::new(c, cid, &keyset, pproj))
-        .collect();
-
-    // Check the whole block's matched keys before staging any one key. Unmatched driver keys
-    // need no real-key checks; only coordinates into the existing columns cross into Corgi.
+    // Check the whole block's matched keys before staging any one key. Unmatched keys need no
+    // real-key checks; only coordinates into the existing columns cross into Corgi.
     let collisions = if hashed {
-        let matched: Vec<bool> = (0..keyset.len()).map(|j| probes.iter().any(|p| p.lo[j] < p.hi[j])).collect();
-        let columns: Vec<_> = dviews.iter().map(|v| recover_key_ref(v.chunk.keys()))
-            .chain(probes.iter().map(|p| recover_key_ref(p.chunk.keys()))).collect();
-        let driver = druns.iter().filter(|&&(j, _, _, _)| matched[j]).map(|&(j, vi, s, e)| (j, vi, s, e));
-        let offset = dviews.len();
-        let probe = probes.iter().enumerate().flat_map(|(pi, p)| {
-            p.lo.iter().zip(&p.hi).enumerate().filter(|(_, (lo, hi))| lo < hi)
-                .map(move |(j, (&s, &e))| (j, offset + pi, s, e))
-        });
-        colliding_keys(keyset.len(), &columns, driver.chain(probe))
+        let columns: Vec<_> = chunks0.iter().chain(chunks1).map(|c| recover_key_ref(c.keys())).collect();
+        let offset = chunks0.len();
+        let of0 = both.iter().enumerate().flat_map(|(m, &(j0, _))| runs0.of(j0).iter().map(move |&(cid, s, e)| (m, cid, s, e)));
+        let of1 = both.iter().enumerate().flat_map(|(m, &(_, j1))| runs1.of(j1).iter().map(move |&(cid, s, e)| (m, offset + cid, s, e)));
+        colliding_keys(both.len(), &columns, of0.chain(of1))
     } else { Vec::new() };
 
-    // Walk the keys in order, staging both sides and emitting the survivors.
-    let (mut sd, mut sp) = (SideScratch::new(), SideScratch::new());
-    let mut drun_at = 0usize;
-    let mut refs: Vec<RunRef<T>> = Vec::new();
-    for (j, &k) in keyset.iter().enumerate() {
-        refs.clear();
-        while drun_at < druns.len() && druns[drun_at].0 == j {
-            let (_, vi, s, e) = druns[drun_at];
-            refs.push(dviews[vi].run_ref(s, e));
-            drun_at += 1;
-        }
-        let dref_count = refs.len();
-        refs.extend(probes.iter().filter_map(|p| p.run_ref(j)));
-        if refs.len() == dref_count {
-            continue; // key absent from the probee: no matches
-        }
-        let collision = hashed && collisions[j];
-        if collision {
-            colliding.push(k);
-        }
-        let (drefs, prefs) = refs.split_at(dref_count);
-        if collision {
-            let (mut staged_d, mut staged_p) = (Vec::new(), Vec::new());
-            stage_collision(drefs, lower, k, &mut staged_d);
-            stage_collision(prefs, lower, k, &mut staged_p);
-            if !staged_d.is_empty() && !staged_p.is_empty() {
-                bridge_d.extend(staged_d);
-                bridge_p.extend(staged_p);
-            }
-            continue;
-        }
-        stage_pair(k, (drefs, prefs), lower, (&mut sd, &mut sp), (bridge_d, bridge_p), completed.as_mut().map(|(pairs, swapped)| (&mut **pairs, *swapped)));
-    }
-    // The block ran to the horizon; resume there (`None` = the driver is exhausted, and
-    // with it the intersection).
-    *from = h;
-}
-
-/// Comparable-sides regime: both sides pulled and merged symmetrically on the `i64`
-/// buffers.
-fn leaf_merge<'a, T: ColTime>(
-    mut views0: Vec<LeafView<'a, T>>,
-    mut views1: Vec<LeafView<'a, T>>,
-    lower: &T,
-    h: Option<i64>,
-    from: &mut Option<i64>,
-    bridge0: &mut ProxyBridge<T, Diff, i64>,
-    bridge1: &mut ProxyBridge<T, Diff, i64>,
-    hashed: bool,
-    colliding: &mut Vec<i64>,
-    mut completed: Completed<'_>,
-) {
-    if !hashed {
-        // Integer identifiers are exact keys: keep the streaming path, without staging block
-        // metadata for comparisons that do not exist.
-        leaf_merge_primitive(views0, views1, lower, h, from, bridge0, bridge1, completed);
-        return;
-    }
-    let (mut refs0, mut refs1): (Vec<(usize, usize, usize)>, Vec<(usize, usize, usize)>) = (Vec::new(), Vec::new());
-    let mut matched = Vec::new();
-    loop {
-        let k = views0.iter().chain(&views1).filter_map(LeafView::cur_key).min();
-        let Some(k) = k.filter(|k| h.is_none_or(|h| *k < h)) else { break };
-        let (start0, start1) = (refs0.len(), refs1.len());
-        refs0.extend(views0.iter_mut().enumerate().filter_map(|(vi, v)| v.take_run(k).map(|(s, e)| (vi, s, e))));
-        refs1.extend(views1.iter_mut().enumerate().filter_map(|(vi, v)| v.take_run(k).map(|(s, e)| (vi, s, e))));
-        if refs0.len() == start0 || refs1.len() == start1 {
-            refs0.truncate(start0);
-            refs1.truncate(start1);
-            continue;
-        }
-        matched.push((k, start0..refs0.len(), start1..refs1.len()));
-    }
-    let columns: Vec<_> = views0.iter().chain(&views1).map(|v| recover_key_ref(v.chunk.keys())).collect();
-    let runs0 = matched.iter().enumerate().flat_map(|(j, (_, range, _))| {
-        refs0[range.clone()].iter().map(move |&(vi, s, e)| (j, vi, s, e))
-    });
-    let offset = views0.len();
-    let runs1 = matched.iter().enumerate().flat_map(|(j, (_, _, range))| {
-        refs1[range.clone()].iter().map(move |&(vi, s, e)| (j, offset + vi, s, e))
-    });
-    let collisions = colliding_keys(matched.len(), &columns, runs0.chain(runs1));
-    let (mut s0, mut s1) = (SideScratch::new(), SideScratch::new());
-    let (mut r0, mut r1): (smallvec::SmallVec<[RunRef<T>; 4]>, smallvec::SmallVec<[RunRef<T>; 4]>) = (smallvec::SmallVec::new(), smallvec::SmallVec::new());
-    for (j, (k, range0, range1)) in matched.into_iter().enumerate() {
-        r0.clear();
-        r0.extend(refs0[range0].iter().map(|&(vi, s, e)| views0[vi].run_ref(s, e)));
-        r1.clear();
-        r1.extend(refs1[range1].iter().map(|&(vi, s, e)| views1[vi].run_ref(s, e)));
-        if collisions[j] {
-            colliding.push(k);
+    // Each matched key in order: its pairs recorded, if it is completed, or else staged, and
+    // presented in the bridges if both sides survive consolidation.
+    let kinds = (proj0.kind, proj1.kind);
+    let (view0, view1) = (SideView::new(chunks0, proj0), SideView::new(chunks1, proj1));
+    let (mut scratch0, mut scratch1) = (SideScratch::new(), SideScratch::new());
+    for (m, &(j0, j1)) in both.iter().enumerate() {
+        let key = runs0.keys[j0];
+        let (of0, of1) = (runs0.of(j0), runs1.of(j1));
+        if hashed && collisions[m] {
+            colliding.push(key);
             let (mut staged0, mut staged1) = (Vec::new(), Vec::new());
-            stage_collision(&r0, lower, k, &mut staged0);
-            stage_collision(&r1, lower, k, &mut staged1);
+            stage_collision(&view0.refs(of0), lower, key, &mut staged0);
+            stage_collision(&view1.refs(of1), lower, key, &mut staged1);
             if !staged0.is_empty() && !staged1.is_empty() {
                 bridge0.extend(staged0);
                 bridge1.extend(staged1);
             }
             continue;
         }
-        stage_pair(k, (&r0, &r1), lower, (&mut s0, &mut s1), (bridge0, bridge1), completed.as_mut().map(|(pairs, swapped)| (&mut **pairs, *swapped)));
-    }
-    *from = h;
-}
-
-/// Primitive identifiers need no real-key validation, so stage each match as it is encountered.
-fn leaf_merge_primitive<'a, T: ColTime>(
-    mut views0: Vec<LeafView<'a, T>>,
-    mut views1: Vec<LeafView<'a, T>>,
-    lower: &T,
-    h: Option<i64>,
-    from: &mut Option<i64>,
-    bridge0: &mut ProxyBridge<T, Diff, i64>,
-    bridge1: &mut ProxyBridge<T, Diff, i64>,
-    mut completed: Completed<'_>,
-) {
-    let (mut s0, mut s1) = (SideScratch::new(), SideScratch::new());
-    let (mut refs0, mut refs1): (Vec<(usize, usize, usize)>, Vec<(usize, usize, usize)>) = (Vec::new(), Vec::new());
-    loop {
-        let k = views0.iter().chain(&views1).filter_map(LeafView::cur_key).min();
-        let Some(k) = k.filter(|k| h.is_none_or(|h| *k < h)) else {
-            *from = h;
-            return;
-        };
-        refs0.clear();
-        refs0.extend(views0.iter_mut().enumerate().filter_map(|(vi, v)| v.take_run(k).map(|(s, e)| (vi, s, e))));
-        refs1.clear();
-        refs1.extend(views1.iter_mut().enumerate().filter_map(|(vi, v)| v.take_run(k).map(|(s, e)| (vi, s, e))));
-        if refs0.is_empty() || refs1.is_empty() { continue; }
-        let r0: smallvec::SmallVec<[RunRef<T>; 4]> = refs0.iter().map(|&(vi, s, e)| views0[vi].run_ref(s, e)).collect();
-        let r1: smallvec::SmallVec<[RunRef<T>; 4]> = refs1.iter().map(|&(vi, s, e)| views1[vi].run_ref(s, e)).collect();
-        stage_pair(k, (&r0, &r1), lower, (&mut s0, &mut s1), (bridge0, bridge1), completed.as_mut().map(|(pairs, swapped)| (&mut **pairs, *swapped)));
+        if let Some(pairs) = completed.as_mut() {
+            if completes((of0, of1), kinds) {
+                pairs.cross(of0, of1);
+                continue;
+            }
+        }
+        scratch0.stage_runs(&view0.refs(of0), lower);
+        scratch1.stage_runs(&view1.refs(of1), lower);
+        if !scratch0.entries.is_empty() && !scratch1.entries.is_empty() {
+            scratch0.emit(key, bridge0);
+            scratch1.emit(key, bridge1);
+        }
     }
 }
 
@@ -1424,15 +1300,15 @@ mod tests {
         let left = make(vec![0, 0, 1, 2, 2, 2, 4, 4, 5], 1);
         let right = make(vec![0, 1, 1, 4, 5], 2);
         let (lproj, rproj) = (SideProj::new(&[&left], &Demand::All), SideProj::new(&[&right], &Demand::All));
-        let mut view = LeafView::new(&left, 0, 2, 8, &lproj);
-        assert_eq!(view.take_run(1), Some((2, 3)));
-        assert_eq!(view.take_run(2), Some((3, 6)));
-        assert_eq!(view.take_run(4), Some((6, 8)));
-        assert_eq!(view.cur_key(), None);
+        let runs = SideRuns::scan(&[&left], &[2], &[8]);
+        assert_eq!(runs.keys, vec![1, 2, 4]);
+        assert_eq!(runs.runs, vec![(0, 2, 3), (0, 3, 6), (0, 6, 8)]);
+        let chunks = [&left];
+        let view = SideView::new(&chunks, &lproj);
         let probe = Probe::new(&right, 1, &[0, 1, 3, 5], &rproj);
         assert!(probe.run_ref(2).is_none());
-        for (s, e) in [(2, 3), (3, 6), (6, 8)] {
-            let a = view.run_ref(s, e);
+        for run in &runs.runs {
+            let a = &view.refs(std::slice::from_ref(run))[0];
             for j in [0, 1, 3] {
                 let b = probe.run_ref(j).unwrap();
                 for i in a.s..a.e {
