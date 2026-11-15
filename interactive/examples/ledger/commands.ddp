@@ -1,0 +1,152 @@
+-- The commands that change the state of a system of ledgers, as changes to its entries (see system.ddp).
+--
+-- A command is one of a short list, and each becomes entries to remove and entries to add.
+-- The list is the vocabulary: what cannot be said here cannot be asked for this way.
+-- A transaction is a list of commands, whose changes are made together or not at all.
+-- The rules in system.ddp and step.ddp judge the changes, and know nothing of the commands,
+-- so a new command needs no new rule.
+--
+--   Create (id, shape, width, start, clock, keep)     register a ledger, durable or derived
+--   Append (ledger, number, lower, upper, batch)      add an append to a ledger, as a span whose since is its own lower
+--   Merge (ledger, from, to, since, batch)            cover the appends from one number up to another again, as one span
+--   Discard (ledger, from, to, since)                 remove a span
+--   Drop (ledger)                                     remove a ledger, and its spans with it
+--   Alias (name, ledger)                              point a name at a ledger, and away from any other
+--   Unalias (name)                                    remove a name
+--   Publish (program, takes, gives, text)             add a program
+--   Define (id, program, inputs, outputs)             bind a program to what it reads and writes, as a computation
+--   Retire (computation)                              remove a computation; the ledgers it wrote are then unbound
+--   Start (instance, computation)                     expect an instance to run a computation
+--   Stop (instance, computation)                      no longer expect it
+--   Hold (holder, ledger, frontier)                   ask that a ledger be kept readable from a frontier, and no longer from any other
+--   Release (holder, ledger)                          remove a hold
+--
+--   input 0, commands : ((index), (command))          one transaction's commands, by their place in it
+--   input 1, entries  : ((entry), ())                 the state before the transaction
+--
+-- Each command is read against the state before the transaction, and not against the other commands.
+--
+--   removes : ((entry), ())    the entries to remove
+--   adds    : ((entry), ())    the entries to add
+--   unmet   : ((index), ())    the commands that name something that is not there; the transaction should not be made
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+enum Command = Create (Id, Shape, int, Frontier, Clock, Keep)
+             | Append (Id, int, Frontier, Frontier, Batch)
+             | Merge (Id, int, int, Frontier, Batch)
+             | Discard (Id, int, int, Frontier)
+             | Drop Id
+             | Alias (Text, Id)
+             | Unalias Text
+             | Publish (Hash, List(Shape), List(Shape), Text)
+             | Define (Id, Hash, List(Input), List(Output))
+             | Retire Id
+             | Start (Id, Id)
+             | Stop (Id, Id)
+             | Hold (Id, Id, Frontier)
+             | Release (Id, Id);
+
+let commands = input 0 : ((int), (Command));
+let entries = input 1 : ((Entry), ()) | distinct;
+
+-- THE STATE, by what a command names. Each row keeps its entry, to remove.
+-- Each table is by its key. Spans are also by their ledger: a dropped ledger takes them.
+let ledgers = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .1) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let spans = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .2) cap_list map ((entry, ((id, _, _, _), _)) -> ((id), (entry))));
+let copies = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .2) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let names = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .3) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let computations = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .5) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let runs = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .6) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let held = entries | flatmap(((entry), ()) -> (entry, entry enlist unweave .7) cap_list map ((entry, (key, _)) -> (key, (entry))));
+
+-- THE COMMANDS, by kind.
+let creates = commands(_, (Create((id, shape, width, start, clock, keep))));
+let appends = commands(_, (Append((id, number, lower, upper, batch))));
+let merges = commands((index), (Merge((id, from, to, since, batch))));
+let discards = commands((index), (Discard((id, from, to, since))))
+             | map(((index, id, from, to, since), ()) -> ((id, from, to, since call frontier_normalize), (index)));
+let drops = commands((index), (Drop(ledger))) | map(((index, ledger), ()) -> ((ledger), (index)));
+let aliases = commands(_, (Alias((name, ledger)))) | map(((name, ledger), ()) -> ((name), (ledger)));
+let unaliases = commands((index), (Unalias(name))) | map(((index, name), ()) -> ((name), (index)));
+let publishes = commands(_, (Publish((program, takes, gives, text))));
+let defines = commands(_, (Define((computation, program, inputs, outputs))));
+let retires = commands((index), (Retire(computation))) | map(((index, computation), ()) -> ((computation), (index)));
+let starts = commands(_, (Start((instance, computation))));
+let stops = commands((index), (Stop(run))) | map(((index, run), ()) -> (run, (index)));
+let holds = commands(_, (Command::Hold((holder, ledger, frontier))))
+          | map(((holder, ledger, frontier), ()) -> ((holder, ledger), (frontier)));
+let releases = commands((index), (Release(hold))) | map(((index, hold), ()) -> (hold, (index)));
+
+-- BEGINS and ENDS: the lower of the spans that begin at each number, and the upper of those that end at each.
+-- A span that covers appends again takes its lower from where its first began and its upper from
+-- where its last ended, and so cannot change them.
+let begins = entries((Span(((id, from, _, _), (lower, _, _)))), ())
+           | map(((id, from, lower), ()) -> ((id, from), (lower))) | distinct;
+let ends = entries((Span(((id, _, to, _), (_, upper, _)))), ())
+         | map(((id, to, upper), ()) -> ((id, to), (upper))) | distinct;
+let merged = merges((index, id, from, to, since, batch), ()) * begins((id, from), (lower)) * ends((id, to), (upper));
+
+-- WHAT IS ADDED: each command's entry, as its key and then the rest.
+-- Frontiers are put in canonical form, so that equal frontiers are equal as values.
+-- A new span covers one append. Its since is its own lower: its times are as they were written, and it is not compacted.
+output "adds" = (creates | map(((id, shape, width, start, clock, keep), ()) ->
+                    ((((id), (shape, width, start call frontier_normalize, clock, keep)) inject Ledger), ())))
+              + (appends | map(((id, number, lower, upper, batch), ()) ->
+                    let lower = lower call frontier_normalize in
+                    ((((id, number, (number, 1) add, lower), (lower, upper call frontier_normalize, batch)) inject Span), ())))
+              + (merged | map(((_, id, from, to, since, batch, lower, upper), ()) ->
+                    ((((id, from, to, since call frontier_normalize), (lower, upper, batch)) inject Span), ())))
+              + (aliases | map(((name), (ledger)) -> ((((name), (ledger)) inject Name), ())))
+              + (publishes | map(((program, takes, gives, text), ()) ->
+                    ((((program), (takes, gives, text)) inject Program), ())))
+              + (defines | map(((computation, program, inputs, outputs), ()) ->
+                    ((((computation), (program, inputs, outputs)) inject Computation), ())))
+              + (starts | map((run, ()) -> (((run, ()) inject Run), ())))
+              + (holds | map((hold, (frontier)) -> (((hold, (frontier call frontier_normalize)) inject Entry::Hold), ())));
+
+-- WHAT IS REMOVED. A dropped ledger takes its spans. An alias takes the name from the ledger that had it,
+-- and a hold takes the place of its holder's earlier hold on the ledger.
+let dropped = drops | join(ledgers, (ledger, (index), (entry)) -> (ledger, (index, entry)));
+let unaliased = unaliases | join(names, (name, (index), (entry)) -> (name, (index, entry)));
+let retired = retires | join(computations, (computation, (index), (entry)) -> (computation, (index, entry)));
+let stopped = stops | join(runs, (run, (index), (entry)) -> (run, (index, entry)));
+let discarded = discards | join(copies, (span, (index), (entry)) -> (span, (index, entry)));
+let released = releases | join(held, (hold, (index), (entry)) -> (hold, (index, entry)));
+output "removes" = ((dropped | map((_, (_, entry)) -> ((entry), ())))
+                  + (dropped | join(spans, (ledger, _, (entry)) -> ((entry), ())))
+                  + (aliases | join(names, (name, _, (entry)) -> ((entry), ())))
+                  + (unaliased | map((_, (_, entry)) -> ((entry), ())))
+                  + (retired | map((_, (_, entry)) -> ((entry), ())))
+                  + (stopped | map((_, (_, entry)) -> ((entry), ())))
+                  + (discarded | map((_, (_, entry)) -> ((entry), ())))
+                  + (holds | join(held, (hold, _, (entry)) -> ((entry), ())))
+                  + (released | map((_, (_, entry)) -> ((entry), ())))) | distinct;
+
+-- WHAT IS NOT THERE: to remove, or for a span to cover again.
+let sought = (drops | map((_, (index)) -> ((index), ()))) + (unaliases | map((_, (index)) -> ((index), ())))
+           + (retires | map((_, (index)) -> ((index), ()))) + (stops | map((_, (index)) -> ((index), ())))
+           + (discards | map((_, (index)) -> ((index), ()))) + (merges | map(((index, _, _, _, _, _), ()) -> ((index), ())))
+           + (releases | map((_, (index)) -> ((index), ())));
+let met = (dropped | map((_, (index, _)) -> ((index), ()))) + (unaliased | map((_, (index, _)) -> ((index), ())))
+        + (retired | map((_, (index, _)) -> ((index), ()))) + (stopped | map((_, (index, _)) -> ((index), ())))
+        + (discarded | map((_, (index, _)) -> ((index), ()))) + (merged | map(((index, _, _, _, _, _, _, _), ()) -> ((index), ())))
+        + (released | map((_, (index, _)) -> ((index), ())));
+output "unmet" = sought - (sought | join(met | distinct, (index, (), ()) -> (index, ())));
