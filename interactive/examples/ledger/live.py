@@ -151,9 +151,15 @@ def history(spans, blobs, cache, start=0, need=None):
     for _, (_, _, batch) in found:
         if batch[1] == 2:
             name = plumbing.hash_name(batch[2])
-            if name not in cache: cache[name] = json.loads(blobs.get(name))["updates"]
+            if name not in cache:
+                cache[name] = [(key, val, at, diff) for frame in plumbing.unpack(blobs.get(name))[1] for key, val, diff, at in plumbing.decode(frame)]
             updates += cache[name]
     return updates, end
+
+
+def batch(blobs, updates, rows=ROW):
+    """Write a batch, as a user who has rows does: one frame of updates, [(key, val, diff, time)]. Returns the blob's name."""
+    return blobs.put(plumbing.pack({}, [plumbing.encode(rows, updates)]))
 
 
 def merged(keeper, blobs, ledger, since):
@@ -162,7 +168,7 @@ def merged(keeper, blobs, ledger, since):
     for key, val, at, diff in history(spans, blobs, {})[0]:
         row = (key, val, max(at, since))
         sums[row] = sums.get(row, 0) + diff
-    return blobs.put(json.dumps({"updates": [[key, val, at, diff] for (key, val, at), diff in sorted(sums.items()) if diff]}).encode())
+    return batch(blobs, [(key, val, diff, at) for (key, val, at), diff in sorted(sums.items()) if diff])
 
 
 def contents(keeper, blobs, ledger):
@@ -208,11 +214,11 @@ def main():
         check("the system is set up by one transaction", keeper.transact(USER, setup) == [])
 
         # The user appends lines of words to ledger 1: at time t, line t holds the words t % 5, t % 7 and 100 + t.
-        words, expected = {}, lambda: {(f"tuple({w})", f"tuple({n})"): 1 for w, n in words.items() if n >= 2}
+        words, expected = {}, lambda: {((w,), (n,)): 1 for w, n in words.items() if n >= 2}
         def write(at):
             line = sorted({at % 5, at % 7, 100 + at})
             for word in line: words[word] = words.get(word, 0) + 1
-            blob = blobs.put(json.dumps({"updates": [[f"tuple({word})", f"tuple({at})", at, 1] for word in line]}).encode())
+            blob = batch(blobs, [((word,), (at,), 1, at) for word in line])
             return keeper.transact(USER, [append(1, at, at, at + 1, blob)])
         for at in range(20): assert write(at) == []
         took = wait(keeper, 3, 20)
@@ -242,8 +248,8 @@ def main():
         check("a computation over two ledgers is set up",
               keeper.transact(USER, [create(5), create(6), publish(BOTH, [ROW, ROW]), define(102, BOTH, [1, 5], 6), start(504, 102)]) == [])
         for part, (first, last) in enumerate([(0, 7), (7, 20)]):
-            rows = [[f"tuple({1000 + at})", f"tuple({at})", at, 1] for at in range(first, last)]
-            assert keeper.transact(USER, [append(5, part, first, last, blobs.put(json.dumps({"updates": rows}).encode()))]) == []
+            rows = [((1000 + at,), (at,), 1, at) for at in range(first, last)]
+            assert keeper.transact(USER, [append(5, part, first, last, batch(blobs, rows))]) == []
             wait(keeper, 6, last)
         either = {**contents(keeper, blobs, 1), **contents(keeper, blobs, 5)}
         check("a computation whose inputs stand at different times loses nothing", agree(contents(keeper, blobs, 6), either),
@@ -313,8 +319,7 @@ def main():
               f"caught up after {took:.2f} s")
 
         # Compaction. Ledger 2 is read by computation 101, whose ledger stands at 40.
-        updates = [[key, val, 40, count] for (key, val), count in contents(keeper, blobs, 2).items()]
-        whole = blobs.put(json.dumps({"updates": updates}).encode())
+        whole = batch(blobs, [(key, val, count, 40) for (key, val), count in contents(keeper, blobs, 2).items()])
         version = keeper.standing()[2][0]
         parts = [(key[1], key[2], plumbing.instant(key[3])) for key, _ in keeper.entries()[SPAN] if number(key[0]) == 2]
         early = [merge(2, 0, version, 41, whole)] + [discard(2, first, last, since) for first, last, since in parts]
@@ -376,6 +381,18 @@ def main():
             wait(keeper, 2, at + 1)
         took = wait(keeper, 3, 65)
         check("and the system carries on", agree(contents(keeper, blobs, 3), expected()), f"caught up after {took:.2f} s")
+        # A durable ledger written from a derived one. Computation 120 counts the lines of ledger 1 into ledger 30, which
+        # is derived: instance 505 holds it, and nothing stores it. Computation 121 reads ledger 30 and writes ledger 31,
+        # which is durable. These are the two programs that make ledger 3 by way of ledger 2, so ledger 31 should hold the same.
+        chain = [create_derived(30, ROW), create(31), define(120, COUNT, 1, 30), define(121, OFTEN, 30, 31), start(505, 120), start(505, 121)]
+        check("a computation over a derived ledger is set up to write a durable one", keeper.transact(USER, chain) == [])
+        took = wait(keeper, 31, keeper.standing()[1][1])
+        check("the durable ledger holds what the derived one gives, at the times of the ledger behind it",
+              agree(contents(keeper, blobs, 31), expected()), f"ledger 31 stood at {keeper.standing()[31][1]} after {took:.2f} s")
+        # The instance is killed. Another begins both computations from where ledger 31 stands, which is passed back
+        # through the derived ledger to ledger 1. The appends below go on through it.
+        subprocess.run(["pkill", "-f", "runner.py run 0.505 "])
+
         # Two stewards are started: a compactor and a collector. They read the state, and act by transactions.
         # Holder 900 asks for ledger 1 from time 10, so the compactor may merge it, and only as far as 10.
         check("a holder asks for ledger 1 from time 10", keeper.transact(USER, [hold(900, 1, 10)]) == [])
@@ -400,6 +417,9 @@ def main():
               settle(lambda: tidied() and len(spans_of(1)) <= 6 and any(since > max(10, lower) for since, lower in spans_of(1))),
               f"spans held from {sorted(since for since, _ in spans_of(1))}")
         check("and the ledgers hold what they should", agree(contents(keeper, blobs, 3), expected()))
+        took = wait(keeper, 31, 75)
+        check("the ledger written from a derived one has followed, through a new instance and the compactor",
+              agree(contents(keeper, blobs, 31), expected()), f"caught up after {took:.2f} s")
         import steward
         check("the collector leaves only the blobs that spans name",
               settle(lambda: steward.listing() == {plumbing.hash_name(key[0]) for key, _ in map(plumbing.row, keeper.peek("before::blobs"))}),

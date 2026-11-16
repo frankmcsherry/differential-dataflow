@@ -13,10 +13,13 @@
 -- together (see `forgotten` in system.ddp). The empty frontier is after every time, so a reader with that need
 -- can use any span: it is for one that wants what the ledger holds in the end, and not when.
 --
---   plan     : ((computation), (program, inputs, outputs, text))   each computation the instance is asked to run
+--   plan     : ((computation), (inputs, outputs, takes, gives, text))   each computation the instance is asked to run,
+--                                                                  with the shapes and the text of its program
 --   binds    : ((computation, position), (writer, place))          each input that reads a derived ledger, and the
 --                                                                  output of the computation that writes it
 --   standing : ((ledger), (version, frontier))                     each durable ledger's version and write frontier
+--   resumes  : ((computation), (target, frontier))                 each durable ledger a computation's outputs reach,
+--                                                                  and where it stands: the computation begins from there
 --   fetch    : ((reader), (from, to, batch))                       the spans a reader reads next, which lead from the
 --                                                                  appends it has read to the ledger's last
 --   stuck    : ((reader), ())                                      a reader that no spans lead on from where it has read
@@ -62,8 +65,8 @@ let derived = ledgers((id), (_, _, _, _, Derived)) | distinct;
 -- PLAN: each computation this instance is asked to run, with its program's text.
 -- An instance that reads the state is told of every run, so its own are picked out.
 output "plan" = runs((instance, computation), ()) * me((instance), ())
-              * computations((computation), (program, inputs, outputs)) * programs((program), (_, _, text))
-              | map(((_, computation, program, inputs, outputs, text), ()) -> ((computation), (program, inputs, outputs, text)));
+              * computations((computation), (program, inputs, outputs)) * programs((program), (takes, gives, text))
+              | map(((_, computation, _, inputs, outputs, takes, gives, text), ()) -> ((computation), (inputs, outputs, takes, gives, text)));
 
 -- BINDS: a derived ledger is the output of the computation that writes it, inside the instance's server.
 -- A computation here that reads one is bound to that output.
@@ -95,8 +98,21 @@ wf: {
                         (1, (seen, (sofar, frontier) call frontier_join, frontier) select)) in
                     ((joined.1), 1) enlist);
 }
-output "standing" = own((id), (version, _)) * wf::write((id), (frontier)) * durable((id), ())
-                  | map(((id, version, frontier), ()) -> ((id), (version, frontier)));
+let standing = own((id), (version, _)) * wf::write((id), (frontier)) * durable((id), ())
+             | map(((id, version, frontier), ()) -> ((id), (version, frontier)));
+output "standing" = standing;
+
+-- RESUMES, as in system.ddp: a computation begins from where its outputs stand. A derived ledger stands nowhere,
+-- so the computation that writes one begins from where its readers do, and so on back.
+-- A hold on a derived ledger is not passed back here: an instance is not told of holds.
+let relies = reads((ledger), (reader, _)) * derived((ledger), ()) * writes((ledger), (writer, _))
+           | map(((ledger, reader, writer), ()) -> ((reader), (writer, ledger)));
+let stands = writes | join(standing, ((ledger), (computation, _), (_, frontier)) -> ((computation), (ledger, frontier)));
+resuming: {
+    let passed = relies | join(resumes, ((reader), (writer, _), (target, frontier)) -> ((writer), (target, frontier)));
+    set resumes = stands + passed | distinct;
+}
+output "resumes" = resuming::resumes;
 
 -- FETCH: the spans that lead a reader on from the appends it has read to the ledger's last.
 

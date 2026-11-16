@@ -7,6 +7,9 @@
 The compactor reads a follower's view of which spans to merge next (see compact.ddp): the merge to make of a ledger,
 the spans to read for it, and the spans to discard after. It makes the merged batch, and asks the keeper for the merge
 and the discards in one transaction. What to merge and when is the view's to say, and the compactor decides none of it.
+The merged batch is the frames of the parts, each with its times moved up to what the merged span is held from.
+The compactor does not open them. So equal updates are not added together, and ones that cancel are both kept:
+the merge makes a ledger's spans fewer, and not yet its batches smaller (see BACKLOG.md).
 The rules judge that transaction like any other, so a compactor that is wrong is refused, and does no harm.
 So the compactor reads from a follower, whose copy of the state may be behind: the keeper judges what it asks.
 
@@ -32,19 +35,18 @@ def compact(url, follower):
         for ledger, (first, last, since) in proposed.items():
             # The copy may be behind. What was asked for is not asked for again until the copy proposes something else.
             if ledger in asked: continue
-            # The merged batch: every update of the parts, with its time moved up to the since, and the counts of equal ones added.
-            sums = {}
+            # The merged batch: the frames of the parts, in order, with each time moved up to the since.
+            frames = []
             for _, _, _, batch in sorted(val for key, val in parts if key[0] == ledger):
                 if batch[1] != 2: continue
                 name = plumbing.hash_name(batch[2])
-                if name not in cache: cache[name] = json.loads(blobs.get(name))["updates"]
-                for key, val, moment, diff in cache[name]:
-                    row = (key, val, max(moment, instant(since)))
-                    sums[row] = sums.get(row, 0) + diff
-            blob = blobs.put(json.dumps({"updates": [[key, val, moment, diff] for (key, val, moment), diff in sorted(sums.items()) if diff]}).encode())
+                if name not in cache: cache[name] = plumbing.unpack(blobs.get(name))[1]
+                frames += [plumbing.raised(frame, instant(since)) for frame in cache[name]]
+            batch = "inject(0,tuple())"
+            if frames: batch = f"inject(2,list({','.join(map(str, plumbing.hash_ints(blobs.put(plumbing.pack({}, frames)))))}))"
             ident = plumbing.show(ledger)
             gone = sorted(val for key, val in spares if key[0] == ledger)
-            commands = [f"inject(2,tuple({ident},{first},{last},{plumbing.show(since)},inject(2,list({','.join(map(str, plumbing.hash_ints(blob)))}))))"]
+            commands = [f"inject(2,tuple({ident},{first},{last},{plumbing.show(since)},{batch}))"]
             commands += [f"inject(3,tuple({ident},{begin},{end},{plumbing.show(held)}))" for begin, end, held in gone]
             refused = keeper.transact(USER, commands)
             asked[ledger] = (first, last, since)

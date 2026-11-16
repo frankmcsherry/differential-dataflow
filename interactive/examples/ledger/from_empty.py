@@ -13,7 +13,7 @@ import plumbing, runner
 import keeper as model
 from plumbing import Client, Blobs, SPAN, number
 from live import (URL, HTTP, FOLLOW, FOLLOWER, USER, COUNT, OFTEN, BOTH, TALLY, ROW, spans_program, create, create_derived, append,
-                  publish, define, start, stop, spawn, up, ready, settle, contents, wait)
+                  publish, define, start, stop, spawn, up, ready, settle, contents, wait, batch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -62,7 +62,7 @@ def main():
             for at in range(first, last):
                 line = sorted({at % 5, at % 7, 100 + at})
                 for word in line: words[word] = words.get(word, 0) + 1
-                blob = blobs.put(json.dumps({"updates": [[f"tuple({word})", f"tuple({at})", at, 1] for word in line]}).encode())
+                blob = batch(blobs, [((word,), (at,), 1, at) for word in line])
                 assert keeper.transact(USER, [append(1, at, at, at + 1, blob)]) == []
             return time.perf_counter() - begin
 
@@ -84,7 +84,7 @@ def main():
         settle(lambda: instances() == ["0.500"])
         reach(2, 5)
         report("5. Start computation 100 on instance 0.500.", took=took)
-        assert contents(keeper, blobs, 2) == {(f"tuple({w})", f"tuple({n})"): 1 for w, n in words.items()}
+        assert contents(keeper, blobs, 2) == {((w,), (n,)): 1 for w, n in words.items()}
 
         took = transact([publish(OFTEN), create(3), define(101, OFTEN, 2, 3), start(501, 101)])
         settle(lambda: instances() == ["0.500", "0.501"])
@@ -94,7 +94,7 @@ def main():
         took = write(5, 10)
         reach(3, 10)
         report("7. Append five more batches to ledger 1.", took=took)
-        often = lambda: {(f"tuple({w})", f"tuple({n})"): 1 for w, n in words.items() if n >= 2}
+        often = lambda: {((w,), (n,)): 1 for w, n in words.items() if n >= 2}
         assert contents(keeper, blobs, 3) == often()
 
         took = transact([create(4), publish(BOTH, [ROW, ROW]), define(102, BOTH, [1, 3], 4), start(501, 102)])

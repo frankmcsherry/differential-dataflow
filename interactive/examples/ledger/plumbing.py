@@ -201,6 +201,48 @@ def untimed(frame):
     return struct.pack("<2Q", rows, 0) + frame[16:len(frame) - 8 * rows * lanes]
 
 
+def raised(frame, time):
+    """A frame with each of its times that is before `time` moved up to it: what one who reads from `time` on sees.
+    The times are the frame's last words, so this opens no column."""
+    rows, lanes = struct.unpack_from("<2Q", frame)
+    assert lanes == 1, "a frame to raise has times"
+    at = len(frame) - 8 * rows
+    return frame[:at] + struct.pack(f"<{rows}Q", *(max(moment, time) for moment in struct.unpack_from(f"<{rows}Q", frame, at)))
+
+
+def shape(text):
+    """A shape of ints and tuples, as DDIR writes it: "int" for an int, and a tuple of shapes for a tuple."""
+    tokens = text.replace("(", " ( ").replace(")", " ) ").replace(",", " ").split()
+    def read(at):
+        if tokens[at] == "int": return "int", at + 1
+        assert tokens[at] == "(", text
+        fields, at = [], at + 1
+        while tokens[at] != ")":
+            field, at = read(at)
+            fields.append(field)
+        return tuple(fields), at + 1
+    return read(0)[0]
+
+
+def column(form, values):
+    """A column of values of one shape, in corgi's encoding: what `Words.column` reads."""
+    count = len(values)
+    if form == "int":
+        if all(0 <= value < 256 for value in values): return struct.pack("<3Q", 0, 8, count) + bytes(values) + bytes(-count % 8)
+        return struct.pack(f"<3Q{count}q", 0, 64, count, *values)
+    if form == (): return struct.pack("<2Q", 4, count)
+    return struct.pack("<2Q", 1, len(form)) + b"".join(column(field, [value[at] for value in values]) for at, field in enumerate(form))
+
+
+def encode(rows, updates):
+    """A frame of updates, [(key, val, diff, time)], for rows of the shape `rows`, which is DDIR text such as "((int), (int))".
+    This is for one who has rows and no server to make frames, as a user who appends does. It writes ints and tuples only."""
+    key, val = shape(rows)
+    count = len(updates)
+    return (struct.pack("<2Q", count, 1) + column(key, [update[0] for update in updates]) + column(val, [update[1] for update in updates])
+            + struct.pack(f"<{count}q", *[update[2] for update in updates]) + struct.pack(f"<{count}Q", *[update[3] for update in updates]))
+
+
 def pack(header, frames):
     """Some frames, to send or to keep: a line of JSON that says how long each is, and then the frames."""
     return json.dumps(dict(header, sizes=[len(frame) for frame in frames])).encode() + b"\n" + b"".join(frames)

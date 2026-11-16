@@ -26,7 +26,7 @@ import json, os, subprocess, sys, time, urllib.error
 import plumbing
 from plumbing import Client, Blobs, SPAN, number
 from live import (URL, HTTP, FOLLOW, FOLLOWER, USER, COUNT, OFTEN, TALLY, ROW, MANY, spans_program, create, create_derived, append,
-                  publish, define, start, stop, hold, check, spawn, up, ready, contents, agree, wait)
+                  publish, define, start, stop, hold, check, spawn, up, ready, contents, agree, wait, batch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIR = "interactive/examples/ledger"
@@ -117,11 +117,11 @@ def main():
         check("each of the three members of the register, on three machines, has the log's head",
               heads[0]["count"] == 1 and heads.count(heads[0]) == 3)
 
-        words, expected = {}, lambda: {(f"tuple({w})", f"tuple({n})"): 1 for w, n in words.items() if n >= 2}
+        words, expected = {}, lambda: {((w,), (n,)): 1 for w, n in words.items() if n >= 2}
         def write(at):
             line = sorted({at % 5, at % 7, 100 + at})
             for word in line: words[word] = words.get(word, 0) + 1
-            blob = blobs.put(json.dumps({"updates": [[f"tuple({word})", f"tuple({at})", at, 1] for word in line]}).encode())
+            blob = batch(blobs, [((word,), (at,), 1, at) for word in line])
             return keeper.transact(USER, [append(1, at, at, at + 1, blob)])
         def carry(first, last):
             """Append lines `first` to `last`, wait for ledger 3 to follow, and say whether it holds what it should."""
