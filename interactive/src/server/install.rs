@@ -14,13 +14,37 @@ impl Server {
     /// so two importers of the same recipe share one source. Any other
     /// unregistered import errors (install its producer first). Also errors if
     /// the name is taken, empty, or contains `::`.
+    ///
+    /// A program that imports a piloted program's trace is installed piloted
+    /// ([`Server::install_piloted`]): that trace follows its own inputs and not the epoch, so
+    /// no `tick` could bring what is computed from it up to the epoch.
     pub fn install(
         &mut self,
         worker: &mut Worker,
         name: &str,
         prog: &st::Program,
     ) -> Result<(), String> {
+        let piloted = prog.root.imports.iter().any(|imp| matches!(&imp.from, st::Source::Trace(t) if self.trace_is_piloted(t)));
+        if piloted { return self.install_piloted(worker, name, prog); }
         self.install_with_root(worker, name, prog, 1, self.import_as_of())
+    }
+
+    /// Install `prog` under `name` as a piloted program: one whose inputs a client moves, each
+    /// alone, with [`Server::advance`]. `tick` does not move them, does not wait for the
+    /// program's outputs, and does not compact them: all three follow the inputs instead.
+    ///
+    /// Its times have one coordinate, as an epoch has, and mean what the client says they mean.
+    /// It reads each trace it imports from that trace's compaction frontier on, and its inputs
+    /// start at the latest of those frontiers: at the least time, if it imports nothing.
+    pub fn install_piloted(&mut self, worker: &mut Worker, name: &str, prog: &st::Program) -> Result<(), String> {
+        let mut as_of = host_time(0);
+        for imp in &prog.root.imports {
+            if let st::Source::Trace(t) = &imp.from {
+                // A source that install creates on demand starts where the epoch is.
+                as_of = as_of.join(&self.trace_since(t).cloned().unwrap_or(self.import_as_of()));
+            }
+        }
+        self.install_paced(worker, name, prog, 1, as_of, Pace::Piloted)
     }
 
     /// Install with `root_width` root coordinates and an explicit import/read floor.
@@ -29,6 +53,15 @@ impl Server {
     pub fn install_with_root(
         &mut self, worker: &mut Worker, name: &str, prog: &st::Program,
         root_width: usize, as_of: HostTime,
+    ) -> Result<(), String> {
+        self.install_paced(worker, name, prog, root_width, as_of, Pace::Ticked)
+    }
+
+    /// [`Server::install_with_root`], for a program of either pace. A piloted program's inputs
+    /// start at `as_of` whatever the epoch is.
+    fn install_paced(
+        &mut self, worker: &mut Worker, name: &str, prog: &st::Program,
+        root_width: usize, as_of: HostTime, pace: Pace,
     ) -> Result<(), String> {
         if root_width == 0 || as_of.len() > root_width {
             return Err("root width must be positive and contain the as-of point".into());
@@ -67,6 +100,10 @@ impl Server {
                 if let Some(output) = self.outputs.get(&key) {
                     if output.width > root_width {
                         return Err(format!("cannot import trace {key:?} of width {} into width {root_width}", output.width));
+                    }
+                    // `tick` waits for a ticked program's outputs at the epoch, which a piloted trace need never reach.
+                    if root_width == 1 && pace == Pace::Ticked && self.trace_is_piloted(&key) {
+                        return Err(format!("trace {key:?} is a piloted program's: a program that imports it must be installed piloted"));
                     }
                     if !output.since.less_equal(&as_of) || !self.traces.get_mut(&key).unwrap().get_logical_compaction().less_equal(&as_of) {
                         return Err(format!("as-of {as_of:?} is before trace {key:?}'s compaction frontier"));
@@ -218,7 +255,7 @@ impl Server {
         for t in &import_names {
             *self.importers.entry(t.clone()).or_insert(0) += 1;
         }
-        let now = if root_width == 1 { as_of.join(&host_time(self.epoch)) } else { as_of.clone() };
+        let now = if root_width == 1 && pace == Pace::Ticked { as_of.join(&host_time(self.epoch)) } else { as_of.clone() };
         let mut by_pos: HashMap<usize, ServerInput> = HashMap::new();
         for (pos, mut handle) in inputs {
             handle.advance_to_point(&now);
@@ -234,6 +271,7 @@ impl Server {
                 dataflow_id,
                 root_width,
                 now,
+                pace,
                 origin: Origin::Program,
                 generators: HashMap::new(),
             },

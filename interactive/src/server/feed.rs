@@ -48,6 +48,28 @@ impl Server {
             .give_columns_at(columns, time)
     }
 
+    /// Stage a span: rows already read into columns, each at its own time in `times`, the first
+    /// root coordinate. Every time must be at or after the input's frontier; nothing is staged
+    /// otherwise, nor if the shapes are not the input's declared ones. The rows of a time take
+    /// effect once the input moves past it, by `tick` or, for a piloted program, [`Server::advance`].
+    pub fn feed_span(&mut self, prog: &str, input: usize, columns: Updates, times: Vec<OuterTime>) -> Result<(), String> {
+        if times.len() != columns.len() {
+            return Err(format!("a feed of {} rows with {} times", columns.len(), times.len()));
+        }
+        let frontier = self.input_frontier(prog, input)?.clone();
+        self.validate_feed(prog, input, &frontier)?;
+        if let Some(early) = times.iter().copied().filter(|time| !frontier.less_equal(&host_time(*time))).min() {
+            return Err(format!("cannot feed at time {early}: input {prog:?}/{input} stands at {}", progress::coordinates(&frontier)));
+        }
+        self.programs
+            .get_mut(&canonical_source_name(prog))
+            .expect("feed target was prevalidated")
+            .inputs
+            .get_mut(&input)
+            .expect("feed input was prevalidated")
+            .give_columns_timed(columns, times)
+    }
+
     /// Bulk-load rows into positional `input` of `prog` at the current epoch.
     ///
     /// `source` is a recipe (`random:…`, `iota:N` — the same names an
@@ -135,6 +157,7 @@ impl Server {
             .expect("load target was prevalidated");
         if let Some(recipe @ Recipe::Random { churn: 1.., .. }) = recipe {
             if installed.root_width != 1 { return Err("churning recipes currently require width 1".into()); }
+            if installed.pace == Pace::Piloted { return Err("a churning recipe changes its input at each tick, and `tick` does not move a piloted program's inputs".into()); }
             if diff != 1 {
                 return Err(format!("load: a churning recipe {:?} must be fed with diff=1", source));
             }

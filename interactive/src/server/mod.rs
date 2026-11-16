@@ -42,6 +42,10 @@
 //! - **tick** advances all inputs to the next epoch, runs to quiescence, then
 //!   lets every trace compact (an importer's own handle holds the shared
 //!   `TraceBox` back to what it still needs).
+//! - **advance** moves one input of a *piloted* program to a time, alone. A piloted program
+//!   is one whose inputs a client moves ([`Server::install_piloted`]): `tick` leaves them where
+//!   they are, so each can take a span of updates at their own times ([`Server::feed_span`])
+//!   and then move to the span's upper, whatever the epoch is and wherever other inputs stand.
 //! - **drop** evicts a program — gated on its published traces having no live
 //!   importer — and calls `worker.drop_dataflow`, which removes the operators
 //!   outright and frees their state immediately. The gate is what makes that
@@ -135,6 +139,15 @@ pub type RowShape = (corgi::Shape, corgi::Shape);
 /// A container of corgi columns at the program time, as a published trace's readers see them.
 pub type HostContainer = crate::runtime::container::CorgiContainer<HostTime, Diff>;
 
+/// Who moves a program's inputs through time.
+#[derive(Clone, Copy, PartialEq)]
+enum Pace {
+    /// `tick` moves every input to each next epoch.
+    Ticked,
+    /// A client moves each input, alone, with [`Server::advance`], and `tick` leaves them be.
+    Piloted,
+}
+
 /// Where an installed entry came from. Only `Program` is writable by `feed`;
 /// `Clock` additionally has its single row advanced each `tick`.
 #[derive(Clone, Copy, PartialEq)]
@@ -190,8 +203,9 @@ impl From<usize> for InputId {
 /// execute it without any further parsing.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Command {
-    /// Install `program` under `name`.
-    Install { name: String, program: st::Program },
+    /// Install `program` under `name`. With `piloted`, a client moves its inputs
+    /// (see [`Server::install_piloted`]).
+    Install { name: String, program: st::Program, piloted: bool },
     /// Update `input` of `prog` with one row, read into columns, at
     /// `time` (default the current epoch when `None`).
     Feed {
@@ -206,6 +220,19 @@ pub enum Command {
         prog: String,
         input: InputId,
         columns: Updates,
+    },
+    /// Stage rows, read into columns, into one input, each at its own time in `times`.
+    FeedSpan {
+        prog: String,
+        input: InputId,
+        columns: Updates,
+        times: Vec<OuterTime>,
+    },
+    /// Move `input` of piloted program `prog` to `time`, alone (see [`Server::advance`]).
+    Advance {
+        prog: String,
+        input: InputId,
+        time: OuterTime,
     },
     /// Fill `input` of `prog` from `source` — a recipe name, a
     /// published trace, or a file path — at the current epoch, each row's
@@ -256,6 +283,8 @@ struct Installed {
     root_width: usize,
     /// Default point used by program-wide advances.
     now: HostTime,
+    /// Who moves its inputs: `tick`, or a client.
+    pace: Pace,
     /// Whether this is a user program, a generated source, or the clock — see
     /// [`Origin`]. Generated/clock entries advance and drop like any program but
     /// are not writable by `feed`.
@@ -286,6 +315,8 @@ pub struct ProgramInfo {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     pub origin: &'static str,
+    /// Whether a client moves its inputs, and `tick` leaves them be.
+    pub piloted: bool,
 }
 
 /// A binding's captured changes: the containers of its source trace, whose times `tick`
@@ -434,6 +465,7 @@ impl Server {
                         Origin::Clock => "clock",
                         Origin::Diagnostics => "diagnostics",
                     },
+                    piloted: installed.pace == Pace::Piloted,
                 }
             })
             .collect();
@@ -520,6 +552,8 @@ impl Server {
 
     /// Close the current epoch: advance every input to the next epoch, step the
     /// worker until all exports have caught up, then let every trace compact.
+    /// A piloted program's inputs do not move, and its exports are not waited for at the epoch
+    /// nor compacted to it: they follow their own inputs (see [`Server::advance`]).
     pub fn tick(&mut self, worker: &mut Worker) {
         let cur = self.epoch;
         let next = cur + 1;
@@ -529,7 +563,7 @@ impl Server {
         // Diagnostics of everything since the last tick enter at the epoch being closed.
         self.process_diagnostics(worker);
         self.feed_diagnostics(cur);
-        for installed in self.programs.values_mut().filter(|p| p.root_width == 1) {
+        for installed in self.programs.values_mut().filter(|p| p.root_width == 1 && p.pace == Pace::Ticked) {
             // The clock's single row advances by one each tick (worker 0 owns
             // it): retract the current epoch, add the next — an O(1) change.
             if w0 && installed.origin == Origin::Clock {
@@ -564,12 +598,14 @@ impl Server {
         // waited on too, so each buffer holds every change through the epoch
         // just closed before it is drained below.
         let epoch = self.epoch;
-        while self.outputs.values().filter(|o| o.width == 1).any(|o| !progress::caught_up(&o.probe, &host_time(epoch)))
+        while self.outputs.values().filter(|o| o.width == 1 && self.programs[&o.owner].pace == Pace::Ticked).any(|o| !progress::caught_up(&o.probe, &host_time(epoch)))
             || self.bindings.iter().any(|b| b.probe.less_than(&host_time(epoch)))
         {
             // Remote data or progress wakes idle workers; do not busy-poll.
             worker.step_or_park(None);
         }
+        // A piloted program that reads a ticked trace has just been handed an epoch of it.
+        self.settle_piloted(worker);
 
         // Feedback: deliver each binding's buffered source changes into its
         // target input at the (new, open) epoch — they become visible when
@@ -607,7 +643,7 @@ impl Server {
         // `epoch`, sliding it out of peek's window and leaving peek with only the
         // latest epoch's delta. (`saturating_sub` guards `epoch == 0`, though
         // tick only runs at epoch >= 1.)
-        let names: Vec<_> = self.outputs.iter().filter(|(_, o)| o.width == 1).map(|(n, _)| n.clone()).collect();
+        let names: Vec<_> = self.outputs.iter().filter(|(_, o)| o.width == 1 && self.programs[&o.owner].pace == Pace::Ticked).map(|(n, _)| n.clone()).collect();
         for name in names {
             let since = self.outputs[&name].since.join(&self.import_as_of());
             self.compact(&name, &since).expect("monotone legacy compaction");

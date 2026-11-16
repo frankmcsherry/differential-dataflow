@@ -99,8 +99,24 @@ impl Server {
         if output.width > 1 {
             return Err(format!("trace {name:?} has root width {}; name a point with snapshot_as_of or peek_as_of", output.width));
         }
-        let epoch = self.programs[&output.owner].now.get(0).copied().unwrap_or(0);
+        let owner = &self.programs[&output.owner];
+        let epoch = match owner.pace {
+            Pace::Ticked => owner.now.get(0).copied().unwrap_or(0),
+            // A piloted program's trace is complete before the least time that its inputs, and
+            // those of the programs it reads, stand at. With none of either, it is all complete.
+            Pace::Piloted => {
+                let mut frontier = Antichain::new();
+                self.collect_frontier(&output.owner, &mut std::collections::HashSet::new(), &mut frontier);
+                match frontier.elements().iter().map(|t| t.get(0).copied().unwrap_or(0)).min() {
+                    Some(least) => least,
+                    None => return Ok(Some(host_time(OuterTime::MAX))),
+                }
+            }
+        };
         if epoch == 0 { return Ok(None); }
+        // A piloted program that reads other traces starts where they are read from, and has
+        // nothing complete to read until its own inputs have moved past that.
+        if !output.since.less_equal(&host_time(epoch - 1)) { return Ok(None); }
         Ok(Some(host_time(epoch - 1)))
     }
 

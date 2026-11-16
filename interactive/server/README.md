@@ -46,7 +46,7 @@ generates one. Responses are `<id> data ...`, followed by `<id> ok ...` or
 Between commands, blank lines and `#` comment lines are skipped, so command
 scripts can be piped to stdin (see `demo/`).
 
-The useful commands are `load`, `drop`, `list`, `feed`, `bind`, `unbind`,
+The useful commands are `load`, `drop`, `list`, `feed`, `advance`, `bind`, `unbind`,
 `peek`, `tail`, `stop`, `tick`, and `exit`. `load <name> from <path>` installs
 a program file (`.ddp`, pipe syntax); `load <name> from <path>
 explain` applies the explanation rewrite first (`explain=debug` also taps
@@ -134,7 +134,8 @@ A `data` payload is `u64 rows | u64 lanes | keys | vals | i64*rows diffs |
 u64*rows*lanes times`, all little-endian. `keys` and `vals` are each one column in
 Corgi's self-describing byte encoding (`corgi::bytes`), so a client reads their
 shapes from the bytes. A `peek` frame has no times (`lanes` is 0); a `tail` frame
-has one lane, each change's epoch. `interactive::runtime::frame` decodes a payload,
+has one lane, each change's epoch, or for a piloted program's trace the time its
+client gave it (see "Spans" below). `interactive::runtime::frame` decodes a payload,
 and `../bench/ldbc/client.py` has a Python decoder. A `tail` whose client falls more
 than 256 MiB of frames behind gets `err client too slow` and `end`, and stops
 sending.
@@ -181,7 +182,8 @@ A program that already has the updates as columns can skip the text:
 
 is followed by exactly `nbytes` bytes, a `data` frame in the format `peek … as
 corgi` answers with, with no time lanes (`lanes` is 0): `rows | 0 | keys | vals |
-diffs`. On WebSocket the header line and its bytes are one binary message. The
+diffs`. (A frame with a time lane is a span, each update at its own time: see
+"Spans" below.) On WebSocket the header line and its bytes are one binary message. The
 session checks that the keys and values have the input's declared shapes (any
 integer storage will do) and admits the columns as one feed, as above. A frame
 of other shapes, not a whole frame, or larger than `DDIR_MAX_FEED_BYTES` is
@@ -208,6 +210,51 @@ recursive view, see `demo/txn.txt`). Racing writes settle identically on
 every replay. Identity is convention, not enforcement: we are not defending
 against adversarial clients yet, and server-side attribution is deliberately
 deferred until a deployment needs it.
+
+## Spans: `load … piloted` and `advance`
+
+A program loaded with the option `piloted` is moved through time by its client, and not by `tick`:
+
+    load ledger piloted begin
+    let a = input "a" : ((int), (int));
+    let b = input "b" : ((int), (int));
+    output "both" = a + b;
+    ledger end-load
+
+Its times have one coordinate, as an epoch has, and mean what the client says they mean.
+Each of its inputs stands at a time of its own, and starts at the least time.
+`tick` moves none of them, however many epochs pass.
+
+A span is some updates, each at its own time.
+
+    feed <prog> <in> frame <nbytes>
+
+feeds one, when the frame has a time lane: `rows | 1 | keys | vals | diffs | times`, the format a `tail … as corgi` sends its `data` frames in.
+So a tail's frame can be fed to another input as it came.
+Every time must be at or after the time the input stands at, or the whole frame is refused.
+A span enters at one worker, so that it is refused whole; it is not divided among the workers as other framed feeds are.
+A single row of text takes `time=<t>`, as it always has.
+
+    advance <prog> <in> <time>
+
+moves one input to `time`, alone.
+No other input moves, of this program or of any other.
+The input takes nothing before `time` afterwards, and does not move back.
+
+The program's outputs are complete before the least of the times its inputs stand at.
+`advance` is answered once every piloted program's outputs have caught up with that, and every `tail` has sent the changes it made.
+`peek` reads what is complete.
+A binary `tail` sends each change at its time, and `progress` as that least time moves.
+`feed <prog> <in> from <trace>` reads a piloted program's trace as what is complete, and feeds it at the time the input stands at.
+A piloted program's traces compact to just before that least time, as the others compact to just before the epoch, so a `tail` started late sees earlier changes at that time.
+
+A program that imports a piloted program's output, or has an input bound to one, is piloted too, whether or not its load says so: its `ok` says `, piloted`.
+It reads the output from where it is complete, and follows it, at its times.
+An input of its own starts at the time the output is read from.
+`bind` does not reach a piloted program: a binding delivers at each tick.
+
+Not here yet: times of more than one coordinate on the wire.
+The library has them (`Server::install_with_root`), and a frame holds one time lane.
 
 ## Requests as input rows
 

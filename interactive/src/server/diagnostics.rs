@@ -67,6 +67,7 @@ impl Server {
                 dataflow_id,
                 root_width: 1,
                 now: host_time(self.epoch),
+                pace: Pace::Ticked,
                 origin: Origin::Diagnostics,
                 generators: HashMap::new(),
             },

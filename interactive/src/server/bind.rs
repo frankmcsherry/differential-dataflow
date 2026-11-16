@@ -76,6 +76,10 @@ impl Server {
         if installed.root_width != 1 || self.outputs[&source].width != 1 {
             return Err("tick bindings currently require width 1 on both ends".into());
         }
+        // A binding delivers at each tick, one epoch later, and a piloted program has no epochs.
+        if installed.pace == Pace::Piloted || self.trace_is_piloted(&source) {
+            return Err("tick bindings require programs that `tick` moves on both ends; a piloted program is moved by `advance`".into());
+        }
         let declared = &installed.inputs[&input].shape;
         let shape = &self.shapes[&source];
         if declared != shape {
