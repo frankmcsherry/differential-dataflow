@@ -1,0 +1,92 @@
+-- What each instance is told of the state: the entries it needs, and no others.
+--
+--   input 0, entries : ((entry), ())
+--
+--   bundle : ((instance), (entry))     the entries an instance needs
+--   roster : ((machine), (instance))   the instances the state asks for, each under the first number of its id
+--
+-- An instance needs:
+--   its runs, the computations they name, and the programs of those computations;
+--   each ledger one of those computations reads or writes, and each clock above such a ledger, with their spans;
+--   every entry, if one of its computations reads the state.
+-- Where a ledger stands is not here. It is the upper of the ledger's last span, joined with those of the clocks
+-- above it, and an instance works that out from the spans it is told. So a clock that ticks is one row to each
+-- instance that needs it, however many of that instance's ledgers follow it.
+--
+-- One who follows the state keeps these two views, and each is read at one key: an instance holds a `tail` of
+-- `bundle` at its own id, and a machine's launcher holds a `tail` of `roster` at its machine's number.
+-- What a tail says is decided by the state. That it is there is not: it lasts as long as its reader's connection.
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let entries = input 0 : ((Entry), ());
+
+let table = entries | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let computations = table((Computation((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let runs = table((Run((key, val))), ()) | map(((key, val), ()) -> (key, val));
+
+-- EACH ENTRY, under what it is about: a ledger, a program, a computation, or an instance.
+-- Each row keeps its entry, to hand on.
+let of_ledger = table | flatmap(((entry), ()) -> (entry, entry enlist unweave .1) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let of_span = table | flatmap(((entry), ()) -> (entry, entry enlist unweave .2) cap_list map ((entry, ((id, _, _, _), _)) -> ((id), (entry))));
+let of_program = table | flatmap(((entry), ()) -> (entry, entry enlist unweave .4) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let of_computation = table | flatmap(((entry), ()) -> (entry, entry enlist unweave .5) cap_list map ((entry, (key, _)) -> (key, (entry))));
+let of_run = table | flatmap(((entry), ()) -> (entry, entry enlist unweave .6) cap_list map ((entry, ((instance, _), _)) -> ((instance), (entry))));
+
+-- HOSTS: each computation, and an instance that runs it.
+let hosts = runs | map(((instance, computation), ()) -> ((computation), (instance)));
+
+-- CODED: each program, and an instance that runs a computation of it.
+let coded = computations | map((computation, (program, _, _)) -> (computation, (program)))
+                         | join(hosts, (_, (program), (instance)) -> ((program), (instance))) | distinct;
+
+-- TOUCHES: each computation, and a ledger it reads or writes. WATCHES: each computation that reads the state.
+let ins = computations | flatmap(((computation), (_, inputs, _)) ->
+              (computation, inputs) cap_list map ((computation, input) -> ((computation), (input))));
+let outs = computations | flatmap(((computation), (_, _, outputs)) ->
+               (computation, outputs) cap_list map ((computation, output) -> ((computation), (output))));
+let touches = (ins((computation), (Read(ledger))) + outs((computation), (Written(ledger))))
+            | map(((computation, ledger), ()) -> ((computation), (ledger))) | distinct;
+let watches = ins((computation), (State)) | distinct;
+
+-- WANTED: each ledger an instance needs, which is each one its computations read or write,
+-- and each clock above one that it needs.
+let follows = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), ()) -> ((id), (clock)));
+let direct = touches | join(hosts, (_, (ledger), (instance)) -> ((ledger), (instance))) | distinct;
+climbing: {
+    let above = wanted | join(follows, (_, (instance), (clock)) -> ((clock), (instance)));
+    set wanted = (direct + above) | distinct;
+}
+
+-- WATCHERS: the instances that run a computation that reads the state. Each is told every entry.
+let watchers = watches | join(hosts, (_, (), (instance)) -> ((), (instance))) | distinct;
+
+output "bundle" = (of_run
+                + (of_computation | join(hosts, (_, (entry), (instance)) -> ((instance), (entry))))
+                + (of_program | join(coded, (_, (entry), (instance)) -> ((instance), (entry))))
+                + (of_ledger | join(climbing::wanted, (_, (entry), (instance)) -> ((instance), (entry))))
+                + (of_span | join(climbing::wanted, (_, (entry), (instance)) -> ((instance), (entry))))
+                + (table | map(((entry), ()) -> ((), (entry)))
+                         | join(watchers, (_, (entry), (instance)) -> ((instance), (entry)))))
+                | distinct;
+
+output "roster" = runs | map((((machine, number), _), ()) -> ((machine), ((machine, number)))) | distinct;
