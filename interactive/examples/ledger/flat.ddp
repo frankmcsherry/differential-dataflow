@@ -1,0 +1,40 @@
+-- Shape flat rows of ints into what round.ddp takes, and into ledgers.
+-- A driver can then send its rows as plain columns of ints, and the shaping is done here.
+-- Every ledger made this way is durable, has one time coordinate, starts at [0], and has an empty shape;
+-- every append has an empty batch.
+--
+--   input 0, singles : ((tx), (hi, lo, lower, upper, number))           one append
+--   input 1, creates : ((tx), (hi, lo, clock_hi, clock_lo, following))  one ledger, which follows a clock if `following`
+--   input 2, acting  : ((tx), (hi, lo))                                 a transaction of a runner, and its computation
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let singles = input 0 : ((int), (int, int, int, int, int));
+let creates = input 1 : ((int), (int, int, int, int, int));
+let acting = input 2 : ((int), (int, int));
+
+output "appends" = singles | map((tx, (hi, lo, lower, upper, number)) ->
+    (tx, ((hi, lo), number, lower enlist enlist, upper enlist enlist, () inject Empty)));
+output "runners" = acting | map((tx, (hi, lo)) -> (tx, ((hi, lo))));
+output "ledgers" = creates | map((_, (hi, lo, clock_hi, clock_lo, following)) ->
+    let shape = [] : List(int) in
+    let clock = (following, (clock_hi, clock_lo) inject Follows, () inject Free) select in
+    (((((hi, lo)), (shape, 1, 0 enlist enlist, clock, () inject Durable)) inject Ledger), ()));

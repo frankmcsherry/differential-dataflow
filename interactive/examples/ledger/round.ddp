@@ -1,0 +1,156 @@
+-- Admission of a round: the checks of admit.ddp, for many transactions of appends at once.
+--
+-- A round is made as one change of the state: the appends of every transaction it makes, together.
+-- admit.ddp covers such a change when its appends are each to a different ledger, and judges each
+-- against the state before the change. So this does the same:
+--   of the transactions that append to a ledger in the round, the one of least key goes on, and the others wait;
+--   a transaction that appends to one ledger twice waits too, in every round: it is for the rules to judge;
+--   an append to a ledger reads the clocks above it, so a transaction waits if one of lesser key appends to such a clock;
+--   each transaction that goes on is judged against the state as the round found it, by admit.ddp's checks,
+--   and is made if none of its appends is refused.
+-- A transaction that waits is not judged, and may be sent again.
+-- A transaction makes others wait whether or not it is made itself.
+-- So no transaction that is made reads what one of lesser key writes, and the round is its made transactions,
+-- one after another in the order of their keys (the test holds it to that).
+-- A clock's append should then have a key above those of the appends to its followers, or they wait for it.
+--
+-- What this reads of the state is not derived from the entries each round. It is kept beside them,
+-- and each round's own output moves it:
+--   input 2, own   : ((id), (version, upper, following, clock, durable))  each ledger's appends so far and its own upper,
+--                                                                        with the clock it follows, if `following`
+--   input 3, bound : ((ledger), (computation, position))                 each ledger a computation writes
+-- A ledger's write frontier is its own upper joined with those of the clocks above it, as the round found them.
+--
+-- The round:
+--   input 0, appends : ((tx), (ledger, number, lower, upper, batch))     each transaction's appends
+--   input 1, runners : ((tx), (computation))                             the transactions of a runner; the rest are a user's
+--
+-- Outputs:
+--   waiting ((tx), ())       transactions this round did not judge
+--   refused ((tx), ())       transactions judged and not made
+--   spans   ((entry), ())    the round's change to the state: a span for each append that is made
+--   moved   ((id), (..))     the round's change to `own`
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let appends = input 0 : ((int), (Id, int, Frontier, Frontier, Batch));
+let runners = input 1 : ((int), (Id));
+let own = input 2 : ((Id), (int, Frontier, int, Id, int));
+let bound = input 3 : ((Id), (Id, int));
+
+-- THE APPENDS, each by its ledger.
+let asked = appends | map(((tx), (ledger, number, lower, upper, batch)) -> ((ledger), (tx, number, lower, upper, batch)));
+
+-- WHO IS CROWDED OFF A LEDGER. On each ledger the transaction of least key goes on, if it appends there once.
+let crowded = asked | map((ledger, (tx, _, _, _, _)) -> (ledger, (tx)))
+                    | reduce((_, claims) ->
+                          let least = claims map (((tx), _) -> tx) fold_min in
+                          let late = (least, claims) cap_list map ((least, ((tx), copies)) -> ((tx, least) ne, (copies, 1) gt) any) in
+                          (late, claims) zip filter map (((tx), _) -> ((tx), 1)))
+                    | map((_, (tx)) -> ((tx), ())) | distinct;
+
+-- EACH APPEND MEETS ITS LEDGER, as the round found it.
+let met = own | join(asked, (ledger, (version, mine, following, clock, durable), (tx, number, lower, upper, batch)) ->
+                  (ledger, (tx, number, lower, upper, batch, version, mine, following, clock, durable)));
+-- A clock that many of the round's ledgers follow would bring them all to one worker, if they met it by its id.
+-- They meet it by (clock, part) instead, where a ledger's part is one of 64 by its id.
+let direct = met | filter((_, (_, _, _, _, _, _, _, following, _, _)) -> following)
+                 | map(((ledger), (tx, number, lower, upper, batch, version, mine, _, clock, durable)) ->
+                       ((clock, (ledger hash shr_b64 1, 64) rem), (ledger, tx, number, lower, upper, batch, version, mine, durable)));
+let parts = direct | map((part, _) -> (part, ())) | distinct;
+
+-- THE CLOCKS THE ROUND NEEDS. A clock's frontier is the join of its own upper with those of the clocks above it.
+-- The climb starts from these clocks, so it costs what the clocks are, however many follow them.
+let named = parts | map(((clock, _), ()) -> ((clock), ())) | distinct;
+let clocks = own | join(named, (clock, (_, upper, following, above, _), ()) -> (clock, (upper, following, above)));
+over: {
+    let next = above | map(((seed), (clock)) -> ((clock), (seed)))
+                     | join(own, ((clock), (seed), (_, _, following, parent, _)) -> ((seed), (following, parent)))
+                     | filter((_, (following, _)) -> following) | map((seed, (_, parent)) -> (seed, (parent)));
+    set above = ((clocks | filter((_, (_, following, _)) -> following) | map((seed, (_, _, clock)) -> (seed, (clock)))) + next) | distinct;
+}
+-- WHO APPENDS TO A CLOCK. An append to a ledger reads the clocks above it, so the round's appends to those clocks matter to it.
+-- TICKING is each needed clock, with each transaction that appends to it or to a clock above it.
+let chain = (named | map(((clock), ()) -> ((clock), (clock))))
+          + (over::above | map(((seed), (clock)) -> ((clock), (seed))));
+let ticking = chain | join(asked, (_, (seed), (tx, _, _, _, _)) -> ((seed), (tx)));
+-- Each needed clock's frontier, whether the round appends to it or above it, and the least key that does:
+-- ((clock), (frontier, ticked, first)). A row to fold is (0, an upper, _) or (1, _, a transaction).
+let clock_state = ((clocks | map((clock, (upper, _, _)) -> (clock, (0, upper, 0))))
+                 + (over::above | map(((seed), (clock)) -> ((clock), (seed)))
+                                | join(own, ((clock), (seed), (_, upper, _, _, _)) -> ((seed), (0, upper, 0))))
+                 + (ticking | map((seed, (tx)) -> let none = [] : List(List(int)) in (seed, (1, none, tx)))))
+                | reduce((_, rows) ->
+                    let none = [] : List(List(int)) in
+                    let (_, frontier, ticked, first) = ((0, none, 0, 0), rows) fold (
+                        ((seen, sofar, ticked, first), ((kind, upper, tx), _)) ->
+                            let is_upper = (kind, 0) eq in
+                            let joined = (seen, (sofar, upper) call frontier_join, upper) select in
+                            let least = ((ticked, (first, tx) lt) all, first, tx) select in
+                            ((is_upper, 1, seen) select, (is_upper, joined, sofar) select,
+                             (is_upper, ticked, 1) select, (is_upper, first, least) select)) in
+                    ((frontier, ticked, first), 1) enlist);
+let spread = parts | map(((clock, part), ()) -> ((clock), (part)))
+                   | join(clock_state, ((clock), (part), (frontier, ticked, first)) -> ((clock, part), (frontier, ticked, first)));
+
+-- JUDGED is each append to a ledger that is registered, with what it is judged against:
+-- ((ledger), (tx, number, lower, upper, batch, version, own upper, write frontier, following, clock, durable, late)).
+-- An append is `late` when a transaction of lesser key appends to a clock above its ledger.
+let judged = (met | filter((_, (_, _, _, _, _, _, _, following, _, _)) -> (following, 0) eq)
+                  | map((ledger, (tx, number, lower, upper, batch, version, mine, following, clock, durable)) ->
+                        (ledger, (tx, number, lower, upper, batch, version, mine, mine, following, clock, durable, 0))))
+           + (direct | join(spread, ((clock, _), (ledger, tx, number, lower, upper, batch, version, mine, durable), (frontier, ticked, first)) ->
+                        ((ledger), (tx, number, lower, upper, batch, version, mine, (mine, frontier) call frontier_join, 1, clock, durable,
+                                    (ticked, (first, tx) lt) all))));
+-- WHO WAITS, in all: those crowded off a ledger, and those behind an append to a clock they read.
+let behind = judged | filter((_, (_, _, _, _, _, _, _, _, _, _, _, late)) -> late)
+                    | map((_, (tx, _, _, _, _, _, _, _, _, _, _, _)) -> ((tx), ()));
+let waiting = (crowded + behind) | distinct;
+
+-- An append passes when admit.ddp refuses it nothing:
+--   its ledger is durable                                              (else "absent")
+--   it names the ledger's version, and begins at its write frontier    (else "stale")
+--   its lower is strictly before its upper                             (else "empty")
+-- PASSED is those, by transaction: ((tx), (ledger, number, lower, upper, batch, version, own upper, following, clock)).
+let passed = judged | filter((_, (_, number, lower, upper, _, version, _, write, _, _, durable, _)) ->
+                          let same = ((lower, write) call frontier_le, (write, lower) call frontier_le) all in
+                          (durable, (number, version) eq, same, (lower, upper) call frontier_lt) all)
+                    | map(((ledger), (tx, number, lower, upper, batch, version, mine, _, following, clock, _, _)) ->
+                          ((tx), (ledger, number, lower, upper, batch, version, mine, following, clock)));
+let failed = (appends | map((tx, _) -> (tx, ()))) - (passed | map((tx, _) -> (tx, ())));
+
+-- Only a runner of its computation appends to a bound ledger (else "barred").
+let claimed = asked | join(bound, (_, (tx, _, _, _, _), (computation, _)) -> ((tx, computation), ()));
+let acting = runners | map(((tx), (computation)) -> ((tx, computation), ())) | distinct;
+let barred = (claimed - (claimed | join(acting, (key, (), ()) -> (key, ())))) | map(((tx, _), ()) -> ((tx), ()));
+
+-- A transaction is made if it does not wait and none of its appends is refused.
+let unmade = (failed + barred + waiting) | distinct;
+let made = passed - (passed | join(unmade, (tx, row, ()) -> (tx, row)));
+output "waiting" = waiting;
+let refusing = (failed + barred) | distinct;
+output "refused" = refusing - (refusing | join(waiting, (tx, (), ()) -> (tx, ())));
+-- A new span covers one append, and its since is its own lower: its times are as they were written.
+output "spans" = made | map((_, (ledger, number, lower, upper, batch, _, _, _, _)) ->
+                          ((((ledger, number, (number, 1) add, lower), (lower, upper, batch)) inject Span), ()));
+-- An append moves its ledger from where it stood to where it leaves it.
+output "moved" = (made | map((_, (ledger, number, _, upper, _, _, _, following, clock)) -> ((ledger), ((number, 1) add, upper, following, clock, 1))))
+               - (made | map((_, (ledger, _, _, _, _, version, mine, following, clock)) -> ((ledger), (version, mine, following, clock, 1))));

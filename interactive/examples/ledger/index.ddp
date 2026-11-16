@@ -1,0 +1,48 @@
+-- What round.ddp reads of each ledger, derived from the entries.
+--
+-- round.ddp does not derive this in each round: it is kept beside the entries, and each round's own output moves it.
+-- This program says what it should be. A keeper that starts makes the index with it, and anyone may check with it,
+-- off the path of a round, that the index a keeper holds is still what the entries say.
+--
+--   input 0, entries : ((entry), ())
+--
+--   own : ((id), (version, upper, following, clock, durable))
+-- A ledger's version is the number of its appends, and its own upper is the upper of the span that covers the last
+-- of them, or its start if it has none (as in system.ddp). `following` says whether it follows a clock, and
+-- `clock` is that clock, or (0, 0). `durable` says whether its contents are its spans.
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let entries = input 0 : ((Entry), ());
+
+let table = entries | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let spans = table((Span((key, val))), ()) | map(((key, val), ()) -> (key, val));
+
+-- Each mark is a version and the upper at it. A ledger's marks are handed over in order, and the last is kept.
+let marks = (ledgers | map((id, (_, _, start, _, _)) -> (id, (0, start))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id), (to, upper))))
+          | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+
+output "own" = ledgers | join(marks, (id, (_, _, _, clock, keep), (version, upper)) ->
+                   let (following, clock) = clock match (Free (_ -> (0, (0, 0))), Follows (clock -> (1, clock))) in
+                   let durable = keep match (Durable (_ -> 1), Derived (_ -> 0)) in
+                   (id, (version, upper, following, clock, durable)));

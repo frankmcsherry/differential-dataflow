@@ -6,6 +6,10 @@
 //!
 //! Admission (`examples/ledger/admit.ddp`) is a short check of appends that stands in for the rules.
 //! Each transaction it covers is judged both ways, and the two must agree.
+//!
+//! A round (`examples/ledger/round.ddp`) is admission of many transactions at once, against an index that is
+//! kept beside the entries (`examples/ledger/index.ddp` says what it should be). What a round makes, the rules
+//! must make too, one transaction after another, and they must leave the same state and the same index.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,14 +42,16 @@ fn rows(rows: &[(&str, &str)]) -> Rows {
     rows.iter().map(|(key, val)| ((key.to_string(), val.to_string()), 1)).collect()
 }
 
-/// The commands, the rules of a state, the rules of a step, and admission.
-struct System { commands: Program, state: Program, step: Program, admit: Program }
+/// The commands, the rules of a state, the rules of a step, admission, admission of a round, and the index a round reads.
+struct System { commands: Program, state: Program, step: Program, admit: Program, round: Program, index: Program }
 fn system() -> System {
     System {
         commands: program(include_str!("../examples/ledger/commands.ddp")),
         state: program(include_str!("../examples/ledger/system.ddp")),
         step: program(include_str!("../examples/ledger/step.ddp")),
         admit: program(include_str!("../examples/ledger/admit.ddp")),
+        round: program(include_str!("../examples/ledger/round.ddp")),
+        index: program(include_str!("../examples/ledger/index.ddp")),
     }
 }
 
@@ -564,4 +570,88 @@ fn admission_agrees_with_the_rules() {
     }
     // Ledger 1 at its version and frontier, by either; 2 by its runner; 5 and 8 at theirs, to either upper, by either.
     assert_eq!((made, tried), (11, 288));
+}
+
+/// One transaction of a round: its key, the computation its maker runs if it is a runner's, and its appends,
+/// each as (ledger, number, lower, upper).
+type Asked = (i64, Option<i64>, Vec<(i64, i64, i64, i64)>);
+
+/// The transactions an output of round.ddp names.
+fn named(rows: &Rows) -> BTreeSet<i64> {
+    rows.keys().map(|(key, _)| key.trim_start_matches("tuple(").trim_end_matches(')').parse().unwrap()).collect()
+}
+
+#[test]
+fn a_round_makes_what_the_rules_make() {
+    let system = system();
+    let entries = small(&system, 1);
+    // Where the ledgers stand: 1 at (1, [9]), unbound; 2 and 3 at (1, [7]), written by computation 100; 4 at (1, [5]), written by 101;
+    // 5, 6 and 7 at (0, [0]); 9 is a clock at (1, [3]), and 8 follows it, at (0, [3]). Ledger 77 is not registered.
+    let rounds: [(Vec<Asked>, &[i64], &[i64]); 4] = [
+        (vec![
+            (9, None, vec![(4, 1, 5, 6)]),                      // refused: a user is barred from a bound ledger
+            (10, None, vec![(1, 1, 9, 12)]),
+            (11, None, vec![(5, 0, 0, 4), (6, 0, 0, 4)]),
+            (12, Some(100), vec![(2, 1, 7, 8), (3, 1, 7, 8)]),
+            (13, Some(101), vec![(4, 1, 5, 6)]),                // waits: transaction 9 is before it on ledger 4
+            (14, None, vec![(7, 0, 0, 2), (77, 0, 0, 2)]),      // refused: ledger 77 is absent, so ledger 7 is not appended to
+            (15, None, vec![(7, 0, 0, 2)]),                     // waits, though the transaction before it is refused
+            (16, None, vec![(8, 0, 3, 4)]),                     // the follower, before its clock
+            (17, None, vec![(9, 1, 3, 5)]),                     // the clock, after its follower
+            (18, None, vec![(1, 1, 9, 12)]),                    // waits
+        ], &[13, 15, 18], &[9, 14]),
+        (vec![
+            (20, None, vec![(1, 0, 9, 12)]),                    // refused: stale, by its number
+            (21, Some(101), vec![(4, 1, 5, 5)]),                // refused: empty
+            (22, None, vec![(5, 0, 0, 1), (5, 1, 1, 2)]),       // waits: two appends to one ledger are for the rules
+            (23, Some(100), vec![(2, 1, 7, 9)]),
+            (24, Some(101), vec![(3, 1, 7, 9)]),                // refused: barred, as the runner of another computation
+            (25, None, vec![(8, 0, 0, 4)]),                     // refused: stale, by its lower
+            (26, None, vec![(6, 0, 0, 3)]),
+        ], &[22], &[20, 21, 24, 25]),
+        (vec![
+            (30, None, vec![(9, 1, 3, 5)]),                     // the clock, before its follower
+            (31, None, vec![(8, 0, 3, 4)]),                     // waits: transaction 30 appends to the clock that ledger 8 reads
+            (32, None, vec![(1, 1, 9, 12)]),
+        ], &[31], &[]),
+        (vec![
+            (40, None, vec![(9, 1, 3, 2)]),                     // refused: empty
+            (41, None, vec![(5, 0, 0, 4), (8, 0, 3, 4)]),       // waits, though the append to its clock is refused
+            (42, None, vec![(8, 0, 3, 4), (9, 1, 3, 5)]),       // waits: transaction 41 is before it on ledger 8, and 40 on ledger 9
+            (43, None, vec![(6, 0, 0, 3)]),
+        ], &[41, 42], &[40]),
+    ];
+    let was = evaluate(&system.state, &[lines(&entries)], 1);
+    let index = evaluate(&system.index, &[lines(&entries)], 1);
+    for workers in [1, 2] {
+        for (asked, waiting, refused) in &rounds {
+            let appends: Vec<String> = asked.iter().flat_map(|(tx, _, appends)| appends.iter().map(move |(ledger, number, lower, upper)|
+                format!("{tx} val=tuple({},{number},{},{},inject(0,tuple()))", id(*ledger), frontier(&[*lower]), frontier(&[*upper])))).collect();
+            let runners: Vec<String> = asked.iter().filter_map(|(tx, actor, _)| actor.map(|computation| format!("{tx} val=tuple({})", id(computation)))).collect();
+            let out = evaluate(&system.round, &[appends, runners, lines(&index["own"]), lines(&was["bound"])], workers);
+            assert_eq!(named(&out["waiting"]), waiting.iter().copied().collect());
+            assert_eq!(named(&out["refused"]), refused.iter().copied().collect());
+
+            // Each transaction the round judged, judged alone by the rules, against the state the round found.
+            let actor = |actor: &Option<i64>| actor.map_or(USER.to_string(), runner);
+            let commands = |appends: &[(i64, i64, i64, i64)]| -> Vec<String> {
+                appends.iter().map(|(ledger, number, lower, upper)| append(*ledger, *number, &[*lower], &[*upper])).collect()
+            };
+            let mut made = Vec::new();
+            for (tx, who, appends) in asked.iter().filter(|(tx, _, _)| !waiting.contains(tx)) {
+                let mut trial = entries.clone();
+                let alone = transact(&system, &mut trial, &actor(who), &commands(appends), workers).is_empty();
+                assert_eq!(alone, !refused.contains(tx), "the round and the rules disagree on transaction {tx}");
+                if alone { made.push((who, appends)); }
+            }
+            // The transactions the round made, by the rules, one after another in the order of their keys.
+            let mut after = entries.clone();
+            for (who, appends) in made {
+                assert_eq!(transact(&system, &mut after, &actor(who), &commands(appends), workers), broken(&[]));
+            }
+            // They leave the state the round leaves, and the index the round leaves is what that state says.
+            assert_eq!(after, changed(&entries, &Rows::new(), &out["spans"]));
+            assert_eq!(evaluate(&system.index, &[lines(&after)], workers)["own"], changed(&index["own"], &Rows::new(), &out["moved"]));
+        }
+    }
 }
