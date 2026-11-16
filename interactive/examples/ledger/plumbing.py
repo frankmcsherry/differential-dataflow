@@ -308,6 +308,17 @@ class Follower:
             sock.sendall(json.dumps({"peek": names}).encode() + b"\n")
             return json.loads(sock.makefile("rb").readline())["rows"]
 
+    def rows(self, *names):
+        """The rows of each view named, all of one state, sent as frames and decoded here: [(key, val)] for each view."""
+        with socket.create_connection(self.address, timeout=60) as sock:
+            sock.sendall(json.dumps({"frames": names}).encode() + b"\n")
+            header, frames = receive(sock.makefile("rb"))
+        found, at = [], 0
+        for count in header["counts"]:
+            found.append([(key, val) for frame in frames[at:at + count] for key, val, _, _ in decode(frame)])
+            at += count
+        return found
+
 
 class Tail:
     """One view of a follower's, at one key, as its changes: frames, in the order the follower sent them.
@@ -375,14 +386,6 @@ def by_kind(lines):
     return kinds
 
 
-def kinds(frames):
-    """The state, by kind, from frames of entries as `peek .. as corgi` gives them: each entry as (key, val)."""
-    found = {}
-    for frame in frames:
-        for (entry,), _, _, _ in decode(frame): found.setdefault(entry[1], []).append(entry[2])
-    return found
-
-
 def stands(lines):
     """Each durable ledger's number: (version, frontier), with a frontier of one time as that time, and of none as None."""
     return {key[0][1]: (val[0], val[1][0][0] if val[1] else None) for key, val in map(row, lines)}
@@ -391,21 +394,3 @@ def stands(lines):
 LEDGER, SPAN, NAME, PROGRAM, COMPUTATION, RUN, HOLD = range(7)
 def number(ident): return ident[1]
 def instant(frontier): return frontier[0][0] if frontier else None
-
-
-def standing_of(entries):
-    """Where each durable ledger stands, worked out from entries as system.ddp's `standing` is: {ledger: (version, frontier)}.
-    A ledger's version is the number of its appends. Its write frontier is the upper of its last span, or its start
-    if it has none, joined with the write frontier of the clock it follows. An instance works this out from the
-    entries it is told, which hold each ledger it needs and each clock above one.
-    A frontier of one time is that time here, and of none is None."""
-    ledgers = {number(key[0]): val for key, val in entries.get(LEDGER, [])}
-    own = {ledger: (0, instant(val[2])) for ledger, val in ledgers.items()}
-    for (ledger, _, last, _), (_, upper, _) in entries.get(SPAN, []):
-        if last > own[number(ledger)][0]: own[number(ledger)] = (last, instant(upper))
-    def write(ledger):
-        upper, clock = own[ledger][1], ledgers[ledger][3]
-        if clock[1] == 0: return upper
-        above = write(number(clock[2]))
-        return None if upper is None or above is None else max(upper, above)
-    return {ledger: (own[ledger][0], write(ledger)) for ledger, val in ledgers.items() if val[4][1] == 0}

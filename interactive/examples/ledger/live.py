@@ -17,7 +17,7 @@ Run from the repository root:
 """
 import hashlib, json, os, subprocess, sys, threading, time, urllib.error
 import plumbing
-from plumbing import Client, Blobs, SPAN, number
+from plumbing import Client, Blobs, SPAN, number, instant
 import runner
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -119,10 +119,47 @@ def settle(done, seconds=30):
     return True
 
 
+# A ledger, read as a user reads one: from the keeper's entries and the blobs. An instance does not read this way:
+# its own views say which spans to read (see instance.ddp), and the checks below hold the two to each other.
+def path(spans, start, end, need=None):
+    """Spans that cover a ledger's appends from number `start` up to number `end`, one after another, or None.
+    With a need, only the spans a reader from that time can use: those held from the need or before, and
+    those that are not compacted, whose since is their own lower (see `forgotten` in system.ddp)."""
+    by_start = {}
+    for key, val in spans:
+        since, lower = instant(key[3]), instant(val[0])
+        if key[1] < key[2] and (need is None or since <= max(need, lower)): by_start.setdefault(key[1], []).append((key, val))
+    # The numbers from which `end` can be reached. A span leads to a greater number, so the greatest are settled first.
+    reach = {end}
+    for at in sorted(by_start, reverse=True):
+        if any(key[2] in reach for key, _ in by_start[at]): reach.add(at)
+    if start not in reach: return None
+    found, at = [], start
+    while at != end:
+        found.append(max((span for span in by_start[at] if span[0][2] in reach), key=lambda span: span[0][2]))
+        at = found[-1][0][2]
+    return found
+
+
+def history(spans, blobs, cache, start=0, need=None):
+    """A ledger's updates from append `start` on, and the append they reach: ([(key, val, time, diff)], number).
+    None if no spans lead from `start` to the last append (see `path`)."""
+    end = max([key[2] for key, _ in spans], default=start)
+    found = path(spans, start, end, need)
+    if found is None: return None
+    updates = []
+    for _, (_, _, batch) in found:
+        if batch[1] == 2:
+            name = plumbing.hash_name(batch[2])
+            if name not in cache: cache[name] = json.loads(blobs.get(name))["updates"]
+            updates += cache[name]
+    return updates, end
+
+
 def merged(keeper, blobs, ledger, since):
     """A blob of everything a ledger holds, as a reader from `since` on would see it."""
     spans, sums = [(key, val) for key, val in keeper.entries().get(SPAN, []) if number(key[0]) == ledger], {}
-    for key, val, at, diff in runner.history(spans, blobs, {})[0]:
+    for key, val, at, diff in history(spans, blobs, {})[0]:
         row = (key, val, max(at, since))
         sums[row] = sums.get(row, 0) + diff
     return blobs.put(json.dumps({"updates": [[key, val, at, diff] for (key, val, at), diff in sorted(sums.items()) if diff]}).encode())
@@ -132,7 +169,7 @@ def contents(keeper, blobs, ledger):
     """What a ledger holds once all its times have passed: {(key, val): count}."""
     spans = [(key, val) for key, val in keeper.entries().get(SPAN, []) if number(key[0]) == ledger]
     rows = {}
-    for key, val, _, diff in runner.history(spans, blobs, {})[0]:
+    for key, val, _, diff in history(spans, blobs, {})[0]:
         rows[(key, val)] = rows.get((key, val), 0) + diff
     return {row: count for row, count in rows.items() if count}
 
@@ -192,9 +229,13 @@ def main():
         check("each instance is told of the ledgers its computation reads and writes, and of no others",
               about(told(500)) == [1, 2] and about(told(501)) == [2, 3],
               f"{count(told(500))} and {count(told(501))} of the state's {len(keeper.peek('committed::entries'))} entries")
-        entries, standing, _ = keeper.snapshot()
-        check("where the ledgers stand, worked out from spans as an instance does, is what the model says",
-              plumbing.standing_of(entries) == standing)
+        def sees(instance):
+            """Where an instance's own views say its ledgers stand."""
+            session = plumbing.Server(runner.port((0, instance)), start=False)
+            try: return plumbing.stands(session.ask("peek local::standing"))
+            finally: session.sock.close()
+        check("where an instance's own views say its ledgers stand is what the model says",
+              settle(lambda: sees(500) == {ledger: at for ledger, at in keeper.standing().items() if ledger in (1, 2)}), str(sees(500)))
 
         # A computation that reads two ledgers. Ledger 1 stands at 20, and ledger 5 is new, and is appended to in two parts.
         # What the computation reads of ledger 1 past where ledger 5 stands has to wait, and must not be lost.
@@ -341,17 +382,23 @@ def main():
         steward_py = os.path.join(HERE, "steward.py")
         processes["compactor"] = spawn(steward_py, "compact", URL, FOLLOWER)
         processes["collector"] = spawn(steward_py, "collect", URL)
-        def spans_of(ledger): return [key for key, _ in keeper.entries()[SPAN] if number(key[0]) == ledger]
-        check("the compactor merges ledger 1 into one span, held from 10",
-              settle(lambda: [(key[1], plumbing.instant(key[3])) for key in spans_of(1)] == [(0, 10)]))
-        check("ledger 2 is merged too, and ledger 3, which nothing needs, is left as it is",
-              settle(lambda: len(spans_of(2)) == 1) and len(spans_of(3)) > 1)
+        # What to merge is the follower's view to say (compact.ddp), and the compactor does as it says.
+        # Each span below is (since, lower): a span is compacted if its since is after its lower.
+        def spans_of(ledger): return [(instant(key[3]), instant(val[0])) for key, val in keeper.entries()[SPAN] if number(key[0]) == ledger]
+        tidied = lambda: not copy.rows("tidy::merge")[0]
+        check("the compactor merges the 65 appends of ledger 1 into a few spans, and compacts none of them past 10",
+              settle(lambda: tidied() and len(spans_of(1)) <= 6 and all(since <= max(10, lower) for since, lower in spans_of(1))),
+              f"{len(spans_of(1))} spans")
+        check("ledger 2 is merged too, and so is ledger 3, which nothing needs: it keeps its times as they were written",
+              settle(lambda: tidied() and len(spans_of(2)) <= 6 and len(spans_of(3)) <= 6) and all(since <= lower for since, lower in spans_of(3)),
+              f"{len(spans_of(2))} and {len(spans_of(3))} spans")
         # The hold is released, and more is appended. The compactor then follows the reader, past 10.
         check("the hold is released", keeper.transact(USER, [f"inject(13,tuple({ident(900)},{ident(1)}))"]) == [])
         for at in range(65, 75): assert write(at) == []
         took = wait(keeper, 3, 75)
-        check("ledger 1 is then held from where its reader stands",
-              settle(lambda: len(spans_of(1)) == 1 and plumbing.instant(spans_of(1)[0][3]) > 10))
+        check("what is then merged of ledger 1 is held from where its reader stands",
+              settle(lambda: tidied() and len(spans_of(1)) <= 6 and any(since > max(10, lower) for since, lower in spans_of(1))),
+              f"spans held from {sorted(since for since, _ in spans_of(1))}")
         check("and the ledgers hold what they should", agree(contents(keeper, blobs, 3), expected()))
         import steward
         check("the collector leaves only the blobs that spans name",

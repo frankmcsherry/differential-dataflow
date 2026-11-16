@@ -36,7 +36,7 @@ HOME = 3
 REMOTE = "ledger-spike"
 ETCD = ",".join(f"http://{address}:2379" for _, address in MACHINES.values())
 FILES = [f"{DIR}/{name}" for name in ("plumbing.py", "keeper.py", "follower.py", "runner.py", "steward.py",
-                                      "commands.ddp", "system.ddp", "bundle.ddp")] + ["target/release/ddir_server"]
+                                      "commands.ddp", "system.ddp", "bundle.ddp", "instance.ddp", "compact.ddp")] + ["target/release/ddir_server"]
 
 
 def ssh(machine, *options):
@@ -191,7 +191,9 @@ def main():
         processes["compactor"] = session(0, f"steward.py compact {URL} {FOLLOWER}", carry=False)
         processes["collector"] = spawn(steward_py, "collect", URL)
         def spans_of(ledger): return [key for key, _ in keeper.entries()[SPAN] if number(key[0]) == ledger]
-        check("a compactor on machine 0 merges ledgers 1 and 2", settle(lambda: len(spans_of(1)) == 1 and len(spans_of(2)) == 1))
+        tidied = lambda: not plumbing.Follower(FOLLOWER).rows("tidy::merge")[0]
+        check("a compactor on machine 0 merges ledgers 1 and 2 into a few spans each",
+              settle(lambda: tidied() and len(spans_of(1)) <= 6 and len(spans_of(2)) <= 6), f"{len(spans_of(1))} and {len(spans_of(2))} spans")
         check("and the computations carry on over the merged ledgers", *carry(60, 70))
         check("the derived ledger on machine 1 has followed the state", settle(follows))
 

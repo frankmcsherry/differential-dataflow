@@ -1,0 +1,121 @@
+-- Which spans of each ledger to merge next: a policy for compaction, as a view of the state.
+--
+--   input 0, entries : ((entry), ())
+--   input 1, needs   : ((source), (computation, target, frontier))   what computations need, as system.ddp derives it
+--
+--   merge  : ((ledger), (from, to, since))          the merge to make next of a ledger, if there is one
+--   parts  : ((ledger), (from, to, since, batch))   the spans to read for it: one after another they cover its appends
+--   spares : ((ledger), (from, to, since))          the spans to discard once it is made
+--
+-- A compactor reads these three, makes the merged batch from the parts, and asks for the merge and the discards
+-- in one transaction. The rules judge that transaction like any other. This says only what is worth asking for.
+--
+-- The policy keeps the spans of a ledger few, and reads each append only a few times over.
+-- A ledger's CHAIN is the spans a reader would read now: one after another, they cover its appends from the first.
+-- The chain is kept so that each span covers more than twice the appends that all the spans after it cover.
+-- A span that does not is HEAVY with what follows it, and the oldest such span is merged with all that follow it.
+-- So a chain of n appends has about log n spans. Each time an append is merged again, the span it is in has
+-- grown by half or more, so an append is read about log n times in all.
+-- A merge is not asked for until it would cover `least` appends, here 4, so that the newest appends are not
+-- merged one by one: each merge is a transaction that every rule judges.
+--
+-- What a merged span is held from is the least frontier the ledger is needed from, by computations and by holders,
+-- joined with where the merged appends begin. Nothing that is needed is compacted away, and no more is kept than is needed.
+-- A ledger that nothing needs is merged too, and keeps its times as they were written: someone may come to need it.
+-- The least of two frontiers is taken to be one of them. That is right when one is before the other, as it is
+-- for times of one coordinate. In general it wants the meet of the two, which DDIR does not yet have.
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let entries = input 0 : ((Entry), ());
+let needs = input 1 : ((Id), (Id, Id, Frontier));
+
+let table = entries | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let spans = table((Span((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let holds = table((Hold((key, val))), ()) | map(((key, val), ()) -> (key, val));
+
+-- VERSION: the number of a durable ledger's appends, which is the greatest number a span of it goes up to.
+let version = (ledgers((id), (_, _, _, _, Durable)) | map(((id), ()) -> ((id), (0))))
+            + (spans | map(((id, _, to, _), _) -> ((id), (to))))
+            | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+
+-- WANTED: the frontier each durable ledger is to be kept readable from.
+-- It is the least of what is asked of the ledger, by computations and by holders. If nothing is asked, it is the
+-- ledger's start, which is before every time in it: the ledger is then kept as it was written.
+-- The rows of a ledger are handed over with what is asked first, kind 0, and its start last, kind 1.
+let asks = (needs | map(((source), (_, _, need)) -> ((source), (0, need))))
+         + (holds | map(((_, ledger), (need)) -> ((ledger), (0, need))))
+         + (ledgers((id), (_, _, start, _, Durable)) | map(((id, start), ()) -> ((id), (1, start))))
+         | distinct;
+let wanted = asks | reduce((_id, rows) ->
+                 let none = [] : List(List(int)) in
+                 let least = ((0, none), rows) fold (((seen, sofar), ((kind, frontier), _count)) ->
+                     ((kind, 0) eq,
+                      (1, ((sofar, frontier) call frontier_le, sofar, frontier) select),
+                      (seen, (seen, sofar, frontier) select)) select) in
+                 ((least.1), 1) enlist);
+
+-- THE CHAIN, found as a reader finds the spans to read (see instance.ddp).
+-- HOPS is each span that can be read from the wanted frontier, as a step from one number to another.
+let hops = spans((id, from, to, since), (lower, _, batch)) * wanted((id), (need))
+         | filter(((_, from, to, since, lower, _, need), ()) ->
+                      ((from, to) lt, (since, (need, lower) call frontier_join) call frontier_le) all)
+         | map(((id, from, to, since, lower, batch, _), ()) -> ((id, from), (to, since, lower, batch)))
+         | distinct;
+-- LEADS is each number from which hops reach the ledger's version.
+let ends = version | map(((id), (to)) -> ((id, to), ()));
+let back = hops | map(((id, from), (to, _, _, _)) -> ((id, to), (from)));
+leading: {
+    let before = back | join(leads, ((id, _), (from), ()) -> ((id, from), ()));
+    set leads = ends + before | distinct;
+}
+-- BEST is, from each number, the hop that goes furthest, of those that go to a number that leads to the version.
+let best = hops | map(((id, from), (to, since, lower, batch)) -> ((id, to), (from, since, lower, batch)))
+                | join(leading::leads, ((id, to), (from, since, lower, batch), ()) -> ((id, from), (to, since, lower, batch)))
+                | reduce((_place, steps) -> ((steps len, 1) sub enlist, steps) gather map ((step, _count) -> (step, 1)));
+-- AT is each number the chain comes to, from 0.
+walking: {
+    let next = at | join(best, ((id, _), (), (to, _, _, _)) -> ((id, to), ()));
+    set at = (wanted | map(((id), _) -> ((id, 0), ()))) + next | distinct;
+}
+let chain = walking::at | join(best, ((id, from), (), (to, since, lower, batch)) -> ((id), (from, to, since, lower, batch)));
+
+-- THE MERGE. A span of the chain is heavy when the appends after it are half as many as its own, or more,
+-- and it and they make `least` appends, here 4. The oldest heavy span is where the merge begins.
+let heavy = chain((id), (from, to, _, lower, _)) * version((id), (last))
+          | filter(((_, from, to, _, last), ()) ->
+                       ((to, last) lt, (((last, to) sub, (last, to) sub) add, (to, from) sub) ge, ((last, from) sub, 4) ge) all)
+          | map(((id, from, _, lower, _), ()) -> ((id), (from, lower)));
+let first = heavy | reduce((_id, places) -> (0 enlist, places) gather map ((place, _count) -> (place, 1)));
+
+output "merge" = first((id), (from, lower)) * version((id), (last)) * wanted((id), (need))
+               | map(((id, from, lower, last, need), ()) -> ((id), (from, last, (need, lower) call frontier_join)));
+
+output "parts" = chain | join(first, (id, (from, to, since, _, batch), (start, _)) -> (id, (start, from, to, since, batch)))
+                       | filter((_, (start, from, _, _, _)) -> (from, start) ge)
+                       | map((id, (_, from, to, since, batch)) -> (id, (from, to, since, batch)));
+
+-- Every span that begins where the merge does or after is covered by the merged span, and is not needed once it is made.
+output "spares" = spans | map(((id, from, to, since), _) -> ((id), (from, to, since)))
+                        | join(first, (id, (from, to, since), (start, _)) -> (id, (start, from, to, since)))
+                        | filter((_, (start, from, _, _)) -> (from, start) ge)
+                        | map((id, (_, from, to, since)) -> (id, (from, to, since)));

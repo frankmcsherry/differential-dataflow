@@ -354,8 +354,11 @@ def main():
         at = f"tuple({steps},{frontier(steps)})"
         check("the three ledgers stand where they were appended to", all(standing[f"tuple({ident(l)})"] == at for l in (1, 2, 9)))
         check("the follower stands at its clock", standing[f"tuple({ident(8)})"] == f"tuple(0,{frontier(steps)})")
-        worked = plumbing.standing_of(plumbing.by_kind(k.ask("peek committed::entries")))
-        check("where the ledgers stand can be worked out from the spans alone", worked == plumbing.stands(k.ask("peek before::standing")))
+        # An instance keeps its own view of where ledgers stand (instance.ddp). It is held here to the model's.
+        k.ask(f"load local from {DIR}/instance.ddp input0=committed::entries")
+        k.ask("tick")
+        check("where an instance's views say the ledgers stand is where the model says", sorted(k.ask("peek local::standing")) == sorted(k.ask("peek before::standing")))
+        k.many(["drop local", "tick"])
 
         # Appends that admission turns away.
         check("a user is barred from a bound ledger", k.transact(USER, [append(2, steps, steps, steps + 1)]) == ["barred"])

@@ -42,6 +42,12 @@ At 1,000 span entries a frame is 56 bytes an entry, against 226 as text.
 So a log record of one entry is several times larger as a frame than as text.
 A round of many appends does not have this problem.
 
+### The meet of two frontiers
+
+DDIR has `frontier_join`, `frontier_le` and `frontier_lt`, and no meet.
+`compact.ddp` wants the least frontier a ledger is needed from, and takes it to be one of the frontiers asked.
+That is right for times of one coordinate, and not in general.
+
 ### A text tail does not mark the end of a tick
 
 A binary tail sends a `progress` frame when its frontier moves, and a text tail sends nothing.
@@ -50,8 +56,10 @@ The spike now uses binary tails, so this matters only to someone who reads a tai
 ## What is not done in the spike
 
 - **Batches are JSON.** An instance and the compactor open them in Python. They should be frames, as a tail of an output gives them.
-- **An instance works things out in Python that DDIR could.** Where a ledger stands, which spans to read, and what to run should be views in the instance's own server. Python would then read a few small rows: a program's text to load, a blob's hash to fetch, the version to append at.
-- **Compaction has a mechanism and no policy.** The model has `Merge` and `Discard`, and the rule `forgotten` refuses a merge that a reader or a holder needs otherwise. The compactor merges a whole ledger into one span once it has four, and builds the merged batch in Python. The merge should be a DDIR program.
+- **An instance still moves its data in Python.** What to run, where a ledger stands and which spans to read are views in its own server now (`instance.ddp`). It still opens each batch, splits it by time, takes away what it had fed after a merge, and reads each output whole to see what changed. All of that waits on an input that takes a span.
+- **The compactor still builds the merged batch in Python.** What to merge and when is a view now (`compact.ddp`), kept by a follower. The merge itself, which moves times up and adds counts, should be done by the server too.
+- **The compaction policy counts appends, not bytes.** The state does not say how large a span's batch is.
+- **A ledger that nothing needs, and that was once compacted,** is not merged further: the policy keeps its times as written, and cannot read its compacted spans that way.
 - **Old blobs are deleted after a wait of two seconds.** Nothing else keeps a blob for a slow reader. This rests on time, and it should not.
 - **A derived ledger is read only on the instance that writes it.** The model says so too, in the rule `starved`. A computation that reads a derived ledger and writes a durable one is allowed by the model, and the instance does not do it yet.
 - **The keeper keeps every rule up to date after each round.** A round reads no rule, so the rules can come off its path.

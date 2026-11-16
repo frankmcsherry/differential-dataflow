@@ -12,7 +12,8 @@ is not in the state; whoever starts the launchers decides it.
 An instance reads the state from a follower, and writes to the keeper. It holds one tail, of the entries it
 needs (see bundle.ddp), and does nothing until they change: it asks no one whether they have. What the tail
 sends is frames, which the instance feeds to its own server unopened, and so has a copy of those entries there.
-It then reads that copy, and decodes it, to see what it is asked to do. For each computation
+Views of that copy, in the same server, say what the instance is to run, where each ledger stands, and which spans
+to read next (see instance.ddp). The instance reads the views, and works none of that out itself. For each computation
 it is to run, it loads the program's text into a DDIR server of its own, reads the input ledgers' spans and their
 blobs, and feeds them in order of time. What comes out is written as blobs and appended to the output ledgers,
 as a runner of the computation: this is all it asks of the keeper.
@@ -34,8 +35,9 @@ A program's outputs are named out0, out1, and so on, in the order the program gi
 import json, os, signal, subprocess, sys, time
 import keeper as model
 import plumbing
-from plumbing import SPAN, PROGRAM, COMPUTATION, RUN, number, instant
+from plumbing import number, instant
 
+DIR = "interactive/examples/ledger"
 EMPTY = "inject(0,tuple())"
 
 
@@ -83,65 +85,85 @@ class Computation:
             self.pending[position] = [update for update in updates if not wanted(update[2])]
         return taken
 
-    def read(self, position, spans, blobs, cache, need=None):
+    def read(self, local, position, ledger, blobs, cache, need=None):
         """Read what one input ledger has that was not yet read, and make it pending.
-        The spans that follow the appends that were read are read. If none follow them, the appends that were read
+        The spans that follow the appends that were read are read: the views say which. If none follow them, the appends that were read
         have been merged with ones that were not, and the two cannot be told apart. The ledger is then read whole,
         and what was fed of it is taken away. What is left of the times up to `need` is pending at `need`:
         a span held from `need` does not say which of those times each of its updates had, and all of them
         but the last, `need` itself, were fed. With no need, times do not matter, and all of it is as one."""
-        found = history(spans, blobs, cache, self.consumed.get(position, 0), need)
+        reader = (self.ident, 0, position)
+        found = local.spans(reader, ledger, self.consumed.get(position, 0), need)
         if found is not None:
-            self.pending.setdefault(position, []).extend(found[0])
+            self.pending.setdefault(position, []).extend(held_in(found, blobs, cache))
         else:
-            found = history(spans, blobs, cache, 0, need)
+            found = local.spans(reader, ledger, 0, need)
             if found is None: raise SystemExit(f"instance: computation {self.ident} cannot read input {position} from {need}")
             rest, later = {row: -count for row, count in self.mine.get(position, {}).items()}, []
-            for key, val, at, diff in found[0]:
+            for key, val, at, diff in held_in(found, blobs, cache):
                 if need is None or at <= need: rest[(key, val)] = rest.get((key, val), 0) + diff
                 else: later.append([key, val, at, diff])
             self.pending[position] = [[key, val, need, diff] for (key, val), diff in rest.items() if diff] + later
             print(f"instance: computation {self.ident} read input {position} whole again, after a merge", flush=True)
-        self.consumed[position] = found[1]
+        if found: self.consumed[position] = found[-1][1]
 
     def drop(self):
         self.server.ask(f"drop {self.name}")
         self.server.ask("tick")
 
 
-def path(spans, start, end, need=None):
-    """Spans that cover a ledger's appends from number `start` up to number `end`, one after another, or None.
-    With a need, only the spans a reader from that time can use: those held from the need or before, and
-    those that are not compacted, whose since is their own lower (see `forgotten` in system.ddp)."""
-    by_start = {}
-    for key, val in spans:
-        since, lower = instant(key[3]), instant(val[0])
-        if key[1] < key[2] and (need is None or since <= max(need, lower)): by_start.setdefault(key[1], []).append((key, val))
-    # The numbers from which `end` can be reached. A span leads to a greater number, so the greatest are settled first.
-    reach = {end}
-    for at in sorted(by_start, reverse=True):
-        if any(key[2] in reach for key, _ in by_start[at]): reach.add(at)
-    if start not in reach: return None
-    found, at = [], start
-    while at != end:
-        found.append(max((span for span in by_start[at] if span[0][2] in reach), key=lambda span: span[0][2]))
-        at = found[-1][0][2]
-    return found
-
-
-def history(spans, blobs, cache, start=0, need=None):
-    """A ledger's updates from append `start` on, and the append they reach: ([(key, val, time, diff)], number).
-    None if no spans lead from `start` to the last append (see `path`)."""
-    end = max([key[2] for key, _ in spans], default=start)
-    found = path(spans, start, end, need)
-    if found is None: return None
-    updates = []
-    for _, (_, _, batch) in found:
+def held_in(found, blobs, cache):
+    """The updates held in some spans, in order: [(key, val, time, diff)]. Each span is (from, to, batch)."""
+    read = []
+    for _, _, batch in found:
         if batch[1] == 2:
             name = plumbing.hash_name(batch[2])
             if name not in cache: cache[name] = json.loads(blobs.get(name))["updates"]
-            updates += cache[name]
-    return updates, end
+            read += cache[name]
+    return read
+
+
+class Local:
+    """The views an instance keeps of the entries it is told, in its own server (see instance.ddp).
+    They say what to run, where each ledger stands, and which spans to read. What they say is decoded here."""
+    def __init__(self, server, instance):
+        self.server, self.readers = server, {}      # each reader this has told the views of, and the row it told them
+        server.ask(f"load local from {DIR}/instance.ddp input0=state::entries")
+        server.many([f"feed local 1 tuple(tuple({instance[0]},{instance[1]})) val=tuple()", "tick"])
+
+    def rows(self, view):
+        return [(key, val) for frame in self.server.ask(f"peek local::{view} as corgi") for key, val, _, _ in plumbing.decode(frame)]
+
+    def plan(self):
+        """Each computation this instance is asked to run: {computation: (program, inputs, outputs, text)}."""
+        return {number(key[0]): val for key, val in self.rows("plan")}
+
+    def binds(self):
+        """Each input that reads a derived ledger, and the output that is the ledger: {(computation, position): (writer, place)}."""
+        return {(number(key[0]), key[1]): (number(val[0]), val[1]) for key, val in self.rows("binds")}
+
+    def standing(self):
+        """Where each durable ledger stands: {ledger: (version, frontier)}, with a frontier of one time as that time."""
+        return {number(key[0]): (val[0], instant(val[1])) for key, val in self.rows("standing")}
+
+    def spans(self, reader, ledger, read, need=None):
+        """The spans that lead a reader of a ledger on from its append `read` to its last, for one that reads from `need`:
+        [(from, to, batch)] in order, or None if no spans lead on from there. With no need, any span will do.
+        A reader is (computation, side, position), and the views are told where it has read to."""
+        frontier = "list()" if need is None else f"list(list({need}))"
+        row = f"tuple(tuple(tuple(0,{reader[0]}),{reader[1]},{reader[2]})) val=tuple(tuple(0,{ledger}),{read},{frontier})"
+        if self.readers.get(reader) != row:
+            feeds = [f"feed local 2 {self.readers[reader]} diff=-1"] if reader in self.readers else []
+            self.readers[reader] = row
+            self.server.many(feeds + [f"feed local 2 {row}", "tick"])
+        key = (((0, reader[0]), reader[1], reader[2]),)
+        if any(found == key for found, _ in self.rows("stuck")): return None
+        return sorted(val for found, val in self.rows("fetch") if found == key)
+
+    def forget(self, computation):
+        """Take back the readers of a computation that is no longer run here."""
+        gone = [reader for reader in self.readers if reader[0] == computation]
+        if gone: self.server.many([f"feed local 2 {self.readers.pop(reader)} diff=-1" for reader in gone] + ["tick"])
 
 
 def port(instance): return 21000 + 2 * (instance[1] % 1000)
@@ -153,6 +175,7 @@ def run(instance, url, follower):
     # What the instance is told is rows of `bundle`, each an entry under this instance's id. `entries` is the entries alone.
     server.ask("load state begin\n" + model.declarations() + 'let told = input 0 : ((Id), (Entry));\noutput "told" = told;\n'
                'output "entries" = told | map((_, (entry)) -> ((entry), ()));\nstate end-load')
+    local = Local(server, instance)
     told = plumbing.Tail(follower, "bundle", instance)
     running, order = {}, []
     try:
@@ -167,47 +190,39 @@ def run(instance, url, follower):
                     feeds = ["feed state 0 from state::told diff=-1"]
                 feeds += [(f"feed state 0 frame {len(frame)}", frame) for frame in map(plumbing.untimed, frames)]
             server.many(feeds + ["tick"])
-            # The entries this instance is told, all of one state. They are decoded here, for the Python below to read.
-            entries = plumbing.kinds(server.ask("peek state::entries as corgi"))
-            standing = plumbing.standing_of(entries)
-            # The plan: each computation this instance is asked to run.
-            asked = {number(computation) for (runner, computation), _ in entries.get(RUN, []) if runner == instance}
-            plan = {number(key[0]): val for key, val in entries.get(COMPUTATION, []) if number(key[0]) in asked}
+            # What the views say of the entries, all of one state: what to run, how to bind it, and where ledgers stand.
+            plan, binds, standing = local.plan(), local.binds(), local.standing()
             # Readers are dropped before what they read, and loaded after it.
             for ident in [ident for ident in reversed(order) if ident not in plan]:
-                running.pop(ident).drop(); order.remove(ident)
-            writers = {number(output[2]): (ident, position) for ident, (_, _, outputs) in plan.items()
-                       for position, output in enumerate(outputs) if output[1] == 1}
+                running.pop(ident).drop(); order.remove(ident); local.forget(ident)
             for _ in plan:
-                for ident, (program, inputs, outputs) in plan.items():
+                for ident, (_, inputs, outputs, text) in plan.items():
                     if ident in running: continue
                     bound = {}
                     for position, source in enumerate(inputs):
                         if source[1] == 0: bound[position] = "state::entries"
-                        elif number(source[2]) not in standing:
-                            writer = writers.get(number(source[2]))
-                            bound[position] = f"c{writer[0]}::out{writer[1]}" if writer and writer[0] in running else None
+                        elif (ident, position) in binds:
+                            writer, place = binds[(ident, position)]
+                            bound[position] = f"c{writer}::out{place}" if writer in running else None
                     if None in bound.values(): continue
-                    text = next(val[2] for key, val in entries.get(PROGRAM, []) if key[0] == program)
                     running[ident] = Computation(server, ident, plumbing.ints_text(text), inputs, outputs, bound)
                     order.append(ident)
-            for ident in order: step(keeper, blobs, cache, running, ident, entries, standing)
+            for ident in order: step(keeper, blobs, cache, local, running, ident, standing)
     finally:
         server.close()
 
 
-def step(keeper, blobs, cache, running, ident, entries, standing):
+def step(keeper, blobs, cache, local, running, ident, standing):
     """Take one computation as far as its inputs allow, and append what it made."""
     this = running[ident]
     reads = [(position, number(source[2])) for position, source in enumerate(this.inputs) if position not in this.bound]
     writes = [(position, number(output[2])) for position, output in enumerate(this.outputs) if output[1] == 1]
     writes = [(position, ledger) for position, ledger in writes if ledger in standing]   # the durable ones
     if not reads: return                                                        # all it reads is inside the server
-    spans = lambda ledger: [(key, val) for key, val in entries.get(SPAN, []) if number(key[0]) == ledger]
     if not writes:
         # Nothing it writes is recorded, so there is nowhere to start from, and no time to keep to:
         # its durable inputs are fed as they come.
-        for position, ledger in reads: this.read(position, spans(ledger), blobs, cache)
+        for position, ledger in reads: this.read(local, position, ledger, blobs, cache)
         updates = this.take(lambda at: True)
         if updates: this.feed(updates)
         return
@@ -222,7 +237,7 @@ def step(keeper, blobs, cache, running, ident, entries, standing):
         # The instance stops: the launcher starts another, which begins from where the outputs stand.
         raise SystemExit(f"instance: computation {ident} must start over")
     if until <= start: return
-    for position, ledger in reads: this.read(position, spans(ledger), blobs, cache, start if this.fed is None else this.fed)
+    for position, ledger in reads: this.read(local, position, ledger, blobs, cache, start if this.fed is None else this.fed)
     made = [[] for _ in this.outputs]
     if this.fed is None:
         # A start. Everything up to where the outputs stand is fed at once: this is what the outputs should hold there.
@@ -231,7 +246,8 @@ def step(keeper, blobs, cache, running, ident, entries, standing):
         this.feed(this.take(lambda at: at <= start))
         for position, ledger in writes:
             held = {}
-            for key, val, _, diff in history(spans(ledger), blobs, cache)[0]: held[(key, val)] = held.get((key, val), 0) + diff
+            wrote = local.spans((ident, 1, position), ledger, 0)
+            for key, val, _, diff in held_in(wrote, blobs, cache): held[(key, val)] = held.get((key, val), 0) + diff
             should = this.seen[position]
             made[position] = [[row[0], row[1], start, should.get(row, 0) - held.get(row, 0)]
                               for row in set(should) | set(held) if should.get(row, 0) != held.get(row, 0)]

@@ -19,9 +19,11 @@ Standing programs on the follower's own server:
   state    the entries, as the records leave them
   views    system.ddp of them: the model's views, and its rules, which are read here and not by the keeper
   bundle   bundle.ddp of them: what each instance is told, and the instances each machine has
+  tidy     compact.ddp of them: which spans of each ledger a compactor should merge next
 
 What a reader may ask, as one line of JSON to the port:
-  {"peek": [names]}                          the rows of each view named, all of one state
+  {"peek": [names]}                          the rows of each view named, all of one state, as text
+  {"frames": [names]}                        the same, as frames
   {"tail": view, "key": key, "after": at}    the rows of `bundle` or `roster` at a key, and then each change to them
 A tail is answered with {"at": number} and frames (see `pack` in plumbing.py): first every row, then, after each
 record that changes a row, the changes. What is sent up to any point is of one state, the one after `at` records.
@@ -79,6 +81,7 @@ class Follower:
         self.server.ask(f'load state begin\n{types}let entries = input 0 : ((Entry), ());\noutput "entries" = entries;\nstate end-load')
         self.server.ask(f"load views from {DIR}/system.ddp input0=state::entries")
         self.server.ask(f"load bundle from {DIR}/bundle.ddp input0=state::entries")
+        self.server.ask(f"load tidy from {DIR}/compact.ddp input0=state::entries input1=views::needs")
         self.server.ask("tick")
         self.types = types
         while True:
@@ -143,6 +146,10 @@ class Follower:
             if "peek" in request:
                 with self.turn: rows = [self.server.ask("peek " + name) for name in request["peek"]]
                 sock.sendall(json.dumps({"at": self.at, "rows": rows}).encode() + b"\n")
+                return
+            if "frames" in request:
+                with self.turn: found = [self.server.ask(f"peek {name} as corgi") for name in request["frames"]]
+                sock.sendall(plumbing.pack({"at": self.at, "counts": [len(frames) for frames in found]}, [frame for frames in found for frame in frames]))
                 return
             view, key = request["tail"], request.get("key")
             with self.turn:

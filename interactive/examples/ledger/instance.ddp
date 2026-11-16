@@ -1,0 +1,133 @@
+-- What an instance asks of the entries it is told: what to run, where its ledgers stand, and which spans to read.
+--
+-- An instance keeps this in its own server, over its copy of the entries (see bundle.ddp, and runner.py).
+-- The instance acts on what these views say, and works none of it out for itself.
+--
+--   input 0, entries : ((entry), ())                       the entries the instance is told
+--   input 1, me      : ((instance), ())                    the instance's own id
+--   input 2, readers : ((reader), (ledger, read, need))    each reader the instance has of a durable ledger
+--
+-- A reader is something in the instance that reads a ledger's appends in order. The instance names it as it likes,
+-- with two ints after a computation's id. `read` is the number of the ledger's appends it has read.
+-- `need` is the frontier it reads from: it can use a span whose since is at or before the need and the span's lower
+-- together (see `forgotten` in system.ddp). The empty frontier is after every time, so a reader with that need
+-- can use any span: it is for one that wants what the ledger holds in the end, and not when.
+--
+--   plan     : ((computation), (program, inputs, outputs, text))   each computation the instance is asked to run
+--   binds    : ((computation, position), (writer, place))          each input that reads a derived ledger, and the
+--                                                                  output of the computation that writes it
+--   standing : ((ledger), (version, frontier))                     each durable ledger's version and write frontier
+--   fetch    : ((reader), (from, to, batch))                       the spans a reader reads next, which lead from the
+--                                                                  appends it has read to the ledger's last
+--   stuck    : ((reader), ())                                      a reader that no spans lead on from where it has read
+--
+-- A reader is stuck when the appends it has read were merged with ones it has not. It then reads the ledger again
+-- from its first append, which the rules promise it can for a need the state knows of.
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+type Reader = (Id, int, int);
+
+let entries = input 0 : ((Entry), ());
+let me = input 1 : ((Id), ());
+let readers = input 2 : ((Reader), (Id, int, Frontier));
+
+let table = entries | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let spans = table((Span((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let programs = table((Program((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let computations = table((Computation((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let runs = table((Run((key, val))), ()) | map(((key, val), ()) -> (key, val));
+
+let durable = ledgers((id), (_, _, _, _, Durable)) | distinct;
+let derived = ledgers((id), (_, _, _, _, Derived)) | distinct;
+
+-- PLAN: each computation this instance is asked to run, with its program's text.
+-- An instance that reads the state is told of every run, so its own are picked out.
+output "plan" = runs((instance, computation), ()) * me((instance), ())
+              * computations((computation), (program, inputs, outputs)) * programs((program), (_, _, text))
+              | map(((_, computation, program, inputs, outputs, text), ()) -> ((computation), (program, inputs, outputs, text)));
+
+-- BINDS: a derived ledger is the output of the computation that writes it, inside the instance's server.
+-- A computation here that reads one is bound to that output.
+let ins = computations | flatmap(((computation), (_, inputs, _)) ->
+              (computation, ((0, inputs len) range, inputs) zip) cap_list
+              map ((computation, (position, input)) -> ((computation, position), (input))));
+let outs = computations | flatmap(((computation), (_, _, outputs)) ->
+               (computation, ((0, outputs len) range, outputs) zip) cap_list
+               map ((computation, (position, output)) -> ((computation, position), (output))));
+let reads = ins((computation, position), (Read(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position)));
+let writes = outs((computation, position), (Written(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position)));
+output "binds" = reads((ledger), (reader, position)) * derived((ledger), ()) * writes((ledger), (writer, place))
+               | map(((_, reader, position, writer, place), ()) -> ((reader, position), (writer, place)));
+
+-- STANDING, as in system.ddp.
+-- OWN: a ledger's version is the number of its appends, and its own upper is the upper of the span that covers
+-- the last of them, or its start if it has none.
+let own = (ledgers | map((id, (_, _, start, _, _)) -> (id, (0, start))))
+        + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id), (to, upper))))
+        | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+-- WRITE FRONTIER: the join of a ledger's own upper with the write frontier of the clock it follows, and so on up.
+let followed = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), ()) -> ((clock), (id)));
+wf: {
+    let lifted = followed | join(write, ((clock), (id), (frontier)) -> ((id), (frontier)));
+    set write = (own | map((id, (_, upper)) -> (id, (upper)))) + lifted
+              | reduce((_id, frontiers) ->
+                    let none = [] : List(List(int)) in
+                    let joined = ((0, none), frontiers) fold (((seen, sofar), ((frontier), _count)) ->
+                        (1, (seen, (sofar, frontier) call frontier_join, frontier) select)) in
+                    ((joined.1), 1) enlist);
+}
+output "standing" = own((id), (version, _)) * wf::write((id), (frontier)) * durable((id), ())
+                  | map(((id, version, frontier), ()) -> ((id), (version, frontier)));
+
+-- FETCH: the spans that lead a reader on from the appends it has read to the ledger's last.
+
+-- HOPS is each span a reader can use, as a step from one number to another: ((reader, from), (to, batch)).
+let seeking = readers | map(((reader), (id, _, need)) -> ((id), (reader, need)));
+let hops = spans((id, from, to, since), (lower, _, batch)) * seeking((id), (reader, need))
+         | filter(((_, from, to, since, lower, _, _, need), ()) ->
+                      ((from, to) lt, (since, (need, lower) call frontier_join) call frontier_le) all)
+         | map(((_, from, to, _, _, batch, reader, _), ()) -> ((reader, from), (to, batch)))
+         | distinct;
+-- LEADS is each number from which hops reach the ledger's version: the version itself, and each number a hop
+-- goes from to one that leads there.
+let ends = readers((reader), (id, _, _)) * own((id), (version, _)) | map(((reader, _, version), ()) -> ((reader, version), ()));
+let back = hops | map(((reader, from), (to, _)) -> ((reader, to), (from)));
+leading: {
+    let before = back | join(leads, ((reader, _), (from), ()) -> ((reader, from), ()));
+    set leads = ends + before | distinct;
+}
+-- BEST is, from each number, the hop to take: of those that go to a number that leads there, the one that goes
+-- furthest. The hops from a number are handed over in order, and the last is kept.
+let best = hops | map(((reader, from), (to, batch)) -> ((reader, to), (from, batch)))
+                | join(leading::leads, ((reader, to), (from, batch), ()) -> ((reader, from), (to, batch)))
+                | reduce((_place, steps) -> ((steps len, 1) sub enlist, steps) gather map ((step, _count) -> (step, 1)));
+-- AT is each number the reader comes to: where it has read to, and where each best hop takes it.
+let begins = readers | map(((reader), (_, read, _)) -> ((reader, read), ()));
+walking: {
+    let next = at | join(best, ((reader, _), (), (to, _)) -> ((reader, to), ()));
+    set at = begins + next | distinct;
+}
+output "fetch" = walking::at | join(best, ((reader, from), (), (to, batch)) -> ((reader), (from, to, batch)));
+
+-- STUCK: a reader whose place does not lead to the ledger's version.
+output "stuck" = begins - (begins | join(leading::leads, (place, (), ()) -> (place, ())))
+               | map(((reader, _), ()) -> ((reader), ()));
