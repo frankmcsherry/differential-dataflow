@@ -1,0 +1,121 @@
+-- What each ledger is needed from, by the computations that read it: the part of system.ddp that says so, alone.
+--
+-- A follower that keeps only the compaction policy (compact.ddp) needs this of the state and none of the rules.
+-- Every statement here is system.ddp's, word for word: where each ledger stands, what each computation reads and
+-- writes, and NEEDS. If system.ddp changes there, this changes with it.
+--
+--   input 0, entries : ((entry), ())
+--
+--   needs : ((source), (computation, target, frontier))   as system.ddp gives it
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let entries = input 0 : ((Entry), ());
+
+-- THE TABLES that are read here, each by its key.
+let table = entries | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let spans = table((Span((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let computations = table((Computation((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let holds = table((Hold((key, val))), ()) | map(((key, val), ()) -> (key, val));
+
+let durable = ledgers((id), (_, _, _, _, Durable)) | distinct;
+let derived = ledgers((id), (_, _, _, _, Derived)) | distinct;
+
+-- FOLLOWED: each clock that is followed, and a ledger that follows it.
+let followed = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), ()) -> ((clock), (id)));
+
+-- OWN: a ledger's version is the number of its appends, and its own upper is the upper
+-- of the span that covers the last of them, or its start if it has none.
+-- MARKS is each number a ledger has come to, with the upper there: 0 with its start, and where each span ends.
+-- A TIP is a mark that no span begins at. The version is the greatest tip, and there are few of them: one, unless
+-- spans were discarded and left others that lead nowhere. So an append changes two rows here, and no more,
+-- however many spans the ledger has.
+-- A ledger's tips are handed over in order, each with its count, and the last is kept.
+let marks = (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, to), (upper))));
+let started = spans | filter(((_, from, to, _), _) -> (from, to) lt) | map(((id, from, _, _), _) -> ((id, from), ())) | distinct;
+let tips = marks - (marks | join(started, (place, upper, ()) -> (place, upper)));
+let own = tips | map(((id, to), (upper)) -> ((id), (to, upper)))
+               | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+
+-- WRITE FRONTIER: the join of a ledger's own upper with the write frontier of the clock
+-- it follows, which is in turn joined with that of the clock above it, and so on.
+wf: {
+    let lifted = followed | join(write, ((clock), (id), (frontier)) -> ((id), (frontier)));
+    set write = (own | map((id, (_, upper)) -> (id, (upper)))) + lifted
+              | reduce((_id, frontiers) ->
+                    let none = [] : List(List(int)) in
+                    let joined = ((0, none), frontiers) fold (((seen, sofar), ((frontier), _count)) ->
+                        (1, (seen, (sofar, frontier) call frontier_join, frontier) select)) in
+                    ((joined.1), 1) enlist);
+}
+
+-- STANDING: each durable ledger's version and write frontier.
+let standing = own((id), (version, _)) * wf::write((id), (frontier)) * durable((id), ())
+             | map(((id, version, frontier), ()) -> ((id), (version, frontier)));
+
+-- READS and WRITES: each ledger a computation is bound to, and the position it is bound at.
+-- Each is made a set, so that a computation defined twice is reported once, as "redefined",
+-- and not again by each rule that counts these rows.
+-- INS is each input of each computation, a ledger or the state, with the computation's program.
+let ins = computations | flatmap(((computation), (program, inputs, _)) ->
+              ((computation, program), ((0, inputs len) range, inputs) zip) cap_list
+              map (((computation, program), (position, input)) -> ((computation, position), (program, input))));
+let reads = ins((computation, position), (_, Read(ledger)))
+          | map(((computation, position, ledger), ()) -> ((ledger), (computation, position)))
+          | distinct;
+-- OUTS is each output of each computation, written or not, with the computation's program.
+let outs = computations | flatmap(((computation), (program, _, outputs)) ->
+               ((computation, program), ((0, outputs len) range, outputs) zip) cap_list
+               map (((computation, program), (position, output)) -> ((computation, position), (program, output))));
+let writes = outs((computation, position), (_, Written(ledger)))
+           | map(((computation, position, ledger), ()) -> ((ledger), (computation, position)))
+           | distinct;
+
+
+-- RELIES: each computation that reads a derived ledger, and the computation that writes it.
+let relies = reads((ledger), (reader, _)) * derived((ledger), ()) * writes((ledger), (writer, _))
+           | map(((ledger, reader, writer), ()) -> ((reader), (writer, ledger)));
+
+-- NEEDS: a computation resumes from where its outputs stand, so each of its inputs must be kept
+-- readable from the write frontier of each durable ledger it writes: (source, (computation, target, frontier)).
+-- A derived ledger stands nowhere. What a reader needs of one, the computation that writes it must
+-- be able to make again, so that computation resumes from where the reader does, and so on back.
+-- A hold on a derived ledger is such a need: the target is then the held ledger, and the frontier the hold's.
+-- A hold on a durable ledger is not passed back: the ledger's own spans serve it (see ASKS, below),
+-- and the computation that writes it, if there is one, resumes from where the ledger stands all the same.
+-- This reads an output's frontier as a time of its inputs. That is right when their times mean the
+-- same thing, and no rule checks that they do: to bind ledgers whose times do not go together is
+-- the mistake of whoever binds them. The state has its own times, and a computation that reads it
+-- beside a ledger gives good results only while that ledger's times are kept up with the state's.
+let stands = writes | join(standing, ((ledger), (computation, _), (_, frontier)) -> ((computation), (ledger, frontier)));
+let pinned = holds((_, ledger), (frontier)) * derived((ledger), ()) * writes((ledger), (writer, _))
+           | map(((ledger, frontier, writer), ()) -> ((writer), (ledger, frontier)));
+resuming: {
+    let passed = relies | join(resumes, ((reader), (writer, _), (target, frontier)) -> ((writer), (target, frontier)));
+    set resumes = stands + pinned + passed | distinct;
+}
+let needs = reads | map(((ledger), (computation, _)) -> ((computation), (ledger)))
+                  | join(resuming::resumes, ((computation), (source), (target, frontier)) ->
+                                            ((source), (computation, target, frontier)))
+                  | distinct;
+output "needs" = needs;

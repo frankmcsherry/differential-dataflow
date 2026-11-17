@@ -84,9 +84,16 @@ output "binds" = reads((ledger), (reader, position)) * derived((ledger), ()) * w
 -- STANDING, as in system.ddp.
 -- OWN: a ledger's version is the number of its appends, and its own upper is the upper of the span that covers
 -- the last of them, or its start if it has none.
-let own = (ledgers | map((id, (_, _, start, _, _)) -> (id, (0, start))))
-        + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id), (to, upper))))
-        | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+-- MARKS is each number a ledger has come to, with the upper there: 0 with its start, and where each span ends.
+-- A TIP is a mark that no span begins at. The version is the greatest tip, and there are few of them: one, unless
+-- spans were discarded and left others that lead nowhere. So an append changes two rows here, and no more,
+-- however many spans the ledger has.
+let marks = (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, to), (upper))));
+let started = spans | filter(((_, from, to, _), _) -> (from, to) lt) | map(((id, from, _, _), _) -> ((id, from), ())) | distinct;
+let tips = marks - (marks | join(started, (place, upper, ()) -> (place, upper)));
+let own = tips | map(((id, to), (upper)) -> ((id), (to, upper)))
+               | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
 -- WRITE FRONTIER: the join of a ledger's own upper with the write frontier of the clock it follows, and so on up.
 let followed = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), ()) -> ((clock), (id)));
 wf: {
@@ -115,35 +122,62 @@ resuming: {
 output "resumes" = resuming::resumes;
 
 -- FETCH: the spans that lead a reader on from the appends it has read to the ledger's last.
+-- All of this is written so that an append to a ledger changes a few rows for each of its readers, and no more,
+-- however many spans the ledger has.
 
 -- HOPS is each span a reader can use, as a step from one number to another: ((reader, from), (to, batch)).
+-- A span whose since is at or before its lower is PLAIN: it holds each update at the time it was written, and a
+-- reader with any need can use it. A span is plain as it is appended. The rest are PACKED, by a merge, and a
+-- reader can use one when its since is at or before the reader's need and the span's lower together.
+-- The two are kept apart because a reader's need moves as it reads: it is asked only of the packed spans.
+let strides = spans | filter(((_, from, to, _), _) -> (from, to) lt);
+let plain = strides | filter(((_, _, _, since), (lower, _, _)) -> (since, lower) call frontier_le);
+let packed = strides | filter(((_, _, _, since), (lower, _, _)) -> ((since, lower) call frontier_le, 0) eq);
+let reading = readers | map(((reader), (id, _, _)) -> ((id), (reader)));
 let seeking = readers | map(((reader), (id, _, need)) -> ((id), (reader, need)));
-let hops = spans((id, from, to, since), (lower, _, batch)) * seeking((id), (reader, need))
-         | filter(((_, from, to, since, lower, _, _, need), ()) ->
-                      ((from, to) lt, (since, (need, lower) call frontier_join) call frontier_le) all)
-         | map(((_, from, to, _, _, batch, reader, _), ()) -> ((reader, from), (to, batch)))
+let hops = (plain((id, from, to, _), (_, _, batch)) * reading((id), (reader))
+            | map(((_, from, to, batch, reader), ()) -> ((reader, from), (to, batch))))
+         + (packed((id, from, to, since), (lower, _, batch)) * seeking((id), (reader, need))
+            | filter(((_, _, _, since, lower, _, _, need), ()) -> (since, (need, lower) call frontier_join) call frontier_le)
+            | map(((_, from, to, _, _, batch, reader, _), ()) -> ((reader, from), (to, batch))))
          | distinct;
--- LEADS is each number from which hops reach the ledger's version: the version itself, and each number a hop
--- goes from to one that leads there.
+
+-- DEAD is each number from which hops do not lead to the ledger's version: it is not the version, and every hop
+-- that leaves it goes to a dead number. So a number that no hop leaves is dead, unless it is the version.
+-- The dead numbers are found, and not the ones that lead on, because an append makes no number dead. The numbers
+-- that lead on are each some steps from the version, and an append would move every one of them a step further.
+-- A reader can only come to a number where a hop begins or ends, where it has read to, or the version: PLACES.
 let ends = readers((reader), (id, _, _)) * own((id), (version, _)) | map(((reader, _, version), ()) -> ((reader, version), ()));
+let begins = readers | map(((reader), (_, read, _)) -> ((reader, read), ()));
+let leaving = hops | map((place, _) -> (place, ()));
+let places = leaving + (hops | map(((reader, _), (to, _)) -> ((reader, to), ()))) + begins + ends | distinct;
+-- HALTS is each place that no hop leaves, other than the version. No hop leaves the version.
+let left = leaving | distinct;
+let halts = places - (places | join(left, (place, (), ()) -> (place, ()))) - ends;
+-- WAYS is how many hops leave each place, and BACK is each hop, by the place it goes to.
+let ways = leaving | count;
 let back = hops | map(((reader, from), (to, _)) -> ((reader, to), (from)));
 leading: {
-    let before = back | join(leads, ((reader, _), (from), ()) -> ((reader, from), ()));
-    set leads = ends + before | distinct;
+    -- LOST is how many of the hops that leave a place go to a dead one. The place is dead when that is all of them.
+    let lost = back | join(dead, ((reader, _), (from), ()) -> ((reader, from), ())) | count;
+    let spent = lost | join(ways, (place, astray, leave) -> (place, (astray, leave)))
+                     | filter((_, (astray, leave)) -> (astray, leave) eq)
+                     | map((place, _) -> (place, ()));
+    set dead = halts + spent | distinct;
 }
--- BEST is, from each number, the hop to take: of those that go to a number that leads there, the one that goes
--- furthest. The hops from a number are handed over in order, and the last is kept.
-let best = hops | map(((reader, from), (to, batch)) -> ((reader, to), (from, batch)))
-                | join(leading::leads, ((reader, to), (from, batch), ()) -> ((reader, from), (to, batch)))
-                | reduce((_place, steps) -> ((steps len, 1) sub enlist, steps) gather map ((step, _count) -> (step, 1)));
--- AT is each number the reader comes to: where it has read to, and where each best hop takes it.
-let begins = readers | map(((reader), (_, read, _)) -> ((reader, read), ()));
+-- BEST is, from each place, the hop to take: of those that go to a place that is not dead, the one that goes
+-- furthest. The hops from a place are handed over in order, and the last is kept.
+let onward = hops | map(((reader, from), (to, batch)) -> ((reader, to), (from, batch)));
+let best = onward - (onward | join(leading::dead, (place, step, ()) -> (place, step)))
+         | map(((reader, to), (from, batch)) -> ((reader, from), (to, batch)))
+         | reduce((_place, steps) -> ((steps len, 1) sub enlist, steps) gather map ((step, _count) -> (step, 1)));
+-- AT is each place the reader comes to: where it has read to, and where each best hop takes it.
 walking: {
     let next = at | join(best, ((reader, _), (), (to, _)) -> ((reader, to), ()));
     set at = begins + next | distinct;
 }
 output "fetch" = walking::at | join(best, ((reader, from), (), (to, batch)) -> ((reader), (from, to, batch)));
 
--- STUCK: a reader whose place does not lead to the ledger's version.
-output "stuck" = begins - (begins | join(leading::leads, (place, (), ()) -> (place, ())))
+-- STUCK: a reader whose place is dead.
+output "stuck" = begins | join(leading::dead, (place, (), ()) -> (place, ()))
                | map(((reader, _), ()) -> ((reader), ()));

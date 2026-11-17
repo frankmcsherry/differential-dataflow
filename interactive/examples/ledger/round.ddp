@@ -28,6 +28,9 @@
 -- Outputs:
 --   waiting ((tx), ())       transactions this round did not judge
 --   refused ((tx), ())       transactions judged and not made
+--   barred  ((tx), ())       those of the refused that a ledger's binding refused; the rest were absent, stale, empty or twice
+--   held    ((tx), (..))     the appends of the transactions that wait, as they came: they are for the next round
+--   heldby  ((tx), (..))     and their runners
 --   spans   ((entry), ())    the round's change to the state: a span for each append that is made
 --   moved   ((id), (..))     the round's change to `own`
 
@@ -123,7 +126,12 @@ let judged = (met | filter((_, (_, _, _, _, _, _, _, following, _, _)) -> (follo
 -- WHO WAITS, in all: those crowded off a ledger, and those behind an append to a clock they read.
 let behind = judged | filter((_, (_, _, _, _, _, _, _, _, _, _, _, late)) -> late)
                     | map((_, (tx, _, _, _, _, _, _, _, _, _, _, _)) -> ((tx), ()));
-let waiting = (crowded + behind) | distinct;
+-- THIS IS A SCRATCH VARIANT. A round's transactions come as frames, which the keeper does not open, so it cannot
+-- keep out one that appends to a ledger twice. Such a one would wait in every round. Here it is refused: TWICE.
+let twice = asked | map((ledger, (tx, _, _, _, _)) -> ((ledger, tx), ())) | count
+                  | filter((_, copies) -> (copies, 1) gt) | map(((_, tx), _) -> ((tx), ())) | distinct;
+let pending = (crowded + behind) | distinct;
+let waiting = pending - (pending | join(twice, (tx, (), ()) -> (tx, ())));
 
 -- An append passes when admit.ddp refuses it nothing:
 --   its ledger is durable                                              (else "absent")
@@ -143,11 +151,15 @@ let acting = runners | map(((tx), (computation)) -> ((tx, computation), ())) | d
 let barred = (claimed - (claimed | join(acting, (key, (), ()) -> (key, ())))) | map(((tx, _), ()) -> ((tx), ()));
 
 -- A transaction is made if it does not wait and none of its appends is refused.
-let unmade = (failed + barred + waiting) | distinct;
+let unmade = (failed + barred + waiting + twice) | distinct;
 let made = passed - (passed | join(unmade, (tx, row, ()) -> (tx, row)));
 output "waiting" = waiting;
-let refusing = (failed + barred) | distinct;
+let refusing = (failed + barred + twice) | distinct;
 output "refused" = refusing - (refusing | join(waiting, (tx, (), ()) -> (tx, ())));
+output "barred" = barred | distinct;
+-- What waits is for the next round. Its appends and its runners are given as they came, to be fed to that round.
+output "held" = appends | join(waiting, (tx, row, ()) -> (tx, row));
+output "heldby" = runners | join(waiting, (tx, row, ()) -> (tx, row));
 -- A new span covers one append, and its since is its own lower: its times are as they were written.
 output "spans" = made | map((_, (ledger, number, lower, upper, batch, _, _, _, _)) ->
                           ((((ledger, number, (number, 1) add, lower), (lower, upper, batch)) inject Span), ()));

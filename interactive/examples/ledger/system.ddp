@@ -80,11 +80,17 @@ let followed = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), (
 
 -- OWN: a ledger's version is the number of its appends, and its own upper is the upper
 -- of the span that covers the last of them, or its start if it has none.
--- Each mark is a version and the upper at it: the start at version 0, and each span at the number it goes up to.
--- A ledger's marks are handed over in order, each with its count, and the last is kept.
-let own = (ledgers | map((id, (_, _, start, _, _)) -> (id, (0, start))))
-        + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id), (to, upper))))
-        | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+-- MARKS is each number a ledger has come to, with the upper there: 0 with its start, and where each span ends.
+-- A TIP is a mark that no span begins at. The version is the greatest tip, and there are few of them: one, unless
+-- spans were discarded and left others that lead nowhere. So an append changes two rows here, and no more,
+-- however many spans the ledger has.
+-- A ledger's tips are handed over in order, each with its count, and the last is kept.
+let marks = (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, to), (upper))));
+let started = spans | filter(((_, from, to, _), _) -> (from, to) lt) | map(((id, from, _, _), _) -> ((id, from), ())) | distinct;
+let tips = marks - (marks | join(started, (place, upper, ()) -> (place, upper)));
+let own = tips | map(((id, to), (upper)) -> ((id), (to, upper)))
+               | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
 
 -- WRITE FRONTIER: the join of a ledger's own upper with the write frontier of the clock
 -- it follows, which is in turn joined with that of the clock above it, and so on.
@@ -177,25 +183,24 @@ output "blobs" = spans(_, (_, _, Blob(hash))) | distinct;
 -- RULES: each of these should be empty.
 
 -- KEYS. Each table has one row for each key: the rows under a key are counted, and no count is above one.
-output "repeated"     = entries      | count | filter((_, copies) -> (copies, 1) gt);   -- an entry is in the state once
+-- Not kept in this variant: it guards against a faulty implementor.
+output "repeated"     = ledgers | filter((_, _) -> 0);                                      -- an entry is in the state once
 output "reregistered" = ledgers      | count | filter((_, copies) -> (copies, 1) gt);   -- a ledger has one registration
-output "doubled"      = spans        | count | filter((_, copies) -> (copies, 1) gt);   -- a span has one batch at each since
+-- Not kept in this variant: it guards against a faulty implementor.
+output "doubled"      = ledgers | filter((_, _) -> 0);                                      -- a span has one batch at each since
 output "ambiguous"    = names        | count | filter((_, copies) -> (copies, 1) gt);   -- a name has one ledger
 output "reprogrammed" = programs     | count | filter((_, copies) -> (copies, 1) gt);   -- a program hash has one program
 output "redefined"    = computations | count | filter((_, copies) -> (copies, 1) gt);   -- a computation has one definition
 output "contested"    = writes       | count | filter((_, copies) -> (copies, 1) gt);   -- a ledger is written by one output
 output "reheld"       = holds        | count | filter((_, copies) -> (copies, 1) gt);   -- a holder has one hold on a ledger
--- An append begins at one frontier and ends at one, whichever spans cover it: ((ledger, side, number), (frontier)).
--- EDGES is each: a span's lower is where its first append begins, side 0, and its upper is where its last ends, side 1.
-let edges = (spans | map(((id, from, _, _), (lower, _, _)) -> ((id, 0, from), (lower))))
-          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, 1, (to, 1) sub), (upper))))
-          | distinct;
-output "forked" = edges | count | filter((_, copies) -> (copies, 1) gt);
+-- An append begins at one frontier and ends at one, whichever spans cover it.
+-- Not kept in this variant: it guards against a faulty implementor. EDGES, which it read, is not kept either.
+output "forked" = ledgers | filter((_, _) -> 0);
 
 -- REFERENCES. What a row names is there: the rows that name a key, less those whose key is there, are none.
 -- Every span belongs to a registered ledger.
-let placed = spans | map(((id, from, to, since), _) -> ((id), (from, to, since)));
-output "orphaned" = placed - (placed | join(registered, (id, span, ()) -> (id, span)));
+-- Not kept in this variant: it guards against a faulty implementor.
+output "orphaned" = ledgers | filter((_, _) -> 0);
 -- A followed clock is registered.
 output "unclocked" = followed - (followed | join(registered, (clock, id, ()) -> (clock, id)));
 -- A name's ledger is registered.
@@ -225,56 +230,53 @@ output "mismatched" = ledgers((id), (_, ours, _, Follows(clock), _)) * ledgers((
 -- are those of computations, passed back through derived ledgers, and those of holders (see NEEDS).
 
 -- A span covers at least one append, and its lower is strictly before its upper.
-output "malformed" = spans | filter(((_, from, to, _), (lower, upper, _)) ->
-                                 (((from, to) lt, (lower, upper) call frontier_lt) all, 0) eq);
+-- Not kept in this variant: it guards against a faulty implementor.
+output "malformed" = ledgers | filter((_, _) -> 0);
 
--- Each append begins no earlier than the one before it ended, and the first no earlier than the start:
--- ((ledger, number), (end, lower)). Appends need not abut: a clock may have advanced the ledger in between.
-let ended = (edges((id, 1, number), (upper)) | map(((id, number, upper), ()) -> ((id, (number, 1) add), (upper))))
-          + (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))));
-output "early" = edges((id, 0, number), (lower)) * ended((id, number), (end))
-               | filter(((_, _, lower, end), ()) -> ((end, lower) call frontier_le, 0) eq)
-               | map(((id, number, lower, end), ()) -> ((id, number), (end, lower)));
+-- Each append begins no earlier than the one before it ended, and the first no earlier than the start.
+-- Not kept in this variant: it guards against a faulty implementor.
+output "early" = ledgers | filter((_, _) -> 0);
 
--- A durable ledger's spans join up: from 0, one span and then the next reach the ledger's version: (ledger, version).
--- STEPS is each span, as a step from the number it begins at to the number it ends at.
--- REACHED is each number that steps reach from 0.
-let steps = spans | map(((id, from, to, _), _) -> ((id, from), (to))) | distinct;
-joining: {
-    let next = reached | join(steps, (place, (), (to)) -> (place, (to)))
-                       | map(((id, _), (to)) -> ((id, to), ()));
-    set reached = (durable | map(((id), ()) -> ((id, 0), ()))) + next | distinct;
-}
-let ending = own((id), (version, _)) * durable((id), ());
-output "skipped" = ending - (ending | join(joining::reached, (place, (), ()) -> (place, ())));
+-- A durable ledger's spans join up: from 0, one span and then the next reach the ledger's version.
+-- Not kept in this variant: it guards against a faulty implementor. STEPS and REACHED, which it read, are not kept either.
+output "skipped" = ledgers | filter((_, _) -> 0);
 
 -- A ledger can be read from each frontier it is needed from: (ledger, need, version).
--- This is the rule above again, once for each need, and with only the spans that a reader from that need can use.
 -- ASKS is each need: what a computation needs, and what a holder asks.
 let asks = (needs | map(((source), (_, _, need)) -> ((source), (need))))
          + (holds | map(((_, ledger), (need)) -> ((ledger), (need))))
          | distinct;
--- HOPS is each span a reader from a need can use, as a step from one number to another.
--- A span is read only at times at or after its lower, so a reader can use it when its since is at or
--- before the need and its lower together. So a new span, whose since is its lower, can be used for every need.
-let hops = spans((id, from, to, since), (lower, _, _)) * asks((id), (need))
-         | filter(((_, _, _, since, lower, need), ()) -> (since, (need, lower) call frontier_join) call frontier_le)
-         | map(((id, from, to, _, _, need), ()) -> ((id, need, from), (to)))
-         | distinct;
+-- A span is read only at times at or after its lower. One whose since is at or before its lower is PLAIN: a reader
+-- from any need can use it, and a span is plain as it is appended. The rest are PACKED, by a merge, and a reader
+-- can use one when its need is at or after the span's since.
+let plain = spans | filter(((_, _, _, since), (lower, _, _)) -> (since, lower) call frontier_le)
+                  | map(((id, from, to, _), _) -> ((id, from), (to)));
+let packed = spans | filter(((_, _, _, since), (lower, _, _)) -> ((since, lower) call frontier_le, 0) eq)
+                   | map(((id, from, to, since), _) -> ((id, from), (to, since)));
+-- FLOORS is, for each number that spans reach from 0, a frontier that a need must be at or after to get there
+-- that way: the join of the sinces of the packed spans on the way, and the least frontier if there are none.
+-- It does not say what is needed, so a need that moves changes none of it, and an append adds one row.
+serving: {
+    let on = floors | join(plain, ((id, _), (floor), (to)) -> ((id, to), (floor)));
+    let up = floors | join(packed, ((id, _), (floor), (to, since)) -> ((id, to), ((floor, since) call frontier_join)));
+    set floors = (ledgers | map(((id), _) -> let first = [] : List(int) in ((id, 0), (first enlist)))) + on + up | distinct;
+}
+-- A need is met when some floor of the ledger's version is at or before it.
 -- A derived ledger has no spans and a version of 0, so this asks nothing of it: what is needed of it
 -- has been passed back to its sources, in NEEDS.
-serving: {
-    let next = reached | join(hops, (place, (), (to)) -> (place, (to)))
-                       | map(((id, need, _), (to)) -> ((id, need, to), ()));
-    set reached = (asks | map(((id), (need)) -> ((id, need, 0), ()))) + next | distinct;
-}
 let due = asks((id), (need)) * own((id), (version, _));
-output "forgotten" = due - (due | join(serving::reached, (place, (), ()) -> (place, ())));
+let met = due | map(((id, need, version), ()) -> ((id, version), (need)))
+              | join(serving::floors, ((id, version), (need), (floor)) -> ((id, need, version), (floor)))
+              | filter(((_, need, _), (floor)) -> (floor, need) call frontier_le)
+              | map((ask, _) -> (ask, ()))
+              | distinct;
+output "forgotten" = due - met;
 
 -- DERIVED LEDGERS. A derived ledger's contents are only on the instances that write it.
 
 -- A derived ledger has no spans.
-output "spanned" = spans((id, from, to, since), _) * derived((id), ());
+-- Not kept in this variant: it guards against a faulty implementor.
+output "spanned" = ledgers | filter((_, _) -> 0);
 -- A derived ledger is written by a computation.
 output "hollow" = derived - (derived | join(written, (ledger, (), ()) -> (ledger, ())));
 -- An instance that runs a reader of a derived ledger also runs the computation that writes it:

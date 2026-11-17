@@ -1,14 +1,15 @@
 # Backlog
 
-Two lists.
+Three lists.
 The first is what the DDIR server lacks that a good design here needs, and what the spike does in its place.
 The second is what is not yet done in the spike itself.
+The third is debt: what the spike does in a way we mean to change, and can change later without touching what is decided.
 
 ## What blocks a good design
 
 ### An input should take a span
 
-This is built, on the branch `ddir-feed-spans`, and the spike runs on it.
+This is built, on this branch, and the spike runs on it.
 
 A ledger's span is some updates, each with its time, and an upper.
 An input now takes exactly that: `feed <prog> <in> frame <nbytes>` takes a frame with times, as a binary tail gives it, and `advance <prog> <in> <time>` moves that input alone.
@@ -22,16 +23,17 @@ What is left of it:
 - A frame holds one time lane, so times of more than one coordinate need a wider frame.
 - A reader that begins from a time moves earlier times up to it, by writing over the frame's last words. A feed could do that itself: "feed this, as of the time the input stands at".
 
-### A trace's history, with its times, added up
+### A feed that moves times up to a frontier
 
-A compactor wants the updates of some spans, with their times moved up to a since, and equal ones added together.
-That is what a trace holds once it has compacted to that since and merged its batches.
-A `peek` gives a trace's contents added up, and without times.
-A `tail` gives its history with times, and does not promise that equal updates were added together.
+A reader that begins from a time, and a compactor that merges to a since, both want a span's updates with their earlier times moved up.
+Today Python does this, by writing over the frame's last words (`plumbing.raised`).
+A feed that takes a frontier and moves the times itself would take this out of Python.
 
-So the compactor merges by putting the frames of the parts one after another, with their times moved up.
-The spans get fewer, and the batches do not get smaller: an update and its retraction are both kept.
-A read of a trace's history as it is stored, at its times, would let the server do the merge.
+This replaces an earlier item, which asked for a read of a trace's history added up.
+That read is not needed.
+A program loaded for the one merge, fed the parts with their times moved up and then advanced past every time, sends the merged span on a tail, with equal updates added together.
+This was tried with what the server has, on one worker and on two.
+What it lacks is a way to say "this input is closed": the trial advanced to a very large time.
 
 ### A tail at a key
 
@@ -73,7 +75,31 @@ The spike uses binary tails, so this matters only to someone who reads a tail as
 - **The keeper keeps every rule up to date after each round.** A round reads no rule, so the rules can come off its path.
 - **Whether the keeper retries a transaction that waited** is not decided. Today it does.
 - **Where an instance runs** is the first number of its id, and who starts the launchers is outside the state.
-- **A keeper that starts reads the whole log.** There is no snapshot of the state.
 - **The actor of a transaction is claimed, not proven.**
 - **A clock that follows a clock** is not tested in a round.
 - **Text is still read** by the keeper, of the keys a round leaves waiting or refused and of whether a rule is empty, and by the collector, of the blobs that spans name. Each is a few small rows.
+- **Two copies of the rules.** `system.ddp` and `step.ddp` are the keeper's: the same views and the same rule names as the model, with each rule that only a faulty party could break left empty. `system-full.ddp` and `step-full.ddp` are the model in full, kept by a follower that audits, and by `tests/ledger_system.rs`. One program for each role's rules would replace the copies.
+- **A round refuses a transaction that appends to one ledger twice.** A round takes appends as frames it does not open, so it cannot order two appends to one ledger within a transaction. The rules alone would make such a transaction. `round.ddp` marks this as a scratch variant.
+
+## What a scale probe found
+
+Measured on one machine, with 1,000 source ledgers, 1,000 computations on 8 instances, and 1,000 output ledgers, and every source appended to each tick.
+The whole system did 1.4 ticks a second, and slowed as spans piled up. With the rules off the path of a round, and the instance's walk changed, it does 2.7, and 10.7 with 200 computations on 4 instances.
+The probes and their output are in `ledger-fabric-sweeps-2026-11-10/scale`.
+
+- **Three programs walked a ledger's spans from a place that moves every tick.** `forgotten` in `system.ddp` walks them once for each need, `compact.ddp` does the same for its policy, and `leads` in `instance.ddp` walked back from a ledger's last append. Each walk is redone whole when the need, or the last append, moves, so each costs as many rows as the ledger has spans, every tick. `instance.ddp` is changed: it finds the numbers that are dead ends, which an append does not change, and it asks a reader's need only of spans that a merge made. On random ledgers, readers and changes it says what the old one said (`check_instance.py`, with the probes). `compact.ddp` is changed the same way, and checked the same way (`check_compact.py`): with 200 ledgers of 120 spans each it costs 13 ms a tick, where it cost 88. What still grows in it is `heavy`, `first` and `version`, which read every span of the chain when the version moves; the chain is short when merges keep up. `forgotten` is changed too: it carries a floor forward from 0, the join of the sinces of the merged spans on the way, and a need is met when some floor at the version is at or before it. On random ledgers and holds of one-coordinate times it says what the old rule said (`check_forgotten.py`). For times of several coordinates it is stricter: it takes a merged span to need `since <= need`, where the old rule asked `since <= join(need, lower)`. It would be exact with a frontier verb DDIR lacks: the least frontier `x` with `since <= join(x, lower)`.
+- **A ledger's version is found by a reduce over all its spans,** in `system.ddp`, `index.ddp`, `instance.ddp` and `compact.ddp`. Each append reads them all again. It is small beside the walks, and it grows the same way.
+- **Every rule was kept up to date on the path of every round, in three places.** This is changed. The keeper and each follower now keep a second copy of the entries for the rules, and bring it up to date only when a rule or a view is read, or after 64 frames. At 1,000 computations the keeper's work a tick went from about 405 ms to about 150 ms, and a follower's from 317 ms to 79 ms. A keeper that keeps no rule at all does a tick in 55 ms. What is left: the catching up is slow and comes all at once, and a tick that meets it takes over a second.
+- **The parts are in a line.** A tick goes keeper, follower, instances, keeper, follower, and each of the first two does one thing at a time. With 10 cores, fewer than 3 are busy.
+
+## Debt
+
+Each of these works, and is not how we mean it to be.
+None of them is in the programs, and none is in anything stored: no program reads the server's epoch, and a log record is numbered by its place in the log and holds frames with no times.
+So each can be changed later by editing the places named, with no change to the model or to what is on disk.
+
+- **The server has two kinds of program.** One is moved by `tick` and one, loaded `piloted`, by its client. We mean to have one kind, moved by its client, with `tick` as something a client does for a demo. To get there, what `tick` also does needs a home: delivering `bind`, moving the built-in clock and the churning sources, and entering diagnostics. The spike says `piloted` in one place (`runner.py`, where a computation is loaded).
+- **`advance` waited for outputs.** This is changed: `advance` moves one input and nothing more, and `spin` waits until outputs reach the least of their inputs. A step of 1,000 small computations in one server took 2.1 s with the wait in each `advance`, and takes 85 ms with one `spin`. Still wanted: a command that says where a trace stands and which input holds it back.
+- **The state is moved by `tick`.** The keeper, each follower and each instance feed the state, and the programs they load beside it, and tick: 20 places in `keeper.py`, `follower.py` and `runner.py`. We mean to feed each log record at its number in the log, and advance to the next number. With that, a computation that reads the state is moved like any other, and the rule that it writes no durable ledger can go.
+- **Python writes a frame's times.** `plumbing.raised` (three callers) moves times up, and `plumbing.untimed` (two callers) cuts them off. Neither opens a column. Both know how a frame is laid out, which is more than a pipe should know. The feed above removes the first, and feeding the state at record numbers removes the second. Until then: no new place where Python reads or writes inside a frame of someone's data.
+- **The compactor puts frames one after another.** The spans get fewer and the batches do not get smaller. The one-off program above is the fix, and it is not yet what `steward.py` does.

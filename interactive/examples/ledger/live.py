@@ -24,6 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 URL, HTTP = "http://127.0.0.1:7970", 7970
 FOLLOW = 7990
 FOLLOWER = f"127.0.0.1:{FOLLOW}"
+AUDIT = 7996
+AUDITOR = f"127.0.0.1:{AUDIT}"
+# The rules a follower that audits keeps: the model's, in full. This tree's keeper keeps fewer, and holds no spans.
+FULL = os.environ.get("FOLLOWER_RULES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "system-full.ddp"))
 USER = "inject(0,tuple())"
 ROW = "((int), (int))"
 
@@ -97,7 +101,7 @@ def spawn(*args, **env):
 def up(url):
     """Wait for a keeper to answer."""
     for _ in range(600):
-        try: return Client(url).peek("before::standing")
+        try: return Client(url).peek("views::standing")
         except (urllib.error.URLError, ConnectionError): time.sleep(0.05)
     raise RuntimeError("the keeper never came up")
 
@@ -149,17 +153,20 @@ def history(spans, blobs, cache, start=0, need=None):
     if found is None: return None
     updates = []
     for _, (_, _, batch) in found:
-        if batch[1] == 2:
-            name = plumbing.hash_name(batch[2])
+        if batch[1] in (1, 2):
+            # A batch is kept inline, or names parts of blobs (or a blob, or a part of one): what is kept is the updates
+            # of the batch, under its whole name.
+            name = (batch[1], tuple(batch[2]))
             if name not in cache:
-                cache[name] = [(key, val, at, diff) for frame in plumbing.unpack(blobs.get(name))[1] for key, val, diff, at in plumbing.decode(frame)]
+                cache[name] = [(key, val, at, diff) for frame in plumbing.frames_of_batch(blobs, batch)
+                               for key, val, diff, at in plumbing.decode(frame)]
             updates += cache[name]
     return updates, end
 
 
 def batch(blobs, updates, rows=ROW):
     """Write a batch, as a user who has rows does: one frame of updates, [(key, val, diff, time)]. Returns the blob's name."""
-    return blobs.put(plumbing.pack({}, [plumbing.encode(rows, updates)]))
+    return blobs.put(plumbing.fresh([plumbing.encode(rows, updates)]))
 
 
 def merged(keeper, blobs, ledger, since):
@@ -205,8 +212,12 @@ def main():
         processes["follower"] = spawn(follower_py, "serve", register, URL, str(FOLLOW))
         ready(FOLLOWER)
         processes["launcher"] = spawn(runner_py, "launch", URL, FOLLOWER)
-        keeper, copy, blobs = Client(URL), plumbing.Follower(FOLLOWER), Blobs()
-        def caught_up(): return sorted(copy.peek("state::entries")[0]) == sorted(keeper.peek("committed::entries"))
+        # The keeper holds no spans: what is asked of them here is asked of the follower, once it has all the keeper made.
+        keeper, copy, blobs = Client(URL, FOLLOWER), plumbing.Follower(FOLLOWER), Blobs()
+        def caught_up():
+            """Whether the follower has every record the keeper made, and the same configuration. The spans are its alone."""
+            at, (theirs,) = copy.peek_at("state::entries")
+            return at == keeper.length() and sorted(line for line in theirs if not line.startswith("tuple(inject(1,")) == sorted(keeper.peek("state::entries"))
 
         # The user sets the system up: three ledgers, two programs, two computations, two instances.
         setup = [create(1), create(2), create(3), publish(COUNT), publish(OFTEN),
@@ -226,7 +237,7 @@ def main():
               f"ledger 3 stood at 20 after {took:.2f} s, with {len(expected())} words")
 
         # The instances read from the follower, and each is told only what it needs.
-        check("the follower holds the state the keeper has, from what the keeper sent it", settle(caught_up))
+        check("the follower has every record the keeper made, and holds the configuration the keeper has", settle(caught_up))
         def told(instance):
             rows = copy.peek(f"bundle::bundle tuple(tuple(0,{instance}))")[0]
             return plumbing.by_kind([line.partition(" val=")[2] for line in rows])
@@ -234,7 +245,7 @@ def main():
         count = lambda entries: sum(map(len, entries.values()))
         check("each instance is told of the ledgers its computation reads and writes, and of no others",
               about(told(500)) == [1, 2] and about(told(501)) == [2, 3],
-              f"{count(told(500))} and {count(told(501))} of the state's {len(keeper.peek('committed::entries'))} entries")
+              f"{count(told(500))} and {count(told(501))} of the state's {len(copy.peek('state::entries')[0])} entries")
         def sees(instance):
             """Where an instance's own views say its ledgers stand."""
             session = plumbing.Server(runner.port((0, instance)), start=False)
@@ -320,12 +331,21 @@ def main():
 
         # Compaction. Ledger 2 is read by computation 101, whose ledger stands at 40.
         whole = batch(blobs, [(key, val, count, 40) for (key, val), count in contents(keeper, blobs, 2).items()])
+        # A merge is asked for as a pass of one: the keeper holds no spans, and is handed the entries that leave (see `Client.merge`).
         version = keeper.standing()[2][0]
-        parts = [(key[1], key[2], plumbing.instant(key[3])) for key, _ in keeper.entries()[SPAN] if number(key[0]) == 2]
-        early = [merge(2, 0, version, 41, whole)] + [discard(2, first, last, since) for first, last, since in parts]
-        check("ledger 2 cannot be compacted past where its reader stands", keeper.transact(USER, early) == ["forgotten"])
-        compact = [merge(2, 0, version, 40, whole)] + [discard(2, first, last, since) for first, last, since in parts]
-        check(f"ledger 2 is compacted: {len(parts)} spans into one", keeper.transact(USER, compact) == [])
+        parts = [key for key, _ in keeper.entries()[SPAN] if number(key[0]) == 2]
+        # THIS COPY (tree_hold): a merge may take spans out only if it is held from at or before the ledger's own hold,
+        # and the own hold moves only as far as the ledger's readers allow.
+        own = lambda ledger, at: [f"inject(13,tuple({ident(0)},{ident(ledger)}))"] * bool(own_of(ledger)) + [hold(0, ledger, at)]
+        own_of = lambda ledger: [row for row in copy.peek("own::holds")[0] if row.startswith(f"tuple({ident(ledger)})")]
+        check("ledger 2's own hold cannot move past where its reader stands", keeper.transact(USER, own(2, 41)) == ["forgotten"])
+        check("and moves to there", keeper.transact(USER, own(2, 40)) == [] and settle(lambda: own_of(2) != []))
+        check("ledger 2 cannot be compacted past its own hold", keeper.merge((0, 2), 0, version, 41, whole) == ["beyond"])
+        check(f"ledger 2 is compacted: {len(parts)} spans into one", keeper.merge((0, 2), 0, version, 40, whole) == []
+              and len([key for key, _ in keeper.entries()[SPAN] if number(key[0]) == 2]) == 1)
+        check("a holder who would read it from before that is refused, and one from there is not",
+              keeper.transact(USER, [hold(901, 2, 39)]) == ["forgotten"] and keeper.transact(USER, [hold(901, 2, 40)]) == []
+              and keeper.transact(USER, [f"inject(13,tuple({ident(901)},{ident(2)}))"]) == [])
         for at in range(40, 50): assert write(at) == []
         took = wait(keeper, 3, 50)
         check("its reader carries on over the compacted ledger", agree(contents(keeper, blobs, 3), expected()), f"caught up after {took:.2f} s")
@@ -339,9 +359,8 @@ def main():
         for at in range(50, 55): assert write(at) == []
         wait(keeper, 2, 55)
         version = keeper.standing()[2][0]
-        parts = [(key[1], key[2], plumbing.instant(key[3])) for key, _ in keeper.entries()[SPAN] if number(key[0]) == 2]
-        whole = [merge(2, 0, version, 50, merged(keeper, blobs, 2, 50))] + [discard(2, first, last, since) for first, last, since in parts]
-        check("ledger 2 is merged whole while its reader is held still", keeper.transact(USER, whole) == [])
+        check("ledger 2 is merged whole while its reader is held still, once its own hold has moved to 50",
+              keeper.transact(USER, own(2, 50)) == [] and keeper.merge((0, 2), 0, version, 50, merged(keeper, blobs, 2, 50)) == [])
         subprocess.run(["pkill", "-CONT", "-f", "runner.py run 0.502 "])
         took = wait(keeper, 3, 55)
         check("the reader goes on over a merge of what it had read with what it had not, and is not started again",
@@ -360,7 +379,11 @@ def main():
         processes.pop("second").terminate()
 
         # Everything is stopped, and started again from the register and the blobs alone.
-        before = sorted(keeper.peek("committed::entries"))
+        # The instances stop first, so that nothing is appended between what the follower is seen to hold and the stop.
+        processes["launcher"].terminate(); processes["launcher"].wait()
+        subprocess.run(["pkill", "-f", "runner.py run "])
+        assert settle(caught_up)
+        before, held = sorted(copy.peek("state::entries")[0]), (sorted(keeper.peek("state::entries")), sorted(keeper.peek("rows::own")))
         for process in processes.values(): process.terminate()
         for process in processes.values(): process.wait()
         subprocess.run(["pkill", "-f", "runner.py run "])
@@ -372,8 +395,9 @@ def main():
         begin = time.perf_counter()
         processes["keeper"] = spawn(keeper_py, "serve", register, str(HTTP))
         up(URL)
-        check("a new keeper has the same state, from the register and the blobs", sorted(keeper.peek("committed::entries")) == before,
-              f"{len(before)} entries, in {time.perf_counter() - begin:.1f} s")
+        check("a new keeper has the same configuration and the same row for each ledger, from the register and the blobs",
+              (sorted(keeper.peek("state::entries")), sorted(keeper.peek("rows::own"))) == held,
+              f"{len(held[0])} entries and {len(held[1])} rows, in {time.perf_counter() - begin:.1f} s")
         processes["launcher"] = spawn(runner_py, "launch", URL, FOLLOWER)
         # Ledger 2 is waited for after each append, so that it has a span for each: the compactor, below, wants several.
         for at in range(56, 65):
@@ -398,7 +422,13 @@ def main():
         check("a holder asks for ledger 1 from time 10", keeper.transact(USER, [hold(900, 1, 10)]) == [])
         steward_py = os.path.join(HERE, "steward.py")
         processes["compactor"] = spawn(steward_py, "compact", URL, FOLLOWER)
-        processes["collector"] = spawn(steward_py, "collect", URL)
+        # THIS COPY: a steward moves each ledger's own hold to what its readers need, rounded down, now and then.
+        processes["holder"] = spawn(steward_py, "hold", URL, FOLLOWER, "views::needs", HOLD_STEP="5", HOLD_EVERY="0.5")
+        # The collector reads a follower that keeps the rules in full, and deletes only what is unnamed in a state they pass.
+        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", FOLLOWER_RULES=FULL)
+        auditor = plumbing.Follower(AUDITOR)
+        ready(AUDITOR)
+        processes["collector"] = spawn(steward_py, "collect", URL, AUDITOR, COLLECT_LINGER="2")   # this test's writers name what they write at once
         # What to merge is the follower's view to say (compact.ddp), and the compactor does as it says.
         # Each span below is (since, lower): a span is compacted if its since is after its lower.
         def spans_of(ledger): return [(instant(key[3]), instant(val[0])) for key, val in keeper.entries()[SPAN] if number(key[0]) == ledger]
@@ -406,11 +436,21 @@ def main():
         check("the compactor merges the 65 appends of ledger 1 into a few spans, and compacts none of them past 10",
               settle(lambda: tidied() and len(spans_of(1)) <= 6 and all(since <= max(10, lower) for since, lower in spans_of(1))),
               f"{len(spans_of(1))} spans")
+        # How each merged span of ledger 1 is kept: inline, or in parts of blobs. With COMPACT_PART small, a merged batch is
+        # several parts, and the reader of ledger 1 reads them back: what it holds is checked below.
+        kept = [batch for key, (_, _, batch) in keeper.entries()[SPAN] if number(key[0]) == 1 and batch[1] != 0]
+        most = max([len(plumbing.pieces_of(batch[2])) for batch in kept if batch[1] == 2], default=0)
+        if os.environ.get("COMPACT_PART"):
+            check("a merged batch of ledger 1 longer than a part is written as several parts", most > 1,
+                  f"the most parts a batch of it has: {most}; {sum(1 for batch in kept if batch[1] == 1)} of its batches inline")
         check("ledger 2 is merged too, and so is ledger 3, which nothing needs: it keeps its times as they were written",
               settle(lambda: tidied() and len(spans_of(2)) <= 6 and len(spans_of(3)) <= 6) and all(since <= lower for since, lower in spans_of(3)),
               f"{len(spans_of(2))} and {len(spans_of(3))} spans")
         # The hold is released, and more is appended. The compactor then follows the reader, past 10.
         check("the hold is released", keeper.transact(USER, [f"inject(13,tuple({ident(900)},{ident(1)}))"]) == [])
+        # THIS COPY: the steward then moves ledger 1's own hold to where its reader stands, rounded down; merges follow it.
+        own_at = lambda ledger: [plumbing.parse(row.split(" val=")[1])[0][0][0] for row in copy.peek("own::holds")[0] if row.startswith(f"tuple({ident(ledger)})")]
+        check("ledger 1's own hold then moves past 10", settle(lambda: own_at(1) and own_at(1)[0] > 10), f"to {own_at(1)}")
         for at in range(65, 75): assert write(at) == []
         took = wait(keeper, 3, 75)
         check("what is then merged of ledger 1 is held from where its reader stands",
@@ -422,14 +462,15 @@ def main():
               agree(contents(keeper, blobs, 31), expected()), f"caught up after {took:.2f} s")
         import steward
         check("the collector leaves only the blobs that spans name",
-              settle(lambda: steward.listing() == {plumbing.hash_name(key[0]) for key, _ in map(plumbing.row, keeper.peek("before::blobs"))}),
+              settle(lambda: steward.listing() == {name for key, _ in map(plumbing.row, auditor.peek("views::blobs")[0]) for name in plumbing.blobs_named(key[0])}),
               f"{len(steward.listing())} blobs in the store")
         check("the derived ledger has followed the state through all of this", follows())
         import keeper as model
         check("the follower has all of the state", settle(caught_up))
-        check("the state keeps every rule, as the follower reads them",
-              not any(copy.peek(*[f"views::{rule}" for rule in model.STATE_RULES])), f"{len(model.STATE_RULES)} rules")
-        print(f"blobs in use: {len(keeper.peek('before::blobs'))}; transactions in the log: "
+        check("the state keeps every rule of the model in full, as a follower that audits reads them",
+              settle(lambda: auditor.where()["at"] == keeper.length()) and not any(auditor.peek(*[f"views::{rule}" for rule in model.STATE_RULES])),
+              f"{len(model.STATE_RULES)} rules")
+        print(f"blobs in use: {len(auditor.peek('views::blobs')[0])}; transactions in the log: "
               f"{plumbing.Register(register).read()[0]['count']}", flush=True)
     finally:
         for process in processes.values(): process.terminate()

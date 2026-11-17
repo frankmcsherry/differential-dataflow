@@ -12,7 +12,7 @@ import json, os, subprocess, sys, time
 import plumbing, runner
 import keeper as model
 from plumbing import Client, Blobs, SPAN, number
-from live import (URL, HTTP, FOLLOW, FOLLOWER, USER, COUNT, OFTEN, BOTH, TALLY, ROW, spans_program, create, create_derived, append,
+from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, FULL, USER, COUNT, OFTEN, BOTH, TALLY, ROW, spans_program, create, create_derived, append,
                   publish, define, start, stop, spawn, up, ready, settle, contents, wait, batch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,15 +26,16 @@ def main():
         processes["follower"] = spawn(os.path.join(HERE, "follower.py"), "serve", register, URL, str(FOLLOW))
         ready(FOLLOWER)
         processes["launcher"] = spawn(os.path.join(HERE, "runner.py"), "launch", URL, FOLLOWER)
-        keeper, copy, blobs = Client(URL), plumbing.Follower(FOLLOWER), Blobs()
+        # The keeper holds no spans: what is asked of them here is asked of the follower, once it has all the keeper made.
+        keeper, copy, blobs = Client(URL, FOLLOWER), plumbing.Follower(FOLLOWER), Blobs()
 
         def instances():
             found = subprocess.run(["pgrep", "-fl", "runner.py run "], capture_output=True, text=True).stdout.split("\n")
             return sorted(line.split("runner.py run ")[1].split()[0] for line in found if "runner.py run " in line)
 
         def report(label, refused=None, took=None):
-            entries = keeper.peek("committed::entries")
-            idle = sorted(number(plumbing.row(line)[0][0]) for line in keeper.peek("before::idle"))
+            entries = keeper.caught("state::entries")[0]
+            idle = sorted(number(plumbing.row(line)[0][0]) for line in keeper.peek("views::idle"))
             stands = ", ".join(f"{ledger} at {at}" for ledger, (_, at) in sorted(keeper.standing().items()))
             print(f"\n{label}" + (f"  [{1000 * took:.0f} ms to transact]" if took is not None else ""))
             if refused: print(f"  REFUSED: {refused}")
@@ -129,9 +130,14 @@ def main():
         for row, count in contents(keeper, blobs, 3).items(): both[row] = both.get(row, 0) + count
         assert contents(keeper, blobs, 4) == both
 
-        broken = [rule for rule, rows in zip(model.STATE_RULES, copy.peek(*[f"views::{rule}" for rule in model.STATE_RULES])) if rows]
-        print(f"\nRules that are broken, of {len(model.STATE_RULES)}, as the follower reads them: {broken or 'none'}")
-        print(f"Blobs that spans name: {len(keeper.peek('before::blobs'))}", flush=True)
+        # The rules are read of a follower that keeps the model's in full: this tree's keeper, and its other followers, keep fewer.
+        processes["auditor"] = spawn(os.path.join(HERE, "follower.py"), "serve", register, URL, str(AUDIT), "audit", FOLLOWER_RULES=FULL)
+        ready(AUDITOR)
+        auditor = plumbing.Follower(AUDITOR)
+        assert settle(lambda: auditor.where()["at"] == keeper.length())
+        broken = [rule for rule, rows in zip(model.STATE_RULES, auditor.peek(*[f"views::{rule}" for rule in model.STATE_RULES])) if rows]
+        print(f"\nRules that are broken, of {len(model.STATE_RULES)} in full, as a follower that audits reads them: {broken or 'none'}")
+        print(f"Blobs that spans name: {len(auditor.peek('views::blobs')[0])}", flush=True)
     finally:
         for process in processes.values(): process.terminate()
         subprocess.run(["pkill", "-f", "runner.py run "])

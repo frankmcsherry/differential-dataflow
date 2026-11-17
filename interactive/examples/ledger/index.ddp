@@ -10,6 +10,11 @@
 -- A ledger's version is the number of its appends, and its own upper is the upper of the span that covers the last
 -- of them, or its start if it has none (as in system.ddp). `following` says whether it follows a clock, and
 -- `clock` is that clock, or (0, 0). `durable` says whether its contents are its spans.
+--
+--   standing : ((id), (version, frontier))
+-- Each durable ledger's version and write frontier, as system.ddp derives them. A keeper judges a transaction by
+-- the rules of the state it would make, and so its one copy of system.ddp is of that state while it judges.
+-- This is where the ledgers stand in the state as it is, before the transaction: admit.ddp and step.ddp read it.
 
 type Id = (int, int);
 type Bytes = List(int);
@@ -37,12 +42,35 @@ let table = entries | distinct;
 let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
 let spans = table((Span((key, val))), ()) | map(((key, val), ()) -> (key, val));
 
--- Each mark is a version and the upper at it. A ledger's marks are handed over in order, and the last is kept.
-let marks = (ledgers | map((id, (_, _, start, _, _)) -> (id, (0, start))))
-          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id), (to, upper))))
-          | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+-- MARKS is each number a ledger has come to, with the upper there: 0 with its start, and where each span ends.
+-- A TIP is a mark that no span begins at. The version is the greatest tip, and there are few of them: one, unless
+-- spans were discarded and left others that lead nowhere. So an append changes two rows here, and no more,
+-- however many spans the ledger has.
+-- TOP is each ledger's greatest tip: its version, and its own upper.
+let marks = (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, to), (upper))));
+let started = spans | filter(((_, from, to, _), _) -> (from, to) lt) | map(((id, from, _, _), _) -> ((id, from), ())) | distinct;
+let tips = marks - (marks | join(started, (place, upper, ()) -> (place, upper)));
+let top = tips | map(((id, to), (upper)) -> ((id), (to, upper)))
+               | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
 
-output "own" = ledgers | join(marks, (id, (_, _, _, clock, keep), (version, upper)) ->
+output "own" = ledgers | join(top, (id, (_, _, _, clock, keep), (version, upper)) ->
                    let (following, clock) = clock match (Free (_ -> (0, (0, 0))), Follows (clock -> (1, clock))) in
                    let durable = keep match (Durable (_ -> 1), Derived (_ -> 0)) in
                    (id, (version, upper, following, clock, durable)));
+
+-- STANDING, as in system.ddp.
+-- WRITE FRONTIER: the join of a ledger's own upper with the write frontier of the clock it follows, and so on up.
+let followed = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), ()) -> ((clock), (id)));
+wf: {
+    let lifted = followed | join(write, ((clock), (id), (frontier)) -> ((id), (frontier)));
+    set write = (top | map((id, (_, upper)) -> (id, (upper)))) + lifted
+              | reduce((_id, frontiers) ->
+                    let none = [] : List(List(int)) in
+                    let joined = ((0, none), frontiers) fold (((seen, sofar), ((frontier), _count)) ->
+                        (1, (seen, (sofar, frontier) call frontier_join, frontier) select)) in
+                    ((joined.1), 1) enlist);
+}
+let durable = ledgers((id), (_, _, _, _, Durable)) | distinct;
+output "standing" = top((id), (version, _)) * wf::write((id), (frontier)) * durable((id), ())
+                  | map(((id, version, frontier), ()) -> ((id), (version, frontier)));

@@ -130,8 +130,11 @@ let retired = retires | join(computations, (computation, (index), (entry)) -> (c
 let stopped = stops | join(runs, (run, (index), (entry)) -> (run, (index, entry)));
 let discarded = discards | join(copies, (span, (index), (entry)) -> (span, (index, entry)));
 let released = releases | join(held, (hold, (index), (entry)) -> (hold, (index, entry)));
+-- A ledger's own hold, whose holder is (0, 0), goes with it when it is dropped (see own.ddp).
+let owned = held | filter(((holder, _), _) -> (holder, (0, 0)) eq) | map(((_, ledger), (entry)) -> ((ledger), (entry)));
 output "removes" = ((dropped | map((_, (_, entry)) -> ((entry), ())))
                   + (dropped | join(spans, (ledger, _, (entry)) -> ((entry), ())))
+                  + (dropped | join(owned, (ledger, _, (entry)) -> ((entry), ())))
                   + (aliases | join(names, (name, _, (entry)) -> ((entry), ())))
                   + (unaliased | map((_, (_, entry)) -> ((entry), ())))
                   + (retired | map((_, (_, entry)) -> ((entry), ())))

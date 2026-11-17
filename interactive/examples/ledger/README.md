@@ -1,89 +1,68 @@
-# Ledgers: a demonstration of durable ledger logic
+# Ledgers: a stack of durable ledgers around DDIR
 
-This directory demonstrates the logic of durable ledgers in DDIR.
-DDIR resolves the transactions, and a driver outside the server makes their results durable.
-It is the logic and a test harness, not an integration: nothing here makes a DDIR program durable.
+This directory is a prototype of a system built around DDIR, as Materialize is built around differential dataflow.
+One ledger, the root, is made durable by brute force: a log of records in a blob store, behind one compare-and-swap.
+Every other ledger is rows in it, whose spans name batches of updates in the blob store.
+Its decisions are DDIR programs over one collection of state, and the Python around them moves bytes, swaps the register, and starts processes.
 
-[`model.md`](model.md) is the place to start.
-It says what a ledger is, what may change a set of ledgers, what is not settled, and what comes next.
+It is a prototype: the programs are real and tested, and the processes around them are Python standing in for Rust.
+[`DEMO.md`](DEMO.md) says how to run it, across four machines.
+[`BACKLOG.md`](BACKLOG.md) says what it lacks, and what it does that we mean to change.
 
-## The files, by purpose
+## The layers and their roles
 
-| Purpose | File | What it is |
+| Layer | Role | Process | What it does |
+| --- | --- | --- | --- |
+| Durability | Keeper | [`keeper.py`](keeper.py) | Judges every change, puts it in order, and records it in the root ledger. It keeps every entry but spans. |
+| Configuration | Followers | [`follower.py`](follower.py) | Each reads the root ledger and keeps a copy of the state. By role: serve instances, advise compaction, audit every rule. |
+| Execution | Instances | [`runner.py`](runner.py) | Each is told its part of the state, runs the computations it names, and appends their outputs. A launcher starts and stops them. |
+| Operation | Compactor, hold steward, collector | [`steward.py`](steward.py) | Merge spans, move read holds, and delete blobs that an audited state no longer names. |
+
+[`plumbing.py`](plumbing.py) is shared by all: the register, the blob store, frames, and the DDIR server.
+
+## The programs, by who runs them
+
+| Program | Who runs it | What it is for |
 | --- | --- | --- |
-| The model | [`model.md`](model.md) | The model, in prose. |
-| | [`ledger.ddp`](ledger.ddp) | The model's state: two collections, what is derived from them, and seven invariants as views that must be empty. |
-| | [`resolve.ddp`](resolve.ddp) | The model's rules: one round of transactions, each committed or rejected. |
-| | [`check.ddp`](check.ddp) | What a client checks of its own requests before it submits them. It reads no state. |
-| Checks | [`../../tests/ledgers.rs`](../../tests/ledgers.rs) | Runs rounds of a client's checks and then the rules, and after each has the state program rebuild the indexes from the manifest. They must agree, and every invariant must hold. |
-| | [`views.txt`](views.txt) | A session: the derived views under a tree of clocks, then each invariant broken once. |
-| The harness | [`fabric.py`](fabric.py) | A driver that pumps rounds, makes each durable, rebuilds a server from the log, and measures. |
-| | [`state.ddp`](state.ddp) | What a resolver keeps between rounds. It has no logic: five inputs, published. |
-| | [`requests.ddp`](requests.ddp) | Shapes the driver's flat rows of ints into requests. It has no rules. |
-| | [`MEASUREMENTS.md`](MEASUREMENTS.md) | Recorded results. |
-| Independent writers | [`resolver.py`](resolver.py) | Nine client sessions submit transactions to one resolver, and a tenth pumps it. Nothing is durable. |
+| [`system.ddp`](system.ddp) | the keeper | the state's views, and the rules that settle races |
+| [`step.ddp`](step.ddp) | the keeper | the rules of a change: what may not be undone |
+| [`commands.ddp`](commands.ddp) | the keeper | what each command removes and adds |
+| [`admit.ddp`](admit.ddp) | the keeper | the short check of a transaction of appends |
+| [`round.ddp`](round.ddp) | the keeper | the same check for many transactions at once |
+| [`stand.ddp`](stand.ddp) | the keeper | where each durable ledger stands, from the keeper's rows |
+| [`shift.ddp`](shift.ddp) | the keeper | the row a transaction gives a ledger it registers, or takes from one it drops |
+| [`gone.ddp`](gone.ddp) | the keeper | what leaves the keeper's tables with a dropped ledger |
+| [`own.ddp`](own.ddp) | the keeper, the policy follower, the hold steward | each ledger's own read hold |
+| [`readers.ddp`](readers.ddp) | the keeper | a new reader that would begin before its ledger's read hold |
+| [`pass.ddp`](pass.ddp) | the keeper | a pass of merges: the generation, the cover, and the merge's bounds |
+| [`bundle.ddp`](bundle.ddp) | a follower that serves | what each instance is told, and the instances each machine has |
+| [`instance.ddp`](instance.ddp) | each instance | what to run, where to begin, and which spans to read next |
+| [`compact.ddp`](compact.ddp) | the policy follower | which spans of each ledger to merge next |
+| [`needs.ddp`](needs.ddp) | the policy follower | what each ledger is needed from |
+| [`system-full.ddp`](system-full.ddp), [`step-full.ddp`](step-full.ddp) | a follower that audits | the model in full: `system.ddp` and `step.ddp` with every rule kept |
+| [`index.ddp`](index.ddp) | the tests | what a round reads of each ledger, derived from the entries, to check the keeper's rows against |
 
-Outside this directory, [`../../src/lambda/frontiers.rs`](../../src/lambda/frontiers.rs) adds the four frontier functions the programs call.
+## Checks
 
-## Why five programs
+| Check | What it does |
+| --- | --- |
+| [`../../tests/ledger_system.rs`](../../tests/ledger_system.rs) | Builds a system by commands, breaks each rule once, and holds admission and rounds to the full rules. |
+| [`live.py`](live.py) | The whole system on this machine: keeper, followers, instances, compactor, collector; restarts from the register and the blobs alone. |
+| [`from_empty.py`](from_empty.py) | A system built up from nothing, one transaction at a time, with what each caused. |
+| [`fleet.py`](fleet.py) | The system of `live.py` across four machines. |
 
-**`ledger.ddp` is the definition.**
-Everything about a ledger is derived from the manifest, which is its registrations and spans.
-That derivation does work for every ledger, so it is used to check and to rebuild, and not in each round.
+    cargo build --release -p ddir-server
+    cargo test --release -p interactive --test ledger_system
+    python3 interactive/examples/ledger/live.py
 
-**`resolve.ddp` is the rules, written to cost what a round touches.**
-It does not read the manifest.
-It reads three indexes of it: each ledger's version and own upper, its width and start, and the clock it follows.
-It reports the round's change to the manifest, and the changes to those indexes.
-Its last section only words rejections, and changes nothing that commits.
+`live.py` needs an etcd at `127.0.0.1:2379` and SeaweedFS at `127.0.0.1:8888`.
 
-**`check.ddp` is what the rules trust a client to have checked.**
-Each check reads the request alone: its actions are in order, its times have one width, and each append's lower is before its upper.
-The test runs it in front of the rules.
-The drivers here make well-formed requests, and do not run it.
+## The demo
 
-**`state.ddp` holds the manifest and the three indexes between rounds.**
-A driver feeds it each round's conclusions.
-After a restart, the manifest comes from the log, and `ledger.ddp` derives the indexes from it.
+[`demo.py`](demo.py) is a walk in eight acts across four machines, [`steady.py`](steady.py) runs the system with data and configuration churning until stopped, and [`watch.py`](watch.py) is a page of live views beside either.
+[`DEMO.md`](DEMO.md) says what each needs and shows.
 
-**`requests.ddp` is a convenience of the driver**, which sends plain columns of ints.
+## Earlier work
 
-## How a round goes
-
-`state` stands for the whole run.
-The rules are loaded for one round, bound to `state` and to the round's requests, and then dropped.
-
-1. Load the rules, and feed the round's requests.
-2. Tick, and the rules decide every request.
-3. Read the round's change to the manifest.
-4. Feed the rules' conclusions into `state`, drop the rules, and tick.
-5. Write the change as one blob, flush, swap the root file, and flush again.
-
-`fabric.py` does all five, and a round's outcomes count as reported when step 5 returns.
-Its log is a chain of blobs, each naming the one before, and a root file naming the last.
-`resolver.py` does the first four, with requests arriving from other sessions.
-
-## Run it
-
-From the repository root:
-
-```sh
-cargo build --release -p ddir-server
-
-# The check of the rules against the model.
-cargo test --release -p interactive --test ledgers
-
-# The model's views, and each invariant broken once.
-./target/release/ddir_server < interactive/examples/ledger/views.txt
-
-# Durable rounds, then a kill, a rebuild from the log, and a check of what was rebuilt.
-python3 interactive/examples/ledger/fabric.py --dir /tmp/fabric --ledgers 100000 --clocks 1 --spans 0,5000 --check
-
-# Nine sessions and a pump.
-python3 interactive/examples/ledger/resolver.py
-```
-
-With `--check`, `fabric.py` kills the server and starts another.
-It feeds the log into the new server's manifest, derives the indexes with `ledger.ddp`, and checks the invariants.
-What it rebuilt must equal what the first server held, and one more round must resolve on it.
-Every round of every run also checks that exactly the expected number of actions committed.
+An earlier generation of this directory, with resolvers in place of a keeper (`ledger.ddp`, `resolve.ddp`, `fabric.py` and their tests), is on the branch `ddir-ledgers`.
+The round harness (`rounds.py`, `flat.ddp`) that measured round admission alone is in this branch's history, before the commit that removed it.

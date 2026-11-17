@@ -1,0 +1,36 @@
+-- What leaves the keeper's tables with a ledger that a transaction drops: its generation.
+--
+-- The keeper holds no spans. A follower that applies a drop takes the dropped ledger's spans out of its copy itself
+-- (see follower.py): a span whose ledger is not registered is an orphan, and every follower finds the same ones at the
+-- same record. Its row leaves through shift.ddp, and its own hold through commands.ddp, with the ledger.
+-- An id is taken never to be registered again once dropped, so its generation can go too.
+--
+--   input 0, dropped : ((id), ())          the ledgers the transaction in hand drops (see shift.ddp)
+--   input 1, gens    : ((id), (number))    each ledger's generation
+--
+--   unmarked  : ((id), (number))       the generations of the ledgers dropped, each with a count of -1
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let dropped = input 0 : ((Id), ());
+let gens = input 1 : ((Id), (int));
+let marks = gens | join(dropped, (id, (number), ()) -> (id, (number)));
+output "unmarked" = (marks | filter((_, _) -> 0)) - marks;

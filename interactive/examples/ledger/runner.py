@@ -23,7 +23,8 @@ them, and the instance does not open them. For each computation it loads three k
   what is owed     after each output that writes a durable ledger: what the computation makes, less what the
                    ledger held when the instance began
 It feeds each span's frames to the local ledger as they are, and moves that input to where the ledger stands.
-The server needs no tick for this: each input is moved alone. A tail of what is owed then sends frames, and how far
+The server needs no tick for this: each input is moved alone (`advance`), and then the server is asked to run until
+its outputs have caught up with their inputs (`spin`). A tail of what is owed then sends frames, and how far
 they are complete, and those frames are the next span of the output ledger. That append is all the instance asks
 of the keeper, and it asks as a runner of the computation.
 
@@ -49,7 +50,7 @@ too: it takes what it reads of durable ledgers as it comes, with no times, and t
 A ledger's times are one int here. A program's outputs are named out0, out1, and so on, in the order it gives them.
 What this does not do: a computation whose durable outputs stand at different times.
 """
-import json, os, signal, struct, subprocess, sys, time
+import concurrent.futures, json, os, signal, struct, subprocess, sys, time
 import keeper as model
 import plumbing
 from plumbing import number, instant
@@ -57,17 +58,33 @@ from plumbing import number, instant
 DIR = "interactive/examples/ledger"
 EMPTY = "inject(0,tuple())"
 FAR = 1 << 62       # a time after every time a ledger has: an input that is moved here takes no more
+KEPT = 4096         # how many blobs an instance keeps of those it has read
+OVERLAP = os.environ.get("RUNNER_OVERLAP", "1") == "1"      # whether an instance feeds its copy while it writes and asks
+WAITS = concurrent.futures.ThreadPoolExecutor(1)            # the one thread that waits on the blob store or the keeper
+STORE = {"puts": 0, "gets": 0, "inline": 0, "blob": 0}      # what this instance asked of the blob store, and how its batches were kept
 
 
 def frames_of(found, blobs, cache):
-    """The frames of some spans' batches, in order. Each span is (from, to, batch). The frames are not opened."""
+    """The frames of some spans' batches, in order. Each span is (from, to, batch). The frames are not opened.
+    A batch names parts of blobs (or, in the older forms, a blob or a part of one). A part that is not in `cache` is
+    read from `blobs` by range, held to its own hash, and kept there: what is read is no more than what is named."""
     read = []
-    for _, _, batch in found:
-        if batch[1] == 2:
-            name = plumbing.hash_name(batch[2])
-            if name not in cache: cache[name] = plumbing.unpack(blobs.get(name))[1]
-            read += cache[name]
+    for _, _, batch in found: read += plumbing.frames_of_batch(blobs, batch, cache)
     return read
+
+
+def wanted(found, cache):
+    """What the batches of some spans need read that `cache` does not have: parts, as (blob, offset, length, digest), and
+    blobs whole for a name of the older forms. Each as the key it is kept under in `cache`, and how to read it."""
+    need = {}
+    for spans in found:
+        for _, _, batch in spans or []:
+            if batch[1] != 2: continue
+            pieces = plumbing.pieces_of(batch[2])
+            for piece in pieces:
+                if piece[:2] not in cache: need[piece[:2]] = piece
+            if not pieces and plumbing.blob_of(batch[2]) not in cache: need[plumbing.blob_of(batch[2])] = None
+    return need
 
 
 class Computation:
@@ -124,11 +141,16 @@ class Local:
     They say what to run, where each ledger stands, and which spans to read. What they say is decoded here."""
     def __init__(self, server, instance):
         self.server, self.readers = server, {}      # each reader this has told the views of, and the row it told them
+        self.seen = {}                              # each view's frames as last read, and their rows
         server.ask(f"load local from {DIR}/instance.ddp input0=state::entries")
         server.many([f"feed local 1 tuple(tuple({instance[0]},{instance[1]})) val=tuple()", "tick"])
 
     def rows(self, view):
-        return [(key, val) for frame in self.server.ask(f"peek local::{view} as corgi") for key, val, _, _ in plumbing.decode(frame)]
+        """The rows of a view. They are decoded only if the view's frames are not the ones it gave last."""
+        frames = self.server.ask(f"peek local::{view} as corgi")
+        if self.seen.get(view, (None,))[0] != frames:
+            self.seen[view] = (frames, [(key, val) for frame in frames for key, val, _, _ in plumbing.decode(frame)])
+        return self.seen[view][1]
 
     def plan(self):
         """Each computation this instance is asked to run: {computation: (inputs, outputs, takes, gives, text)}."""
@@ -149,19 +171,28 @@ class Local:
         """Where each durable ledger stands: {ledger: (version, frontier)}, with a frontier of one time as that time."""
         return {number(key[0]): (val[0], instant(val[1])) for key, val in self.rows("standing")}
 
-    def spans(self, reader, ledger, read, need=None):
-        """The spans that lead a reader of a ledger on from its append `read` to its last, for one that reads from `need`:
-        [(from, to, batch)] in order, or None if no spans lead on from there. With no need, any span will do.
-        A reader is (computation, side, position), and the views are told where it has read to."""
-        frontier = "list()" if need is None else f"list(list({need}))"
-        row = f"tuple(tuple(tuple(0,{reader[0]}),{reader[1]},{reader[2]})) val=tuple(tuple(0,{ledger}),{read},{frontier})"
-        if self.readers.get(reader) != row:
-            feeds = [f"feed local 2 {self.readers[reader]} diff=-1"] if reader in self.readers else []
-            self.readers[reader] = row
-            self.server.many(feeds + [f"feed local 2 {row}", "tick"])
-        key = (((0, reader[0]), reader[1], reader[2]),)
-        if any(found == key for found, _ in self.rows("stuck")): return None
-        return sorted(val for found, val in self.rows("fetch") if found == key)
+    def spans(self, asks):
+        """For each (reader, ledger, read, need): the spans that lead the reader of the ledger on from its append `read`
+        to its last, for one that reads from `need`: [(from, to, batch)] in order, or None if no spans lead on from there.
+        With no need, any span will do. A reader is (computation, side, position), and the views are told where it has read to."""
+        feeds = []
+        for reader, ledger, read, need in asks:
+            frontier = "list()" if need is None else f"list(list({need}))"
+            row = f"tuple(tuple(tuple(0,{reader[0]}),{reader[1]},{reader[2]})) val=tuple(tuple(0,{ledger}),{read},{frontier})"
+            if self.readers.get(reader) != row:
+                if reader in self.readers: feeds.append(f"feed local 2 {self.readers[reader]} diff=-1")
+                self.readers[reader] = row
+                feeds.append(f"feed local 2 {row}")
+        if feeds: self.server.many(feeds + ["tick"])
+        stuck, fetch = {key for key, _ in self.rows("stuck")}, {}
+        for key, val in self.rows("fetch"): fetch.setdefault(key, []).append(val)
+        key = lambda reader: (((0, reader[0]), reader[1], reader[2]),)
+        found = [None if key(reader) in stuck else sorted(fetch.get(key(reader), [])) for reader, _, _, _ in asks]
+        # A reader of side 1 reads what an output ledger holds, once, when its computation begins. It is taken back
+        # here: left in place, the views would go on saying what it would read next, for every span the ledger gains.
+        once = [reader for reader, _, _, _ in asks if reader[1] == 1 and reader in self.readers]
+        if once: self.server.many([f"feed local 2 {self.readers.pop(reader)} diff=-1" for reader in once] + ["tick"])
+        return found
 
     def forget(self, computation):
         """Take back the readers of a computation that is no longer run here."""
@@ -170,6 +201,14 @@ class Local:
 
 
 def port(instance): return 21000 + 2 * (instance[1] % 1000)
+
+
+# With RUNNER_TIMES=1 an instance says, every ten seconds, where its time went: waiting to be told, bringing its own
+# copy up to date and reading its views, and each kind of thing its computations ask for together.
+TIMES, SPENT = os.environ.get("RUNNER_TIMES") == "1", {"said": time.perf_counter(), "passes": 0}
+def spent(what, begin):
+    if TIMES: SPENT[what] = SPENT.get(what, 0.0) + time.perf_counter() - begin
+    return time.perf_counter()
 
 
 def run(instance, url, follower):
@@ -181,20 +220,43 @@ def run(instance, url, follower):
     local = Local(server, instance)
     told = plumbing.Tail(follower, "bundle", instance)
     running, order = {}, []
+    def feed(sent):
+        # What the tail sent is fed to the server as it is, less its times, so the instance's copy of the entries
+        # follows what it is told.
+        feeds = []
+        for afresh, frames in sent:
+            if afresh:
+                # The follower was asked again, and has sent every row. What was told before is taken back out.
+                if feeds: server.many(feeds + ["tick"])
+                feeds = ["feed state 0 from state::told diff=-1"]
+            feeds += [(f"feed state 0 frame {len(frame)}", frame) for frame in map(plumbing.untimed, frames)]
+        if feeds: server.many(feeds + ["tick"])
+    # A PASS, IN ORDER: wait to be told; feed the copy and read the views; find the spans to read and read their
+    # blobs; feed the computations and run them; write what they made, as one blob; ask the keeper to append.
+    # The blob is written before the append is asked, and a computation goes no further until it is told of its
+    # own append. While the blob is written and while the keeper is asked the instance has nothing to compute, so
+    # it takes what the tail sends then and feeds its copy (`meanwhile`), and does not wait for that again after.
+    early = [False]
+    def meanwhile(asked):
+        begin, fed = time.perf_counter(), 0.0
+        while not asked.done():
+            sent = told.take(timeout=0.004)
+            if sent:
+                at = time.perf_counter()
+                feed(sent)
+                early[0], fed = True, fed + time.perf_counter() - at
+        if TIMES: SPENT["(its copy fed while it wrote or asked)"] = SPENT.get("(its copy fed while it wrote or asked)", 0.0) + fed
     try:
         while True:
-            # Nothing is done until the tail has sent something. Its frames are fed to the server as they are,
-            # less their times, so the instance's copy of the entries follows what it is told.
-            feeds = []
-            for afresh, frames in told.take():
-                if afresh:
-                    # The follower was asked again, and has sent every row. What was told before is taken back out.
-                    if feeds: server.many(feeds + ["tick"])
-                    feeds = ["feed state 0 from state::told diff=-1"]
-                feeds += [(f"feed state 0 frame {len(frame)}", frame) for frame in map(plumbing.untimed, frames)]
-            server.many(feeds + ["tick"])
+            # Nothing is done until the tail has sent something, unless it sent something during the last pass.
+            begin = time.perf_counter()
+            sent = told.take(timeout=0) if early[0] else told.take()
+            early[0] = False
+            begin = spent("waiting to be told", begin)
+            feed(sent)
             # What the views say of the entries, all of one state.
             plan, binds, standing, begins = local.plan(), local.binds(), local.standing(), local.begins()
+            spent("its copy and its views", begin)
             # Readers are dropped before what they read, and loaded after it.
             for ident in [ident for ident in reversed(order) if ident not in plan]:
                 running.pop(ident).drop(); order.remove(ident); local.forget(ident)
@@ -214,38 +276,64 @@ def run(instance, url, follower):
                     shapes = lambda found: [plumbing.ints_text(shape) for shape in found]
                     running[ident] = Computation(server, ident, plumbing.ints_text(text), shapes(takes), shapes(gives), reads, writes, bound, sources, piloted)
                     order.append(ident)
-            for ident in order: step(keeper, blobs, cache, local, running, ident, standing, begins)
+            together(server, keeper, blobs, cache, local, [step(running, ident, standing, begins, cache) for ident in order],
+                     meanwhile if OVERLAP else None)
+            SPENT["passes"] += 1
+            if os.environ.get("RUNNER_STORE") == "1" and time.perf_counter() - STORE.get("said", 0) >= 10:
+                # What this instance has asked of the blob store, and how its batches were kept, so far.
+                print(f"instance {instance} store: puts {STORE['puts']} gets {STORE['gets']} inline {STORE['inline']} blob {STORE['blob']} "
+                      f"bytes put {plumbing.STORED['put']} got {plumbing.STORED['got']}", flush=True)
+                STORE["said"] = time.perf_counter()
+            if TIMES and time.perf_counter() - SPENT["said"] >= 10:
+                print(f"instance {instance}: {SPENT.pop('passes')} passes in {time.perf_counter() - SPENT.pop('said'):.0f} s; ms: "
+                      + "; ".join(f"{what} {1000 * seconds:.0f}" for what, seconds in SPENT.items()), flush=True)
+                SPENT.clear(); SPENT.update(said=time.perf_counter(), passes=0)
     finally:
         server.close()
 
 
-def step(keeper, blobs, cache, local, running, ident, standing, begins):
-    """Take one computation as far as its inputs allow, and append what it made."""
+def step(running, ident, standing, begins, cache):
+    """One computation's part of a pass: take it as far as its inputs allow, and append what it made.
+    This is a generator, so that what every computation here wants of the views, the server, the blob store and the
+    keeper is asked for together (see `together`). It yields what it wants, and is sent the answer:
+      ("spans", [(reader, ledger, read, need)])   the spans that lead each reader on (see `Local.spans`), with their blobs in `cache`
+      ("feed", requests)                          requests to the server: it has made them, and caught up, when this goes on
+      ("put", [frames])                           frames to keep, a group for each batch: the name of each batch, as ints.
+                                                  The groups of every computation here go in one blob, each a part of it
+      ("append", computation, appends)            a transaction of appends for the keeper, as this computation's runner:
+                                                  each (ledger, number, lower, upper, batch). What refused it, or none"""
     this = running[ident]
-    server = this.server
 
-    def read(position, ledger, need, afresh):
-        """The requests that feed a local ledger what its ledger has that it has not read. `afresh` says to move the times
-        of what is read up to `need`, as is done when the local ledger has nothing of the ledger yet.
+    def read(need, afresh):
+        """The requests that feed each local ledger what its ledger has that it has not read. `afresh` says to move the times
+        of what is read up to the need, as is done when the local ledger has nothing of the ledger yet.
         If no spans lead on from what was read, it was merged with what was not: all that the local ledger holds
-        is taken back, and the ledger is read again whole, from `need`."""
-        name, reader = f"i{ident}_{position}", (ident, 0, position)
-        requests, found = [], local.spans(reader, ledger, this.consumed[position], need)
-        if found is None:
-            requests, found, afresh = [f"feed {name} 0 from {name}::rows diff=-1"], local.spans(reader, ledger, 0, need), True
-            if found is None: raise SystemExit(f"instance: computation {ident} cannot read input {position} from {need}")
-            print(f"instance: computation {ident} read input {position} whole again, after a merge", flush=True)
-        for frame in frames_of(found, blobs, cache):
-            # A piloted input takes each update at its time. A ticked one takes them with no times, at the tick.
-            if not this.piloted: frame = plumbing.untimed(frame)
-            elif afresh and need is not None: frame = plumbing.raised(frame, need)
-            requests.append((f"feed {name} 0 frame {len(frame)}", frame))
-        if found: this.consumed[position] = found[-1][1]
+        is taken back, and the ledger is read again whole, from the need."""
+        asks = [((ident, 0, position), ledger, this.consumed[position], need(position)) for position, ledger in this.reads]
+        found = yield ("spans", asks)
+        stuck = [at for at, spans in enumerate(found) if spans is None]
+        if stuck:
+            again = yield ("spans", [(asks[at][0], asks[at][1], 0, asks[at][3]) for at in stuck])
+            for at, spans in zip(stuck, again):
+                position = asks[at][0][2]
+                if spans is None: raise SystemExit(f"instance: computation {ident} cannot read input {position} from {asks[at][3]}")
+                print(f"instance: computation {ident} read input {position} whole again, after a merge", flush=True)
+                found[at] = spans
+        requests = []
+        for at, ((position, _), spans) in enumerate(zip(this.reads, found)):
+            name = f"i{ident}_{position}"
+            if at in stuck: requests.append(f"feed {name} 0 from {name}::rows diff=-1")
+            for frame in frames_of(spans, None, cache):
+                # A piloted input takes each update at its time. A ticked one takes them with no times, at the tick.
+                if not this.piloted: frame = plumbing.untimed(frame)
+                elif (afresh or at in stuck) and need(position) is not None: frame = plumbing.raised(frame, need(position))
+                requests.append((f"feed {name} 0 frame {len(frame)}", frame))
+            if spans: this.consumed[position] = spans[-1][1]
         return requests
 
     if not this.piloted:
-        requests = [request for position, ledger in this.reads for request in read(position, ledger, None, False)]
-        if requests: server.many(requests + ["tick"])
+        requests = yield from read(lambda position: None, False)
+        if requests: yield ("feed", requests + ["tick"])
         return
 
     # What this was told may be from before its own last append. It waits until it is told of that append.
@@ -259,49 +347,120 @@ def step(keeper, blobs, cache, local, running, ident, standing, begins):
         if this.start is not None and any(running[writer].floor(running) < this.start for writer in this.sources):
             raise SystemExit(f"instance: computation {ident} reads a derived ledger that is behind where its outputs stand, which this does not do")
         # What the output ledgers hold is fed to what is owed, as of the start, and that input is then done with.
-        for position, ledger in this.writes:
-            held = local.spans((ident, 1, position), ledger, 0, this.start)
-            if held is None: raise SystemExit(f"instance: computation {ident} cannot read what output {position} holds")
+        held = yield ("spans", [((ident, 1, position), ledger, 0, this.start) for position, ledger in this.writes])
+        for (position, _), spans in zip(this.writes, held):
+            if spans is None: raise SystemExit(f"instance: computation {ident} cannot read what output {position} holds")
             requests += [(f"feed w{ident}_{position} 1 frame {len(frame)}", frame)
-                         for frame in (plumbing.raised(frame, this.start) for frame in frames_of(held, blobs, cache))]
+                         for frame in (plumbing.raised(frame, this.start) for frame in frames_of(spans, None, cache))]
             requests.append(f"advance w{ident}_{position} 1 {FAR}")
+    begun = this.begun
+    requests += yield from read(lambda position: this.at[position] if begun else this.start, not begun)
     for position, ledger in this.reads:
-        requests += read(position, ledger, this.at[position] if this.begun else this.start, not this.begun)
         # The local ledger is moved to where the ledger stands. Nothing else moves with it.
         if standing[ledger][1] > this.at[position]:
             requests.append(f"advance i{ident}_{position} 0 {standing[ledger][1]}")
             this.at[position] = standing[ledger][1]
     this.begun = True
-    if requests: server.many(requests)
+    # Every computation here waits at this point, with or without requests of its own: what one is fed may change
+    # what another owes, when the other reads a derived ledger that the one writes.
+    yield ("feed", requests)
     if not this.writes: return
 
     # Each tail of what is owed has sent its frames, and how far they are complete. Those frames are the next span.
     for position, _ in this.writes:
-        sent, server.tails[this.tails[position]] = server.tails[this.tails[position]], []
+        sent, this.server.tails[this.tails[position]] = this.server.tails[this.tails[position]], []
         for kind, found in sent:
             if kind == "data": this.owed[position].append(found)
             else: this.reached[position] = struct.unpack("<Q", found)[0]
     reach = min(this.reached.values())
     if reach <= this.stood: return
-    commands = []
+    full = [position for position, _ in this.writes if this.owed[position]]
+    names = dict(zip(full, (yield ("put", [this.owed[position] for position in full])) if full else []))
+    appends = []
     for position, ledger in this.writes:
         version, stands = standing[ledger]
         # The outputs stand elsewhere than this left them, so another has written them, and what this holds is not what follows.
         if stands != this.stood: raise SystemExit(f"instance: computation {ident} must start over")
-        batch = EMPTY
-        if this.owed[position]:
-            name = blobs.put(plumbing.pack({}, this.owed[position]))
-            batch = f"inject(2,list({','.join(map(str, plumbing.hash_ints(name)))}))"
-        commands.append(f"inject(1,tuple(tuple(0,{ledger}),{version},list(list({this.stood})),list(list({reach})),{batch}))")
-    while True:
-        # While the keeper is away, the instance waits, and asks the same again when it is back.
-        # If the keeper made the append before it went, asking again is refused, and the instance starts over.
-        try: refused = keeper.transact(f"inject(1,tuple(0,{ident}))", commands); break
-        except OSError: time.sleep(0.2)
+        batch = names.get(position, plumbing.EMPTY)
+        appends.append(((0, ledger), version, [[this.stood]], [[reach]], batch))
+    refused = yield ("append", ident, appends)
     # An append that is refused was made from a state that is not the keeper's: what it held is lost.
-    if refused: raise SystemExit(f"instance: computation {ident} was refused ({', '.join(refused)}), and must start over")
+    if refused: raise SystemExit(f"instance: computation {ident} was refused ({refused}), and must start over")
     this.awaited = {ledger: standing[ledger][0] + 1 for _, ledger in this.writes}
     this.stood, this.owed = reach, {position: [] for position in this.owed}
+
+
+def together(server, keeper, blobs, cache, local, steps, meanwhile=None):
+    """Run every computation's part of a pass, each as far as it goes, and ask for what they want together:
+    one question of the views, one run of requests to the server, one blob written, and one request to the keeper.
+    All of one kind is asked before any of the next, in the order a computation asks: spans, then requests, then
+    blobs, then appends. So every computation's requests are made before any reads what its outputs owe."""
+    wants = []
+    def aside(work):
+        # What only waits, on the blob store or on the keeper, is asked on another thread, and `meanwhile` runs here until it is answered.
+        if meanwhile is None: return work()
+        asked = WAITS.submit(work)
+        meanwhile(asked)
+        return asked.result()
+    def go(step, answer=None, first=False):
+        try: wants.append((step, next(step) if first else step.send(answer)))
+        except StopIteration: pass
+    for each in steps: go(each, first=True)
+    while wants:
+        kind = next(kind for kind in ("spans", "feed", "put", "append") if any(want[0] == kind for _, want in wants))
+        now, wants[:] = [(each, want) for each, want in wants if want[0] == kind], [(each, want) for each, want in wants if want[0] != kind]
+        begin = time.perf_counter()
+        if kind == "spans":
+            found = local.spans([ask for _, want in now for ask in want[1]])
+            # The blobs of the spans that were found are read at once, and kept until the pass is over.
+            # Each part is read by range: an instance's blob holds the parts of every output of a pass, and a
+            # reader of one output reads its own part only.
+            need = wanted(found, cache)
+            wholes = sorted(key for key, piece in need.items() if piece is None)
+            STORE["gets"] += plumbing.fetch(blobs, [piece for piece in need.values() if piece is not None], cache) + len(wholes)
+            cache.update(zip(wholes, blobs.many(blobs.get, wholes)))
+            answers = []
+            for _, want in now: answers.append(found[:len(want[1])]); del found[:len(want[1])]
+        elif kind == "feed":
+            requests = [request for _, want in now for request in want[1]]
+            if requests: server.many(requests + ["spin"])
+            answers = [None] * len(now)
+        elif kind == "put":
+            # What every computation here made in this pass: a batch that is small is kept in its entry, inline, and
+            # the rest are written as one blob, of which each batch names its part. A pass whose batches are all
+            # small writes no blob.
+            groups = [frames for _, want in now for frames in want[1]]
+            # The bound is on the batch as it would be kept: compressed, unless that is off.
+            kept = [plumbing.inline(frames) for frames in groups]
+            small = [len(each[2]) < plumbing.INLINE for each in kept]
+            data, places = plumbing.several([frames for frames, inside in zip(groups, small) if not inside])
+            name = aside(lambda: blobs.put(data, stored=True)) if not all(small) else None
+            places, names = iter(places), []
+            for each, inside in zip(kept, small):
+                names.append(each if inside else ("inject", 2, plumbing.piece_ints(name, next(places))))
+            STORE["puts"] += 0 if all(small) else 1
+            STORE["inline"] += sum(small)
+            STORE["blob"] += len(small) - sum(small)
+            answers = []
+            for _, want in now: answers.append(names[:len(want[1])]); del names[:len(want[1])]
+        else:
+            def ask():
+                while True:
+                    # While the keeper is away, the instance waits, and asks the same again when it is back.
+                    # If the keeper made an append before it went, asking again is refused, and the instance starts over.
+                    # The appends of every computation go in one request, as frames: each computation's are one transaction,
+                    # at its own place in the request, and the keeper is told who its runner is. The keeper opens none of it.
+                    try:
+                        return keeper.append([(place, *each) for place, (_, want) in enumerate(now) for each in want[2]],
+                                             [(place, (0, want[1])) for place, (_, want) in enumerate(now)])
+                    except OSError: time.sleep(0.2)
+            refused = aside(ask)
+            answers = [refused.get(place) for place in range(len(now))]
+        begin = spent({"spans": "spans found and their blobs read", "feed": "its server fed and run", "put": "blobs written", "append": "the keeper asked to append"}[kind], begin)
+        for (each, _), answer in zip(now, answers): go(each, answer)
+        spent("the computations' own steps", begin)
+    # What was read of the blob store is kept for a reader that must read again, up to a bound.
+    for name in list(cache)[:max(0, len(cache) - KEPT)]: del cache[name]
 
 
 def launch(url, follower, machine=None):

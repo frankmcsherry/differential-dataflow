@@ -1,0 +1,91 @@
+-- A new reader, against the merges that were made: a rule for a keeper that holds no spans.
+--
+-- A reader of a ledger begins from some frontier: a holder from what it holds, and a computation from where its outputs
+-- stand (NEEDS, in system.ddp). The ledger must be readable from there. With the spans in hand that is the rule
+-- `forgotten` of system.ddp, which asks whether the spans a reader from that frontier can use join up.
+-- This keeper has no spans. It keeps one frontier for each ledger that a merge has compacted, its floor (see pass.ddp):
+-- the join of what every such merge was held from. Any chain of the ledger's spans asks of a reader no more than that.
+-- So a reader that begins at or after the floor can read the ledger, as long as its spans join up at all, which is a
+-- follower's rule to keep. One that begins before the floor is refused here.
+-- This refuses every reader that `forgotten` refuses. It may refuse one that `forgotten` would let by: when a merged
+-- span stands beside the spans it covers, which a reader from before could still use; and when two merges were held
+-- from frontiers neither of which is before the other, where the join is after both.
+--
+-- The transaction in hand may register a ledger, which has no row yet (see shift.ddp). It stands at its start,
+-- joined with where the clock it follows stands, if that clock stands anywhere.
+--
+--   input 0, config   : ((entry), ())                     the configuration the transaction in hand would make
+--   input 1, standing : ((ledger), (version, frontier))   where each durable ledger stands, from the keeper's rows
+--   input 2, moved    : ((ledger), (version, upper, following, clock, durable))   the rows the transaction gives and takes
+--   input 3, floors   : ((ledger), (frontier))            what each ledger that a merge has compacted can be read from
+--
+--   forgotten : ((ledger), (need, floor))   a need of a ledger that is before the ledger's floor
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let config = input 0 : ((Entry), ());
+let standing = input 1 : ((Id), (int, Frontier));
+let moved = input 2 : ((Id), (int, Frontier, int, Id, int));
+let floors = input 3 : ((Id), (Frontier));
+
+-- WHERE THE LEDGERS STAND, with the ledgers the transaction in hand registers. A row it takes away has a count
+-- below zero, and is not one of those: the rows are counted, since `distinct` keeps a row of either sign.
+let born = moved | map((id, row) -> ((id, row), ())) | count | filter((_, copies) -> (copies, 0) gt)
+                 | map(((id, (_, start, following, clock, durable)), _) -> (id, (start, following, clock, durable)))
+                 | filter((_, (_, _, _, durable)) -> durable);
+let led = born | filter((_, (_, following, _, _)) -> following) | map(((id), (start, _, clock, _)) -> ((clock), (id, start)));
+let lifted = led | join(standing, ((clock), (id, start), (_, frontier)) -> ((id), (0, (start, frontier) call frontier_join)));
+let rises = lifted | map((id, _) -> (id, ())) | distinct;
+let level = born | map((id, (start, _, _, _)) -> (id, (0, start)));
+let stood = standing + lifted + (level - (level | join(rises, (id, place, ()) -> (id, place))));
+
+-- WHAT EACH LEDGER IS NEEDED FROM: NEEDS of system.ddp, with where the ledgers stand read from the rows.
+let table = config | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let computations = table((Computation((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let holds = table((Hold((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let derived = ledgers((id), (_, _, _, _, Derived)) | distinct;
+let ins = computations | flatmap(((computation), (_, inputs, _)) ->
+              (computation, ((0, inputs len) range, inputs) zip) cap_list
+              map ((computation, (position, input)) -> ((computation, position), (input))));
+let outs = computations | flatmap(((computation), (_, _, outputs)) ->
+               (computation, ((0, outputs len) range, outputs) zip) cap_list
+               map ((computation, (position, output)) -> ((computation, position), (output))));
+let reads = ins((computation, position), (Read(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position))) | distinct;
+let writes = outs((computation, position), (Written(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position))) | distinct;
+let relies = reads((ledger), (reader, _)) * derived((ledger), ()) * writes((ledger), (writer, _))
+           | map(((ledger, reader, writer), ()) -> ((reader), (writer, ledger)));
+let stands = writes | join(stood, ((ledger), (computation, _), (_, frontier)) -> ((computation), (ledger, frontier)));
+let pinned = holds((_, ledger), (frontier)) * derived((ledger), ()) * writes((ledger), (writer, _))
+           | map(((ledger, frontier, writer), ()) -> ((writer), (ledger, frontier)));
+resuming: {
+    let passed = relies | join(resumes, ((reader), (writer, _), (target, frontier)) -> ((writer), (target, frontier)));
+    set resumes = stands + pinned + passed | distinct;
+}
+let needs = reads | map(((ledger), (computation, _)) -> ((computation), (ledger)))
+                  | join(resuming::resumes, ((computation), (source), (_, frontier)) -> ((source), (frontier)))
+                  | distinct;
+let asks = (needs | map(((source), (need)) -> ((source), (need))))
+         + (holds | map(((_, ledger), (need)) -> ((ledger), (need))))
+         | distinct;
+
+output "forgotten" = asks | join(floors, (ledger, (need), (floor)) -> (ledger, (need, floor)))
+                          | filter((_, (need, floor)) -> ((floor, need) call frontier_le, 0) eq);

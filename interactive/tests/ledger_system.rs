@@ -47,8 +47,8 @@ struct System { commands: Program, state: Program, step: Program, admit: Program
 fn system() -> System {
     System {
         commands: program(include_str!("../examples/ledger/commands.ddp")),
-        state: program(include_str!("../examples/ledger/system.ddp")),
-        step: program(include_str!("../examples/ledger/step.ddp")),
+        state: program(include_str!("../examples/ledger/system-full.ddp")),
+        step: program(include_str!("../examples/ledger/step-full.ddp")),
         admit: program(include_str!("../examples/ledger/admit.ddp")),
         round: program(include_str!("../examples/ledger/round.ddp")),
         index: program(include_str!("../examples/ledger/index.ddp")),
@@ -80,11 +80,24 @@ fn runner(computation: i64) -> String { format!("tuple() val=tuple(inject(1,tupl
 fn judge(system: &System, before: &Rows, after: &Rows, actor: &str, workers: usize) -> BTreeSet<&'static str> {
     let was = evaluate(&system.state, &[lines(before)], workers);
     let is = evaluate(&system.state, &[lines(after)], workers);
-    let step = evaluate(&system.step, &[lines(before), lines(after), lines(&was["standing"]), lines(&is["standing"]), vec![actor.to_string()]], workers);
+    let (removes, adds) = change(before, after);
+    let step = evaluate(&system.step, &[lines(before), lines(&removes), lines(&adds), lines(&was["standing"]), lines(&is["standing"]), vec![actor.to_string()]], workers);
     let mut broken = BTreeSet::new();
     for rule in STATE_RULES.into_iter().chain([UNFOUNDED]) { if !is[rule].is_empty() { broken.insert(rule); } }
     for rule in STEP_RULES { if !step[rule].is_empty() { broken.insert(rule); } }
     broken
+}
+
+/// A step as its change: what it takes out of `before`, and what it puts in, to make `after`.
+fn change(before: &Rows, after: &Rows) -> (Rows, Rows) {
+    let mut removes = before.clone();
+    for (row, diff) in after { *removes.entry(row.clone()).or_default() -= diff; }
+    let mut adds = Rows::new();
+    removes.retain(|row, diff| {
+        if *diff < 0 { adds.insert(row.clone(), -*diff); }
+        *diff > 0
+    });
+    (removes, adds)
 }
 
 /// `entries` with some rows removed and others added.
@@ -603,12 +616,12 @@ fn a_round_makes_what_the_rules_make() {
         (vec![
             (20, None, vec![(1, 0, 9, 12)]),                    // refused: stale, by its number
             (21, Some(101), vec![(4, 1, 5, 5)]),                // refused: empty
-            (22, None, vec![(5, 0, 0, 1), (5, 1, 1, 2)]),       // waits: two appends to one ledger are for the rules
+            (22, None, vec![(5, 0, 0, 1), (5, 1, 1, 2)]),       // refused: two appends to one ledger, which the rules alone would make
             (23, Some(100), vec![(2, 1, 7, 9)]),
             (24, Some(101), vec![(3, 1, 7, 9)]),                // refused: barred, as the runner of another computation
             (25, None, vec![(8, 0, 0, 4)]),                     // refused: stale, by its lower
             (26, None, vec![(6, 0, 0, 3)]),
-        ], &[22], &[20, 21, 24, 25]),
+        ], &[], &[20, 21, 22, 24, 25]),
         (vec![
             (30, None, vec![(9, 1, 3, 5)]),                     // the clock, before its follower
             (31, None, vec![(8, 0, 3, 4)]),                     // waits: transaction 30 appends to the clock that ledger 8 reads
@@ -639,6 +652,13 @@ fn a_round_makes_what_the_rules_make() {
             };
             let mut made = Vec::new();
             for (tx, who, appends) in asked.iter().filter(|(tx, _, _)| !waiting.contains(tx)) {
+                // A round takes appends as frames it does not open, so it refuses a transaction that appends to one
+                // ledger twice, which would otherwise wait in every round. The rules alone would make it.
+                let ledgers: BTreeSet<i64> = appends.iter().map(|(ledger, _, _, _)| *ledger).collect();
+                if ledgers.len() < appends.len() {
+                    assert!(refused.contains(tx), "a round refuses transaction {tx}, which appends to one ledger twice");
+                    continue;
+                }
                 let mut trial = entries.clone();
                 let alone = transact(&system, &mut trial, &actor(who), &commands(appends), workers).is_empty();
                 assert_eq!(alone, !refused.contains(tx), "the round and the rules disagree on transaction {tx}");

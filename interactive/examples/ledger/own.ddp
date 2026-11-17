@@ -1,0 +1,33 @@
+-- Each ledger's own hold: the frontier from which its readers are promised they can read it in full.
+--
+-- It is a `Hold` entry whose holder is (0, 0). A new use of a ledger must begin at or after it (readers.ddp), and a
+-- merge may take spans out only if it is held from at or before it (pass.ddp). It moves by a transaction that
+-- releases it and holds it again, later; the rules refuse that if a reader needs the ledger from before.
+--
+--   input 0, entries : ((entry), ())
+--
+--   holds : ((ledger), (frontier))
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let entries = input 0 : ((Entry), ());
+let held = entries((Hold((key, val))), ()) | map(((key, val), ()) -> (key, val));
+output "holds" = held | filter(((holder, _), _) -> (holder, (0, 0)) eq) | map(((_, ledger), (frontier)) -> ((ledger), (frontier)));
