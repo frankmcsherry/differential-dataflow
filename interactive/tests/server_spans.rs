@@ -21,6 +21,13 @@ fn span(rows: &[(i64, i64, u64, i64)]) -> (Updates, Vec<u64>) {
     (decoder.finish(), rows.iter().map(|row| row.2).collect())
 }
 
+/// Move one input, and then run until the outputs have caught up: `advance` and then `spin`.
+fn advance(server: &mut Server, worker: &mut timely::worker::Worker, prog: &str, input: usize, time: &HostTime) -> Result<(), String> {
+    server.advance(prog, input, time)?;
+    server.spin(worker);
+    Ok(())
+}
+
 /// The first coordinate of a time.
 fn first(time: &HostTime) -> u64 {
     time.get(0).copied().unwrap_or(0)
@@ -52,11 +59,11 @@ fn spans_on(workers: usize) {
         assert!(contents(&mut server, worker, "p::both").is_empty(), "nothing is complete at the start");
 
         // One input moves, and the other stays: the output is complete before the least of them.
-        server.advance(worker, "p", 0, &host_time(2)).unwrap();
+        advance(&mut server, worker, "p", 0, &host_time(2)).unwrap();
         assert_eq!(first(server.input_frontier("p", 0).unwrap()), 2);
         assert_eq!(first(server.input_frontier("p", 1).unwrap()), 0);
         assert!(contents(&mut server, worker, "p::both").is_empty(), "input 1 is still at 0");
-        server.advance(worker, "p", 1, &host_time(1)).unwrap();
+        advance(&mut server, worker, "p", 1, &host_time(1)).unwrap();
         if w0 { assert_eq!(contents(&mut server, worker, "p::both"), [(1, 10, 1), (1, 100, 1)], "time 0"); } else { contents(&mut server, worker, "p::both"); }
 
         // `tick` moves neither input, and does not wait for the output at the epoch.
@@ -66,10 +73,10 @@ fn spans_on(workers: usize) {
         assert_eq!(first(server.input_frontier("p", 1).unwrap()), 1);
 
         // The trace compacts to just before its frontier, not to the epoch.
-        server.advance(worker, "p", 1, &host_time(4)).unwrap();
+        advance(&mut server, worker, "p", 1, &host_time(4)).unwrap();
         assert_eq!(server.trace_since("p::both").map(first), Some(1));
         if w0 { assert_eq!(contents(&mut server, worker, "p::both"), [(1, 10, 1), (1, 100, 1), (2, 20, 1)], "times 0 and 1"); } else { contents(&mut server, worker, "p::both"); }
-        server.advance(worker, "p", 0, &host_time(5)).unwrap();
+        advance(&mut server, worker, "p", 0, &host_time(5)).unwrap();
         assert_eq!(server.trace_since("p::both").map(first), Some(3));
         if w0 { assert_eq!(contents(&mut server, worker, "p::both"), [(1, 100, 1), (2, 20, 1), (2, 200, 1), (3, 30, 1)], "times 0 to 3"); } else { contents(&mut server, worker, "p::both"); }
 
@@ -77,14 +84,14 @@ fn spans_on(workers: usize) {
         let (columns, times) = span(&[(7, 70, 5, 1), (8, 80, 4, 1)]);
         let error = server.feed_span("p", 0, columns, times).unwrap_err();
         assert_eq!(error, "cannot feed at time 4: input \"p\"/0 stands at 5");
-        let error = server.advance(worker, "p", 0, &host_time(3)).unwrap_err();
+        let error = advance(&mut server, worker, "p", 0, &host_time(3)).unwrap_err();
         assert_eq!(error, "cannot advance input \"p\"/0 to 3: it stands at 5");
 
         // A program that `tick` moves is not advanced, and a piloted one is not bound at ticks.
         let one = program(r#"output "rows" = input 0 : ((int), (int));"#);
         server.install(worker, "ticked", &one).unwrap();
         assert!(!server.is_piloted("ticked"));
-        assert!(server.advance(worker, "ticked", 0, &host_time(9)).unwrap_err().contains("`tick` moves this program's inputs"));
+        assert!(advance(&mut server, worker, "ticked", 0, &host_time(9)).unwrap_err().contains("`tick` moves this program's inputs"));
         assert!(server.bind(worker, "p::both", "ticked", 0).unwrap_err().contains("piloted"));
         assert!(server.bind(worker, "ticked::rows", "p", 0).unwrap_err().contains("piloted"));
 
@@ -94,10 +101,10 @@ fn spans_on(workers: usize) {
             let (columns, times) = span(&[(1, 1, 0, 1), (2, 2, 0, 1), (3, 3, 6, 1), (4, 4, 6, 2)]);
             server.feed_span("x", 0, columns, times).unwrap();
         }
-        server.advance(worker, "x", 0, &host_time(7)).unwrap();
+        advance(&mut server, worker, "x", 0, &host_time(7)).unwrap();
         if w0 { assert_eq!(contents(&mut server, worker, "x::rows").len(), 4); } else { contents(&mut server, worker, "x::rows"); }
         server.load(worker, "x", 0, "x::rows", -1).unwrap();
-        server.advance(worker, "x", 0, &host_time(8)).unwrap();
+        advance(&mut server, worker, "x", 0, &host_time(8)).unwrap();
         assert!(contents(&mut server, worker, "x::rows").is_empty());
 
         // A program that imports a piloted trace is piloted, reads it from where it is complete,
@@ -107,14 +114,14 @@ fn spans_on(workers: usize) {
         assert!(error.contains("must be installed piloted"), "{error}");
         server.install(worker, "c", &tens).unwrap();
         assert!(server.is_piloted("c"));
-        server.advance(worker, "p", 1, &host_time(5)).unwrap();
+        advance(&mut server, worker, "p", 1, &host_time(5)).unwrap();
         if w0 { assert_eq!(contents(&mut server, worker, "c::tens"), [(1, 1000, 1), (2, 200, 1), (2, 2000, 1), (3, 300, 1)]); } else { contents(&mut server, worker, "c::tens"); }
         if w0 {
             let (columns, times) = span(&[(9, 90, 6, 1)]);
             server.feed_span("p", 0, columns, times).unwrap();
         }
-        server.advance(worker, "p", 0, &host_time(8)).unwrap();
-        server.advance(worker, "p", 1, &host_time(8)).unwrap();
+        advance(&mut server, worker, "p", 0, &host_time(8)).unwrap();
+        advance(&mut server, worker, "p", 1, &host_time(8)).unwrap();
         assert_eq!(server.trace_since("c::tens").map(first), Some(7));
         if w0 { assert_eq!(contents(&mut server, worker, "c::tens"), [(1, 1000, 1), (2, 200, 1), (2, 2000, 1), (3, 300, 1), (9, 900, 1)]); } else { contents(&mut server, worker, "c::tens"); }
     })

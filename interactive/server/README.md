@@ -46,7 +46,7 @@ generates one. Responses are `<id> data ...`, followed by `<id> ok ...` or
 Between commands, blank lines and `#` comment lines are skipped, so command
 scripts can be piped to stdin (see `demo/`).
 
-The useful commands are `load`, `drop`, `list`, `feed`, `advance`, `bind`, `unbind`,
+The useful commands are `load`, `drop`, `list`, `feed`, `advance`, `spin`, `bind`, `unbind`,
 `peek`, `tail`, `stop`, `tick`, and `exit`. `load <name> from <path>` installs
 a program file (`.ddp`, pipe syntax); `load <name> from <path>
 explain` applies the explanation rewrite first (`explain=debug` also taps
@@ -211,7 +211,7 @@ every replay. Identity is convention, not enforcement: we are not defending
 against adversarial clients yet, and server-side attribution is deliberately
 deferred until a deployment needs it.
 
-## Spans: `load … piloted` and `advance`
+## Spans: `load … piloted`, `advance` and `spin`
 
 A program loaded with the option `piloted` is moved through time by its client, and not by `tick`:
 
@@ -240,10 +240,16 @@ A single row of text takes `time=<t>`, as it always has.
 moves one input to `time`, alone.
 No other input moves, of this program or of any other.
 The input takes nothing before `time` afterwards, and does not move back.
+`advance` waits for nothing: it is answered once the input has moved.
+
+    spin
+
+runs until every piloted program's outputs have caught up with their inputs, and every `tail` has sent the changes that followed.
+A client that moves many inputs sends an `advance` for each, and then one `spin`.
+With 1,000 small programs in one server, a `spin` after each `advance` took 2.1 s for the 1,000, and one `spin` after them all took 85 ms.
 
 The program's outputs are complete before the least of the times its inputs stand at.
-`advance` is answered once every piloted program's outputs have caught up with that, and every `tail` has sent the changes it made.
-`peek` reads what is complete.
+`peek` reads what is complete, and waits for it by itself.
 A binary `tail` sends each change at its time, and `progress` as that least time moves.
 `feed <prog> <in> from <trace>` reads a piloted program's trace as what is complete, and feeds it at the time the input stands at.
 A piloted program's traces compact to just before that least time, as the others compact to just before the epoch, so a `tail` started late sees earlier changes at that time.

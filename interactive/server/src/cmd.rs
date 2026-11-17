@@ -168,6 +168,8 @@ pub enum Cmd {
         prog: String,
         input: InputId,
     },
+    /// Wait until every piloted program's outputs have caught up with their inputs. `spin`.
+    Spin,
     /// Advance ambient time by `n` (default 1).
     Tick { n: u64 },
     /// End the session.
@@ -275,6 +277,7 @@ pub fn prepare(command: Cmd, catalog: &Catalog) -> Result<PreparedCommand, Strin
         Cmd::Source { prog, input, source, diff } => ServerCommand::Load { prog, input, source, diff },
         Cmd::Bind { trace, prog, input } => ServerCommand::Bind { trace, prog, input },
         Cmd::Unbind { trace, prog, input } => ServerCommand::Unbind { trace, prog, input },
+        Cmd::Spin => ServerCommand::Spin,
         Cmd::Tick { n } => ServerCommand::Tick { n },
         Cmd::Exit => ServerCommand::Exit,
     };
@@ -371,7 +374,7 @@ pub struct LineParser {
 /// instead of an explicit reqid, the parser synthesizes a reqid.
 const COMMAND_KEYWORDS: &[&str] = &[
     "load", "plan", "drop", "list", "peek", "tail", "stop", "tick", "exit", "feed", "bind",
-    "unbind", "advance",
+    "unbind", "advance", "spin",
 ];
 
 /// Program-size gate: a `load` body larger than this is rejected at intake,
@@ -904,6 +907,10 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                 tail_reqid: (*rid).to_string(),
             }),
             _ => ParseOutcome::Err("stop: expected `<tail-reqid>`".into()),
+        },
+        "spin" => match args {
+            [] => ParseOutcome::Cmd(Cmd::Spin),
+            _ => ParseOutcome::Err("spin: expected no arguments".into()),
         },
         "tick" => match args {
             [] => ParseOutcome::Cmd(Cmd::Tick { n: 1 }),

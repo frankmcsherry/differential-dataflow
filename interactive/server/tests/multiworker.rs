@@ -708,14 +708,14 @@ fn assert_spans(workers: usize) {
     framed(&mut writer, &mut reader, "f", &format!("f feed p a frame {}\n", a.len()), &a).unwrap();
     framed(&mut writer, &mut reader, "f", &format!("f feed p::b frame {}\n", b.len()), &b).unwrap();
     let mut advance = |writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, command: &str| {
-        request_observing(writer, reader, "a", &format!("a advance {command}\n"), |line, payload| keep_frame(&mut frames, "w", line, payload));
+        request_observing(writer, reader, "s", &format!("a advance {command}\ns spin\n"), |line, payload| keep_frame(&mut frames, "w", line, payload));
         heard(&mut frames)
     };
 
     // Input `b` is still at 0, so nothing is complete.
     assert!(advance(&mut writer, &mut reader, "p a 2").0.is_empty());
     assert!(request(&mut writer, &mut reader, "p", "p peek p::both\n").is_empty());
-    // Time 0 is complete once `b` passes it. The changes come before the advance is answered.
+    // Time 0 is complete once `b` passes it. The changes come before the `spin` after it is answered.
     assert_eq!(advance(&mut writer, &mut reader, "p::b 1"), (vec!["time=0 diff=1 key=tuple(1) val=tuple(10)".into(), "time=0 diff=1 key=tuple(1) val=tuple(100)".into()], Some(1)));
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek p::both\n"), ["tuple(1) val=tuple(10)", "tuple(1) val=tuple(100)"]);
     // `a` is at 2 and `b` at 4: time 1 is complete.
@@ -773,7 +773,7 @@ fn tick_leaves_piloted_inputs_alone() {
     // After seven ticks the piloted input still takes a span from time 0 on.
     let early = span_frame(&shape, &[("1", Some("10"), 1, 0), ("2", Some("20"), 1, 3)]);
     framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", early.len()), &early).unwrap();
-    request_observing(&mut writer, &mut reader, "a", "a advance p 0 2\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    request_observing(&mut writer, &mut reader, "s", "a advance p 0 2\ns spin\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
     assert_eq!(heard(&mut frames), (vec!["time=0 diff=1 key=tuple(1) val=tuple(10)".into()], Some(2)));
     request_observing(&mut writer, &mut reader, "t", "t tick\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek p::rows\n"), ["tuple(1) val=tuple(10)"], "a tick does not complete time 3");
@@ -803,7 +803,7 @@ fn assert_tail_frames_feed_on(workers: usize) {
     let shape = declared("((int, List(int)), Option(int))");
     let first = span_frame(&shape, &[("tuple(1,list(2,3))", Some("inject(1,7)"), 1, 0), ("tuple(2,list())", Some("inject(0,tuple())"), 2, 0), ("tuple(3,list(4))", Some("inject(1,-1)"), 1, 2)]);
     framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", first.len()), &first).unwrap();
-    request(&mut writer, &mut reader, "a", "a advance p 0 1\n");
+    request(&mut writer, &mut reader, "s", "a advance p 0 1\ns spin\n");
 
     // The tail's replay is time 0, and what follows is each later change. Each frame goes to `q`
     // as it came.
@@ -821,21 +821,21 @@ fn assert_tail_frames_feed_on(workers: usize) {
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(rows.iter().all(|row| row.starts_with("time=0 ")), "a frame says its times, zero included: {rows:?}");
     assert_eq!(progress, Some(1));
-    request(&mut writer, &mut reader, "a", "a advance q 0 1\n");
+    request(&mut writer, &mut reader, "s", "a advance q 0 1\ns spin\n");
     let at_zero = request(&mut writer, &mut reader, "p", "p peek p::rows\n");
     assert_eq!(at_zero.len(), 2);
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::rows\n"), at_zero);
 
     let second = span_frame(&shape, &[("tuple(1,list(2,3))", Some("inject(1,7)"), -1, 4), ("tuple(5,list())", Some("inject(1,0)"), 1, 6)]);
     framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", second.len()), &second).unwrap();
-    request_observing(&mut writer, &mut reader, "a", "a advance p 0 5\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    request_observing(&mut writer, &mut reader, "s", "a advance p 0 5\ns spin\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
     let (rows, progress) = pass_on(&mut writer, &mut reader, &mut frames);
     assert_eq!(rows.len(), 2, "times 2 and 4: {rows:?}");
     assert_eq!(progress, Some(5));
     // `q` is fed times 2 and 4 while it stands at 1, and is complete through 4 once it passes it.
-    request(&mut writer, &mut reader, "a", "a advance q 0 3\n");
+    request(&mut writer, &mut reader, "s", "a advance q 0 3\ns spin\n");
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::rows\n").len(), 3, "time 2");
-    request(&mut writer, &mut reader, "a", "a advance q 0 5\n");
+    request(&mut writer, &mut reader, "s", "a advance q 0 5\ns spin\n");
     let through_four = request(&mut writer, &mut reader, "p", "p peek p::rows\n");
     assert_eq!(through_four.len(), 2);
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::rows\n"), through_four);
@@ -850,7 +850,7 @@ fn assert_tail_frames_feed_on(workers: usize) {
 
     // Everything `q`'s input holds is taken back from its own output, at the input's time.
     request(&mut writer, &mut reader, "r", "r feed q 0 from q::rows diff=-1\n");
-    request(&mut writer, &mut reader, "a", "a advance q 0 6\n");
+    request(&mut writer, &mut reader, "s", "a advance q 0 6\ns spin\n");
     assert!(request(&mut writer, &mut reader, "p", "p peek q::rows\n").is_empty());
     assert!(fed >= 2);
     request(&mut writer, &mut reader, "s", "s stop w\n");
@@ -879,7 +879,7 @@ fn a_bound_consumer_follows_a_piloted_producer() {
     let shape = declared("((int), (int))");
     let first = span_frame(&shape, &[("1", Some("10"), 1, 0), ("2", Some("20"), 1, 1), ("3", Some("30"), 1, 5)]);
     framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", first.len()), &first).unwrap();
-    request(&mut writer, &mut reader, "a", "a advance p 0 3\n");
+    request(&mut writer, &mut reader, "s", "a advance p 0 3\ns spin\n");
 
     let mut answer = Vec::new();
     request_observing(&mut writer, &mut reader, "c", "c load c rows=p::rows begin\nlet rows = input \"rows\" : ((int), (int));\noutput \"tens\" = rows | map((k, (v)) -> (k, ((v, 10) mul)));\nc end-load\n", |line, _| answer.push(line.to_string()));
@@ -893,7 +893,7 @@ fn a_bound_consumer_follows_a_piloted_producer() {
     assert_eq!(progress, Some(3));
     let second = span_frame(&shape, &[("1", Some("10"), -1, 7)]);
     framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", second.len()), &second).unwrap();
-    request_observing(&mut writer, &mut reader, "a", "a advance p 0 9\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    request_observing(&mut writer, &mut reader, "s", "a advance p 0 9\ns spin\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
     assert_eq!(heard(&mut frames), (vec!["time=5 diff=1 key=tuple(3) val=tuple(300)".into(), "time=7 diff=-1 key=tuple(1) val=tuple(100)".into()], Some(9)));
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek c::tens\n"), ["tuple(2) val=tuple(200)", "tuple(3) val=tuple(300)"]);
     // The producer cannot be dropped while the consumer reads it, as for any import.

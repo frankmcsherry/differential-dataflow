@@ -67,12 +67,12 @@ impl Server {
     }
 
     /// Move one input of a piloted program to `time`, alone: no other input moves, of this
-    /// program or of any other. Then run until every piloted program's outputs have caught up
-    /// with their inputs, and let those outputs compact. Collective across workers.
+    /// program or of any other. This does not wait for what follows from it: [`Server::spin`]
+    /// does, once, for as many inputs as were moved. Collective across workers.
     ///
     /// The input must be at or before `time`. What was fed to it at times before `time` takes
     /// effect; nothing may be fed to it before `time` afterwards.
-    pub fn advance(&mut self, worker: &mut Worker, prog: &str, input: usize, time: &HostTime) -> Result<(), String> {
+    pub fn advance(&mut self, prog: &str, input: usize, time: &HostTime) -> Result<(), String> {
         if !self.is_piloted(prog) {
             return Err(format!("cannot advance input {prog:?}/{input}: `tick` moves this program's inputs; install it piloted to move them one at a time"));
         }
@@ -80,10 +80,12 @@ impl Server {
         if !frontier.less_equal(time) {
             return Err(format!("cannot advance input {prog:?}/{input} to {}: it stands at {}", coordinates(time), coordinates(frontier)));
         }
-        self.advance_input(prog, input, time)?;
-        self.settle_piloted(worker);
-        Ok(())
+        self.advance_input(prog, input, time)
     }
+
+    /// Run until every piloted program's outputs have caught up with their inputs, and let
+    /// those outputs compact. Collective across workers.
+    pub fn spin(&mut self, worker: &mut Worker) { self.settle_piloted(worker); }
 
     /// Run until every piloted program's outputs have caught up with what was commanded, then
     /// let each compact to just before its frontier, as `tick` compacts the rest to just before

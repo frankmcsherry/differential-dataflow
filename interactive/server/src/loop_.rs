@@ -360,12 +360,17 @@ fn dispatch(
                     logical_count.expect("a span retains its logical row count"),
                 ))
             }),
-            // Collective: every worker moves its own handle, and waits for what follows from it.
+            // Collective: every worker moves its own handle. Nothing is waited for.
             ServerCommand::Advance { prog, input, time } => server.input_position(&prog, &input).and_then(|input| {
-                server.advance(worker, &prog, input, &host_time(time))?;
-                settle_tails(server, tails, worker);
+                server.advance(&prog, input, &host_time(time))?;
                 Ok(format!("advanced {prog:?} input {input} to {time}"))
             }),
+            // Collective: every worker runs until the piloted outputs, and the tails, have caught up.
+            ServerCommand::Spin => {
+                server.spin(worker);
+                settle_tails(server, tails, worker);
+                Ok("spun".to_string())
+            }
             // Collective: every worker sources its own shard.
             ServerCommand::Load { prog, input, source, diff } => server.input_position(&prog, &input).and_then(|input| {
                 let local = server.loads_from_trace(&source);

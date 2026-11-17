@@ -244,6 +244,8 @@ pub enum Command {
         source: String,
         diff: Diff,
     },
+    /// Run until every piloted program's outputs have caught up with their inputs (see [`Server::spin`]).
+    Spin,
     /// Close `n` epochs, running to quiescence after each one.
     Tick { n: u64 },
     /// Drop the named program.
