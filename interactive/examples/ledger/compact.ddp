@@ -5,10 +5,10 @@
 --
 --   merge  : ((shard), (ledger, from, to, since, lower, upper))   the merge to make next of a ledger, if there is one,
 --                                                                 with where the merged span begins and ends
---   parts  : ((shard), (ledger, from, to, since, batch, need, shape))   the spans to read for it, in order: those of its spans
+--   parts  : ((shard), (ledger, from, to, since, batch, need, shape))   the spans to read for it, in order: those of its chain
 --                                                                 whose batch is not empty (inline, or in blobs), with what the merged span is to be held from,
 --                                                                 and the shape of the ledger's rows
---   leaves : ((shard), (ledger, entry))                           the entries it takes out of the state, whole
+--   leaves : ((shard), (ledger, entry))                           the entries it takes out of the state, whole: every span within it
 --
 -- All three are under a shard, one of 64 by the ledger's id. A compactor hands `merge` and `leaves` to the keeper as
 -- frames, unopened, and a frame may be too large to hand over. It then asks for them a few shards at a time.
@@ -90,13 +90,54 @@ let wanted = asks | reduce((_id, rows) ->
                       (seen, (seen, sofar, frontier) select)) select) in
                  ((least.1), 1) enlist);
 
--- THE CHAIN. THIS IS A SCRATCH VARIANT, for a keeper that holds each ledger's spans as one chain and judges every
--- merge against it (see pass.ddp): a merge takes out everything it covers, so no span stands beside another.
--- So every span is of the chain, and the chain is not looked for: LINK is each span, by the number it begins at.
+-- THE CHAIN. A ledger may hold its appends more than once: a merge may stand beside the spans it covers (pass.ddp).
+-- So a merge makes two choices, and they are kept apart. What the merged batch is read from is one path of spans,
+-- the CHAIN, from the ledger's first append to its version, each usable at WANTED: no update is read twice (PARTS).
+-- What the merge takes out is every span of the ledger within what it covers, on the chain or beside it (LEAVES).
 -- All that follows is written so that an append costs a few rows, and a pass a few rows for each span it takes out,
 -- however many spans a ledger has: when compaction is behind, the policy must not get slower, or it never catches up.
-let link = spans | filter(((_, from, to, _), _) -> (from, to) lt)
-                 | map(((id, from, to, since), (lower, upper, batch)) -> ((id, from), (to, since, lower, upper, batch)));
+--
+-- HOPS is each span usable at WANTED, as a step from one number to another, as in instance.ddp. A span whose since is
+-- at or before its lower is PLAIN, and usable from anywhere. The rest are PACKED, by a merge, and one is usable when
+-- its since is at or before WANTED joined with its lower. The two are kept apart because only the packed are asked
+-- of WANTED, which moves.
+let strides = spans | filter(((_, from, to, _), _) -> (from, to) lt);
+let plain = strides | filter(((_, _, _, since), (lower, _, _)) -> (since, lower) call frontier_le)
+                    | map(((id, from, to, since), (lower, upper, batch)) -> ((id, from), (to, since, lower, upper, batch)));
+let packed = strides | filter(((_, _, _, since), (lower, _, _)) -> ((since, lower) call frontier_le, 0) eq)
+                     | map(((id, from, to, since), (lower, upper, batch)) -> ((id), (from, to, since, lower, upper, batch)))
+                     | join(wanted, ((id), (from, to, since, lower, upper, batch), (need)) -> ((id, from), (to, since, lower, upper, batch, need)))
+                     | filter((_, (_, since, lower, _, _, need)) -> (since, (need, lower) call frontier_join) call frontier_le)
+                     | map((place, (to, since, lower, upper, batch, _)) -> (place, (to, since, lower, upper, batch)));
+let hops = plain + packed | distinct;
+-- DEAD is each number from which hops do not lead to the ledger's version: it is not the version, and every hop that
+-- leaves it goes to a dead number. An append makes no number dead, so this changes little as a ledger grows.
+let tops = version | map(((id), (last)) -> ((id, last), ()));
+let leaving = hops | map((place, _) -> (place, ()));
+let places = leaving + (hops | map(((id, _), (to, _, _, _, _)) -> ((id, to), ()))) + tops | distinct;
+let left = leaving | distinct;
+let halts = places - (places | join(left, (place, (), ()) -> (place, ()))) - tops;
+let ways = leaving | count;
+let back = hops | map(((id, from), (to, _, _, _, _)) -> ((id, to), (from)));
+leading: {
+    let lost = back | join(dead, ((id, _), (from), ()) -> ((id, from), ())) | count;
+    let spent = lost | join(ways, (place, astray, leave) -> (place, (astray, leave)))
+                     | filter((_, (astray, leave)) -> (astray, leave) eq)
+                     | map((place, _) -> (place, ()));
+    set dead = halts + spent | distinct;
+}
+-- BEST is, from each number, the hop to take: of those that go to a number that is not dead, the one that goes
+-- furthest. The hops from a number are handed over in order, and the last is kept.
+let onward = hops | map(((id, from), (to, since, lower, upper, batch)) -> ((id, to), (from, since, lower, upper, batch)));
+let best = onward - (onward | join(leading::dead, (place, step, ()) -> (place, step)))
+         | map(((id, to), (from, since, lower, upper, batch)) -> ((id, from), (to, since, lower, upper, batch)))
+         | reduce((_place, steps) -> ((steps len, 1) sub enlist, steps) gather map ((step, _count) -> (step, 1)));
+-- LINK is each span of the chain, by the number it begins at: the best hops, taken one after another from 0.
+walking: {
+    let next = at | join(best, ((id, _), (), (to, _, _, _, _)) -> ((id, to), ()));
+    set at = (wanted | map(((id), _) -> ((id, 0), ()))) + next | distinct;
+}
+let link = walking::at | join(best, (place, (), (to, since, lower, upper, batch)) -> (place, (to, since, lower, upper, batch)));
 
 -- THE MERGE. A span of the chain is heavy when the appends after it are half as many as its own, or more,
 -- and it and they make `least` appends, here 4. The oldest heavy span is where the merge begins.
@@ -186,11 +227,11 @@ let picked = offer | reduce((_shard, offers) ->
 output "merge" = picked;
 -- TAKEN is each merge that is offered, by its ledger, with its shard and what the merged span is to be held from.
 let taken = picked | map(((shard), (id, _, _, need, _, _)) -> ((id), (shard, need)));
--- SENT is each span that an offered merge takes out, with the merge's shard: the spans are looked up once for both views.
+-- SENT is each span of the chain that an offered merge covers, with the merge's shard.
 let sent = kept | join(taken, ((id), (from, to, since, lower, upper, batch), (shard, need)) ->
                            ((shard), (id, from, to, since, lower, upper, batch, need)));
 
--- PARTS is the spans that an offered merge takes out and a compactor must read: those whose batch is not empty.
+-- PARTS is the spans of the chain that an offered merge covers and a compactor must read: those whose batch is not empty.
 -- A span's batch is its updates kept in the entry (inline), or the parts of blobs it names. One with no updates gives the merged batch nothing.
 -- With each, the shape of the ledger's rows: the compactor merges the parts in a server of its own, which is told it.
 let shapes = ledgers | map((id, (shape, _, _, _, _)) -> (id, (shape)));
@@ -198,7 +239,18 @@ output "parts" = sent((shard), (id, from, to, since, _, _, batch, need)) * shape
                | filter(((_, _, _, _, _, batch, _, _), ()) -> batch match (Empty (_ -> 0), Inline (_ -> 1), Blob (_ -> 1)))
                | map(((shard, id, from, to, since, batch, need, shape), ()) -> ((shard), (id, from, to, since, batch, need, shape)));
 
--- LEAVES is each span an offered merge takes out, as the entry it is, whole.
+-- LEAVES is each span an offered merge takes out, as the entry it is, whole, and once: every span of the ledger
+-- within what the merge covers, whether it is of the chain or stands beside it. Those spans begin in the blocks the
+-- merge's spans begin in (NEAR), so they are found there. A span beside the chain adds to how many the merge takes
+-- out, and is not counted in what a shard offers.
 -- A compactor hands these to the keeper as frames, as it was given them, and does not open them.
-output "leaves" = sent | map(((shard), (id, from, to, since, lower, upper, batch, _)) ->
-                             ((shard), (id, ((id, from, to, since), (lower, upper, batch)) inject Span)));
+let every = strides | map(((id, from, to, since), (lower, upper, batch)) -> ((id, from shr_b64 6), (from, to, since, lower, upper, batch)));
+let nearby = near | map((place, _) -> (place, ())) | distinct
+                  | join(every, ((id, _), (), (from, to, since, lower, upper, batch)) -> ((id), (from, to, since, lower, upper, batch)));
+let covers = picked | map(((shard), (id, from, to, _, _, _)) -> ((id), (shard, from, to)));
+output "leaves" = nearby | join(covers, ((id), (from, to, since, lower, upper, batch), (shard, first, last)) ->
+                                        ((shard), (id, from, to, since, lower, upper, batch, first, last)))
+                         | filter((_, (_, from, to, _, _, _, _, first, last)) -> ((first, from) le, (to, last) le) all)
+                         | map(((shard), (id, from, to, since, lower, upper, batch, _, _)) ->
+                               ((shard), (id, ((id, from, to, since), (lower, upper, batch)) inject Span)))
+                         | distinct;
