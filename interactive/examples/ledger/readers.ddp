@@ -1,7 +1,7 @@
 -- A new reader, against the merges that were made: a rule for a keeper that holds no spans.
 --
 -- A reader of a ledger begins from some frontier: a holder from what it holds, and a computation from where its outputs
--- stand (NEEDS, in system.ddp). The ledger must be readable from there. With the spans in hand that is the rule
+-- stand (NEEDS, in needs.ddp). The ledger must be readable from there. With the spans in hand that is the rule
 -- `forgotten` of system.ddp, which asks whether the spans a reader from that frontier can use join up.
 -- This keeper has no spans. It keeps each ledger's own hold (own.ddp), the frontier from which every reader of the ledger
 -- is promised it can read it. A merge that takes spans out must be held from at or before it (pass.ddp), and it only
@@ -11,12 +11,13 @@
 -- This refuses every reader that `forgotten` refuses. It may refuse one that `forgotten` would let by: one from before
 -- the own hold, when no merge has yet taken out the spans it would use.
 --
--- Where the ledgers stand is read from the rows the transaction in hand would leave: the keeper's rows with the rows it
--- gives and takes (shift.ddp), through stand.ddp. So a ledger it registers stands at its start joined with where its
--- clock stands, and that clock may be registered by the same transaction.
+-- What each ledger is needed from is NEEDS (needs.ddp), with where the ledgers stand read from the rows the transaction
+-- in hand would leave: the keeper's rows with the rows it gives and takes (shift.ddp), through stand.ddp. So a ledger it
+-- registers stands at its start joined with where its clock stands, and that clock may be registered by the same
+-- transaction.
 --
 --   input 0, config   : ((entry), ())                     the configuration the transaction in hand would make
---   input 1, standing : ((ledger), (version, frontier))   where each durable ledger would stand after the transaction
+--   input 1, needs    : ((source), (computation, target, frontier))   what each ledger is needed from, after the transaction
 --   input 2, floors   : ((ledger), (frontier))            each ledger's own hold, as the transaction in hand would leave it
 --   input 3, before   : ((ledger), (frontier))            each ledger's own hold before the transaction
 --
@@ -45,37 +46,15 @@ enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
            | Hold ((Id, Id), (Frontier));
 
 let config = input 0 : ((Entry), ());
-let standing = input 1 : ((Id), (int, Frontier));
+let needs = input 1 : ((Id), (Id, Id, Frontier));
 let floors = input 2 : ((Id), (Frontier));
 let before = input 3 : ((Id), (Frontier));
 
--- WHAT EACH LEDGER IS NEEDED FROM: NEEDS of system.ddp, with where the ledgers stand read from the rows.
+-- ASKS is each need of a ledger: what a computation needs of it, and what a holder asks.
 let table = config | distinct;
 let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
-let computations = table((Computation((key, val))), ()) | map(((key, val), ()) -> (key, val));
 let holds = table((Hold((key, val))), ()) | map(((key, val), ()) -> (key, val));
-let derived = ledgers((id), (_, _, _, _, Derived)) | distinct;
-let ins = computations | flatmap(((computation), (_, inputs, _)) ->
-              (computation, ((0, inputs len) range, inputs) zip) cap_list
-              map ((computation, (position, input)) -> ((computation, position), (input))));
-let outs = computations | flatmap(((computation), (_, _, outputs)) ->
-               (computation, ((0, outputs len) range, outputs) zip) cap_list
-               map ((computation, (position, output)) -> ((computation, position), (output))));
-let reads = ins((computation, position), (Read(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position))) | distinct;
-let writes = outs((computation, position), (Written(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position))) | distinct;
-let relies = reads((ledger), (reader, _)) * derived((ledger), ()) * writes((ledger), (writer, _))
-           | map(((ledger, reader, writer), ()) -> ((reader), (writer, ledger)));
-let stands = writes | join(standing, ((ledger), (computation, _), (_, frontier)) -> ((computation), (ledger, frontier)));
-let pinned = holds((_, ledger), (frontier)) * derived((ledger), ()) * writes((ledger), (writer, _))
-           | map(((ledger, frontier, writer), ()) -> ((writer), (ledger, frontier)));
-resuming: {
-    let passed = relies | join(resumes, ((reader), (writer, _), (target, frontier)) -> ((writer), (target, frontier)));
-    set resumes = stands + pinned + passed | distinct;
-}
-let needs = reads | map(((ledger), (computation, _)) -> ((computation), (ledger)))
-                  | join(resuming::resumes, ((computation), (source), (_, frontier)) -> ((source), (frontier)))
-                  | distinct;
-let asks = (needs | map(((source), (need)) -> ((source), (need))))
+let asks = (needs | map(((source), (_, _, need)) -> ((source), (need))))
          + (holds | map(((_, ledger), (need)) -> ((ledger), (need))))
          | distinct;
 

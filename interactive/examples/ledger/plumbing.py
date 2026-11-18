@@ -796,10 +796,10 @@ class Client:
         answer = json.loads(http("POST", self.url + "/merges", pack(header, [proposed, leaving] + batches), timeout=600))
         if answer.get("error"): return ["error: " + answer["error"]]
         return [] if answer["made"] else ["beyond" if answer.get("beyond") else "late"]
-    def standing(self): return stands(self.peek("views::standing"))
+    def standing(self): return stands(self.peek("stand::standing"))
     def snapshot(self):
         """The entries, the standing and the plan, all of one state. Read apart, they may be of different states."""
-        entries, standing, plan = self.peek("state::entries,views::standing,views::plan")
+        entries, standing, plan = self.peek("state::entries,stand::standing,views::plan")
         return by_kind(entries), stands(standing), [row(line) for line in plan]
 
 

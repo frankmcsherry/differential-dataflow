@@ -7,7 +7,7 @@
 --   input 0, before   : ((entry), ())                 the entries before the step
 --   input 1, removes  : ((entry), ())                 the entries the step takes out, as commands.ddp gives them
 --   input 2, adds     : ((entry), ())                 the entries the step puts in
---   input 3, stood    : ((id), (version, frontier))   each ledger's standing before, as system.ddp derives it
+--   input 3, stood    : ((id), (version, frontier))   each ledger's standing before, as stand.ddp gives it
 --   input 4, stands   : ((id), (version, frontier))   each ledger's standing after
 --   input 5, actor    : ((), (actor))                 who made the change: a user, or a runner of a computation
 --

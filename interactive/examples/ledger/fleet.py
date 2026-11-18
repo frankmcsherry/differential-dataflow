@@ -36,7 +36,7 @@ HOME = 3
 REMOTE = "ledger-spike-rows"      # this tree's own folder on the other machines: the worktree's deployment is left alone
 ETCD = ",".join(f"http://{address}:2379" for _, address in MACHINES.values())
 FILES = [f"{DIR}/{name}" for name in ("plumbing.py", "keeper.py", "follower.py", "runner.py", "steward.py",
-                                      "commands.ddp", "system.ddp", "bundle.ddp", "instance.ddp", "compact.ddp", "needs.ddp", "own.ddp")] + ["target/release/ddir_server"]
+                                      "commands.ddp", "system.ddp", "bundle.ddp", "instance.ddp", "compact.ddp", "needs.ddp", "own.ddp", "index.ddp", "stand.ddp")] + ["target/release/ddir_server"]
 
 
 def ssh(machine, *options):

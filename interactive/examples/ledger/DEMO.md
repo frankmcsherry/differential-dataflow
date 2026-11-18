@@ -157,8 +157,8 @@ The keeper here holds no spans, and these were not measured again on it:
 
 The sizes of things:
 
-- **The programs, as DDIR:** 16 programs, 2,052 lines.
-- **The keeper, follower, instance, stewards and what they share, as Python:** 3,210 lines, in five files.
+- **The programs, as DDIR:** 16 programs, 1,912 lines.
+- **The keeper, follower, instance, stewards and what they share, as Python:** 3,229 lines, in five files.
 
 ## What is not shown, and why
 

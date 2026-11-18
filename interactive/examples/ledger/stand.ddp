@@ -1,8 +1,9 @@
--- Where each durable ledger stands, from the keeper's rows.
+-- Where each durable ledger stands, from the ledgers' rows.
 --
--- A keeper that holds no spans keeps one row for each ledger, which each round moves (see round.ddp, `moved`).
--- This is system.ddp's STANDING over those rows: a ledger's version, and its write frontier, which is its own
--- upper joined with the write frontier of the clock it follows, and so on up.
+-- This is the one place that says it: a ledger's version, and its write frontier, which is its own upper joined with
+-- the write frontier of the clock it follows, and so on up. An append must name both.
+-- The rows are a follower's or an instance's from its copy of the entries (index.ddp), or the keeper's own: a keeper
+-- that holds no spans keeps one row for each ledger, which each round moves (see round.ddp, `moved`).
 --
 --   input 0, own : ((id), (version, upper, following, clock, durable))   the rows, as round.ddp reads them
 --

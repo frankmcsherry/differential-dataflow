@@ -25,11 +25,13 @@ It is a prototype: the programs are real and tested, and the processes around th
 | Program | Who runs it | What it is for |
 | --- | --- | --- |
 | [`system.ddp`](system.ddp) | the keeper, a follower that audits | the state's views, and the rules a state should keep |
+| [`index.ddp`](index.ddp) | the keeper, followers, instances, the tests | each ledger's row from the entries: its version and own upper |
+| [`stand.ddp`](stand.ddp) | the keeper, followers, instances | where each durable ledger stands, from the rows |
+| [`needs.ddp`](needs.ddp) | the keeper, followers | what each computation reads and writes, and what each ledger is needed from |
 | [`step.ddp`](step.ddp) | the keeper | the rules of a change: what may not be undone |
 | [`commands.ddp`](commands.ddp) | the keeper | what each command removes and adds |
 | [`admit.ddp`](admit.ddp) | the keeper | the short check of a transaction of appends |
 | [`round.ddp`](round.ddp) | the keeper | the same check for many transactions at once |
-| [`stand.ddp`](stand.ddp) | the keeper | where each durable ledger stands, from the keeper's rows |
 | [`shift.ddp`](shift.ddp) | the keeper | the row a transaction gives a ledger it registers, or takes from one it drops |
 | [`gone.ddp`](gone.ddp) | the keeper | what leaves the keeper's tables with a dropped ledger |
 | [`own.ddp`](own.ddp) | the keeper, the policy follower, the hold steward | each ledger's own read hold |
@@ -38,8 +40,6 @@ It is a prototype: the programs are real and tested, and the processes around th
 | [`bundle.ddp`](bundle.ddp) | a follower that serves | what each instance is told, and the instances each machine has |
 | [`instance.ddp`](instance.ddp) | each instance | what to run, where to begin, and which spans to read next |
 | [`compact.ddp`](compact.ddp) | the policy follower | which spans of each ledger to merge next |
-| [`needs.ddp`](needs.ddp) | the policy follower | what each ledger is needed from |
-| [`index.ddp`](index.ddp) | the tests | what a round reads of each ledger, derived from the entries, to check the keeper's rows against |
 
 ## Checks
 

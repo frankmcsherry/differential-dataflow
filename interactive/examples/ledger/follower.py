@@ -26,12 +26,17 @@ that (see keeper.py). The keeper's own snapshots hold no spans, and are not a fo
 Standing programs on the follower's own server, for a follower that does everything (the role `all`):
   state    the entries, as the records leave them
   bundle   bundle.ddp of them: what each instance is told, and the instances each machine has
-  checked  the entries again, for the two programs below: it is brought up to `state` only when one of them is read
-  views    system.ddp of `checked`: the model's views, and its rules
-  tidy     compact.ddp of `checked`: which spans of each ledger a compactor should merge next
+  checked  the entries again, for the programs below: it is brought up to `state` only when one of them is read
+  index    index.ddp of `checked`: each ledger's row, its version and own upper
+  stand    stand.ddp of `index`: where each durable ledger stands
+  needs    needs.ddp of `checked` and `stand`: what each computation reads and writes, and what each ledger is needed from
+  views    system.ddp of `checked`, `index` and `needs`: the model's views, and its rules
+  tidy     compact.ddp of `checked` and `needs`: which spans of each ledger a compactor should merge next
+  own      own.ddp of `checked`: each ledger's own hold
 So what an instance is told of a record does not wait for the rules to be worked out for it.
 A follower may instead be started with a role, and then keeps only that role's programs (see `Follower`):
-`serve` has `state` and `bundle`; `tidy` has `checked`, needs.ddp and `tidy`; `audit` has `checked` and the rules in full.
+`serve` has `state` and `bundle`; `tidy` has `checked`, `index`, `stand`, `needs`, `tidy` and `own`; `audit` has
+`checked`, `index`, `stand`, `needs` and `views`.
 
 What a reader may ask, as one line of JSON to the port:
   {"peek": [names]}                          the rows of each view named, all of one state, as text
@@ -116,18 +121,20 @@ class Follower:
         if self.serves:
             self.server.ask(entries("state"))
             self.server.ask(f"load bundle from {DIR}/bundle.ddp input0=state::entries")
-        if role != "serve": self.server.ask(entries("checked"))
-        if role == "all":
-            self.server.ask(f"load views from {DIR}/system.ddp input0=checked::entries")
-            self.server.ask(f"load tidy from {DIR}/compact.ddp input0=checked::entries input1=views::needs")
-        if role in ("tidy", "all"):
+        if role != "serve":
+            # Each ledger's row, where it stands, and what each computation reads and writes and what each ledger is
+            # needed from: what the rules and the policy both read.
+            self.server.ask(entries("checked"))
+            self.server.ask(f"load index from {DIR}/index.ddp input0=checked::entries")
+            self.server.ask(f"load stand from {DIR}/stand.ddp input0=index::own")
+            self.server.ask(f"load needs from {DIR}/needs.ddp input0=checked::entries input1=stand::standing")
+        if role in ("all", "audit"):
+            self.server.ask(f"load views from {DIR}/system.ddp input0=checked::entries input1=index::own input2=needs::ins "
+                            "input3=needs::outs input4=needs::reads input5=needs::writes input6=needs::relies input7=needs::needs")
+        if role in ("all", "tidy"):
+            self.server.ask(f"load tidy from {DIR}/compact.ddp input0=checked::entries input1=needs::needs")
             # Each ledger's own hold, for the steward that moves them (see steward.py and own.ddp).
             self.server.ask(f"load own from {DIR}/own.ddp input0=checked::entries")
-        if role == "tidy":
-            self.server.ask(f"load needs from {DIR}/needs.ddp input0=checked::entries")
-            self.server.ask(f"load tidy from {DIR}/compact.ddp input0=checked::entries input1=needs::needs")
-        if role == "audit":
-            self.server.ask(f"load views from {DIR}/system.ddp input0=checked::entries")
         self.owed = []                      # the frames of records that `checked` does not yet have
         self.dropping = False               # whether a record among those owed dropped a ledger
         self.snapped = 0                    # the log's length at the last snapshot of the entries this follower wrote

@@ -99,7 +99,7 @@ def spawn(*args, **env):
 def up(url):
     """Wait for a keeper to answer."""
     for _ in range(600):
-        try: return Client(url).peek("views::standing")
+        try: return Client(url).peek("stand::standing")
         except (urllib.error.URLError, ConnectionError): time.sleep(0.05)
     raise RuntimeError("the keeper never came up")
 
@@ -107,7 +107,7 @@ def up(url):
 def ready(address):
     """Wait for a follower to answer."""
     for _ in range(600):
-        try: return plumbing.Follower(address).peek("views::standing")
+        try: return plumbing.Follower(address).peek("stand::standing")
         except (OSError, ValueError): time.sleep(0.05)
     raise RuntimeError("the follower never came up")
 
@@ -247,7 +247,7 @@ def main():
         def sees(instance):
             """Where an instance's own views say its ledgers stand."""
             session = plumbing.Server(runner.port((0, instance)), start=False)
-            try: return plumbing.stands(session.ask("peek local::standing"))
+            try: return plumbing.stands(session.ask("peek stand::standing"))
             finally: session.sock.close()
         check("where an instance's own views say its ledgers stand is what the model says",
               settle(lambda: sees(500) == {ledger: at for ledger, at in keeper.standing().items() if ledger in (1, 2)}), str(sees(500)))
@@ -422,7 +422,7 @@ def main():
         steward_py = os.path.join(HERE, "steward.py")
         processes["compactor"] = spawn(steward_py, "compact", URL, FOLLOWER)
         # The hold steward moves each ledger's own hold to what its readers need, rounded down, now and then.
-        processes["holder"] = spawn(steward_py, "hold", URL, FOLLOWER, "views::needs", HOLD_STEP="5", HOLD_EVERY="0.5")
+        processes["holder"] = spawn(steward_py, "hold", URL, FOLLOWER, HOLD_STEP="5", HOLD_EVERY="0.5")
         # The collector reads a follower that keeps the rules in full, and deletes only what is unnamed in a state they pass.
         processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit")
         auditor = plumbing.Follower(AUDITOR)

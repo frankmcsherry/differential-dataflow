@@ -35,9 +35,11 @@ Standing programs on one server. There is one copy of the configuration, and one
              The state is a set: an entry put in that is there already adds nothing, as in step.ddp.
              It is not fed. With no transaction in hand it is the state. It also gives the change as one collection, `delta`,
              and as what it puts in, `added`, and takes out, `removed`.
-  views      system.ddp of `trial`: the model's views and its rules. Between transactions these are of the state,
-             and with a transaction in hand they are of the state it would make. The views of spans are empty here
-             (`standing` puts every ledger at its start): where ledgers stand is read from `stand` and `later`
+  needs      needs.ddp of `trial` and `later`: what each computation reads and writes, and what each ledger is needed from
+  index      index.ddp of `trial`: each ledger's row as the entries say, which, with no spans, is at its start
+  views      system.ddp of `trial`, `index` and `needs`: the model's views and its rules. Between transactions these are
+             of the state, and with a transaction in hand they are of the state it would make. The rules over spans have
+             nothing to read here. Where ledgers stand is read from `stand` and `later`, not from `index`
   step       step.ddp: the rules of a change, of `state` and what `change` takes out of it and puts in
   admit      admit.ddp: the short check of appends
 
@@ -301,7 +303,6 @@ class Keeper:
             self.ask(f"load {name} begin\n{text}{name} end-load")
         self.ask(f"load change from {DIR}/commands.ddp input0=intake::commands input1=state::entries")
         self.ask(f"load trial input0=state::entries input1=change::adds input2=change::removes begin\n{trial}trial end-load")
-        self.ask(f"load views from {DIR}/system.ddp input0=trial::entries")
         self.ask(f"load stand from {DIR}/stand.ddp input0=rows::own")
         self.ask(f"load shift from {DIR}/shift.ddp input0=trial::added input1=trial::removed input2=rows::own")
         self.ask(f"load gone from {DIR}/gone.ddp input0=shift::dropped input1=gens::rows")
@@ -315,7 +316,14 @@ class Keeper:
                          'output "own" = own + moved;\n')
         self.ask(f"load after input0=rows::own input1=shift::moved begin\n{after}after end-load")
         self.ask(f"load later from {DIR}/stand.ddp input0=after::own")
-        self.ask(f"load readers from {DIR}/readers.ddp input0=trial::entries input1=later::standing input2=own::holds input3=owned::holds")
+        # What each computation reads and writes, and what each ledger is needed from, with where ledgers would stand.
+        self.ask(f"load needs from {DIR}/needs.ddp input0=trial::entries input1=later::standing")
+        # Each ledger's row as the entries say, for the rules over spans: the keeper's entries have no spans, so every
+        # ledger is at its start here, whatever its row in `rows` says.
+        self.ask(f"load index from {DIR}/index.ddp input0=trial::entries")
+        self.ask(f"load views from {DIR}/system.ddp input0=trial::entries input1=index::own input2=needs::ins input3=needs::outs "
+                 "input4=needs::reads input5=needs::writes input6=needs::relies input7=needs::needs")
+        self.ask(f"load readers from {DIR}/readers.ddp input0=trial::entries input1=needs::needs input2=own::holds input3=owned::holds")
         # Where ledgers stand is the rows' to say, before and after: a transaction the rules judge moves no ledger.
         self.ask(f"load step from {DIR}/step.ddp input0=state::entries input1=change::removes input2=change::adds "
                  "input3=stand::standing input4=stand::standing input5=intake::actor")
@@ -395,8 +403,8 @@ class Keeper:
         self.number += 1
 
     def read(self, name):
-        """The rows of a view, or of the entries. Where ledgers stand is asked of the rows: the rules see no span."""
-        return self.ask("peek " + ("stand::standing" if name == "views::standing" else name))
+        """The rows of a view, or of the entries."""
+        return self.ask("peek " + name)
 
     def name(self, actor, commands):
         """The checks of admission that refuse a transaction of plain appends. It is not made here, whatever they say."""
@@ -891,7 +899,7 @@ def main():
         elapsed = time.perf_counter() - begin
         check(f"{2 * steps} transactions of appends are made, each a round of one", k.fast == 2 * steps,
               f"{1000 * elapsed / (2 * steps):.2f} ms each")
-        standing = dict(row.split(" val=") for row in k.read("views::standing"))
+        standing = dict(row.split(" val=") for row in k.read("stand::standing"))
         at = f"tuple({steps},{frontier(steps)})"
         check("the three ledgers stand where they were appended to", all(standing[f"tuple({ident(l)})"] == at for l in (1, 2, 9)))
         check("the follower stands at its clock", standing[f"tuple({ident(8)})"] == f"tuple(0,{frontier(steps)})")
@@ -959,8 +967,8 @@ def main():
         # is new too, and starts at the own hold.
         said = k.transact(USER, [create(15, start=steps), create(16, clock=15), define(105, 71, [1], [16])])
         check("and one whose new output follows a new clock that starts at it, in one transaction", said == [], str(said))
-        check("the new output stands where its clock starts", plumbing.stands(k.read("views::standing")).get(16) == (0, steps),
-              str(plumbing.stands(k.read("views::standing")).get(16)))
+        check("the new output stands where its clock starts", plumbing.stands(k.read("stand::standing")).get(16) == (0, steps),
+              str(plumbing.stands(k.read("stand::standing")).get(16)))
         check("a merge held from the own hold may now take out what it covers: both versions there, the one as written and the one held from 5",
               k.merges(k.number, *frames([(1, 0, steps, steps)], [(1, span(1, 0, steps, 0)), (1, span(1, 0, steps, 5))])) == [] and k.left == 2)
         # The own hold only moves forward: that merge took out spans that a reader from before it would need.
@@ -1037,7 +1045,7 @@ def main():
               k.round([(3, USER, [append(1, t, t, t + 1)]), (4, USER, [append(2, t, t, t + 1)])]) == (set(), {3, 4}, set()))
         check("a follower waits for an append to its clock that has a lesser key",
               k.round([(1, USER, [append(9, t + 1, t + 1, t + 2)]), (2, USER, [append(8, 1, t + 1, t + 2)])]) == ({1}, set(), {2}))
-        standing = {ledger: at for ledger, at in plumbing.stands(k.read("views::standing")).items() if ledger in (1, 2, 8, 9)}
+        standing = {ledger: at for ledger, at in plumbing.stands(k.read("stand::standing")).items() if ledger in (1, 2, 8, 9)}
         check("the ledgers stand where the rounds left them",
               standing == {1: (t + 1, t + 1), 2: (t + 1, t + 1), 9: (t + 2, t + 2), 8: (1, t + 2)}, str(standing))
         # A round of frames, as askers make them (see `Client.append`): each transaction's key is its request's ticket
@@ -1055,7 +1063,7 @@ def main():
         by = plumbing.encode(plumbing.RUNNERS, [((9 * S,), ((0, 100),), 1)], timed=False)
         check("a runner's append comes with a frame that says who it is", k.judge([plumbing.encode(plumbing.APPENDS, [one(9, 0, 2, t + 1, t + 1, t + 2)], timed=False)], [by])[:3] == (set(), {}, 1))
         check("a round with a frame the server will not take judges nothing, and says which", k.judge([asks[0], b"not a frame"], [])[2] == 0 and k.spoiled == [1])
-        standing = {ledger: at for ledger, at in plumbing.stands(k.read("views::standing")).items() if ledger in (1, 2, 8, 9)}
+        standing = {ledger: at for ledger, at in plumbing.stands(k.read("stand::standing")).items() if ledger in (1, 2, 8, 9)}
         check("the ledgers stand where those rounds left them", standing == {1: (t + 2, t + 2), 2: (t + 2, t + 2), 9: (t + 2, t + 2), 8: (1, t + 2)}, str(standing))
         check("the state keeps every rule after the rounds", k.audit() == [])
         entries = sorted(k.ask("peek state::entries"))

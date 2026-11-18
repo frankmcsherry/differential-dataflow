@@ -42,8 +42,9 @@ fn rows(rows: &[(&str, &str)]) -> Rows {
     rows.iter().map(|(key, val)| ((key.to_string(), val.to_string()), 1)).collect()
 }
 
-/// The commands, the rules of a state, the rules of a step, admission, admission of a round, and the index a round reads.
-struct System { commands: Program, state: Program, step: Program, admit: Program, round: Program, index: Program }
+/// The commands, the rules of a state, the rules of a step, admission, admission of a round, the index a round reads,
+/// where each ledger stands, and what each computation reads and writes and what each ledger is needed from.
+struct System { commands: Program, state: Program, step: Program, admit: Program, round: Program, index: Program, stand: Program, needs: Program }
 fn system() -> System {
     System {
         commands: program(include_str!("../examples/ledger/commands.ddp")),
@@ -52,7 +53,23 @@ fn system() -> System {
         admit: program(include_str!("../examples/ledger/admit.ddp")),
         round: program(include_str!("../examples/ledger/round.ddp")),
         index: program(include_str!("../examples/ledger/index.ddp")),
+        stand: program(include_str!("../examples/ledger/stand.ddp")),
+        needs: program(include_str!("../examples/ledger/needs.ddp")),
     }
+}
+
+/// The views and rules of a state, as a follower keeps them: each ledger's row (index.ddp), where each stands
+/// (stand.ddp), what each computation reads and writes and what each ledger is needed from (needs.ddp), and the rest
+/// (system.ddp). The standing and the needs are among the views here, as `standing` and `needs`.
+fn views(system: &System, entries: &Rows, workers: usize) -> BTreeMap<String, Rows> {
+    let index = evaluate(&system.index, &[lines(entries)], workers);
+    let stand = evaluate(&system.stand, &[lines(&index["own"])], workers);
+    let needs = evaluate(&system.needs, &[lines(entries), lines(&stand["standing"])], workers);
+    let mut out = evaluate(&system.state, &[lines(entries), lines(&index["own"]), lines(&needs["ins"]), lines(&needs["outs"]),
+                                            lines(&needs["reads"]), lines(&needs["writes"]), lines(&needs["relies"]), lines(&needs["needs"])], workers);
+    out.insert("standing".to_string(), stand["standing"].clone());
+    out.insert("needs".to_string(), needs["needs"].clone());
+    out
 }
 
 const STATE_RULES: [&str; 28] = [
@@ -78,8 +95,8 @@ fn runner(computation: i64) -> String { format!("tuple() val=tuple(inject(1,tupl
 
 /// The rules a change breaks: those of the state after it, and those of the step from the state before it.
 fn judge(system: &System, before: &Rows, after: &Rows, actor: &str, workers: usize) -> BTreeSet<&'static str> {
-    let was = evaluate(&system.state, &[lines(before)], workers);
-    let is = evaluate(&system.state, &[lines(after)], workers);
+    let was = views(&system, before, workers);
+    let is = views(&system, after, workers);
     let (removes, adds) = change(before, after);
     let step = evaluate(&system.step, &[lines(before), lines(&removes), lines(&adds), lines(&was["standing"]), lines(&is["standing"]), vec![actor.to_string()]], workers);
     let mut broken = BTreeSet::new();
@@ -118,7 +135,7 @@ fn transact(system: &System, entries: &mut Rows, actor: &str, commands: &[String
     let mut broken = judge(system, entries, &after, actor, workers);
     if !change[UNMET].is_empty() { broken.insert(UNMET); }
     // Admission reads the standing and the bindings before, and should say what the rules say.
-    let was = evaluate(&system.state, &[lines(entries)], workers);
+    let was = views(&system, entries, workers);
     let admit = evaluate(&system.admit, &[commands, lines(&was["standing"]), lines(&was["bound"]), vec![actor.to_string()]], workers);
     if admit[DEFERRED].is_empty() {
         let admitted = ADMISSION.iter().all(|check| admit[*check].is_empty());
@@ -244,7 +261,7 @@ fn commands_change_a_system_within_its_rules() {
         let none = broken(&[]);
 
         // THE VIEWS.
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["standing"], rows(&[
             ("tuple(tuple(0,1))", "tuple(1,list(list(9)))"), ("tuple(tuple(0,2))", "tuple(1,list(list(7)))"), ("tuple(tuple(0,3))", "tuple(1,list(list(7)))"),
             ("tuple(tuple(0,4))", "tuple(1,list(list(5)))"), ("tuple(tuple(0,5))", "tuple(0,list(list(0)))"), ("tuple(tuple(0,6))", "tuple(0,list(list(0)))"),
@@ -352,20 +369,20 @@ fn commands_change_a_system_within_its_rules() {
 
         // A blob is in use while a span names it. No span of this system names one, until one is merged into a blob.
         assert!(out["blobs"].is_empty());
-        let blobbed = evaluate(&system.state, &[lines(&changed(&entries, &nothing, &span_at(1, 0, &[0], &[9], &[5], "inject(2,list(42))")))], workers);
+        let blobbed = views(&system, &changed(&entries, &nothing, &span_at(1, 0, &[0], &[9], &[5], "inject(2,list(42))")), workers);
         assert_eq!(blobbed["blobs"], rows(&[("tuple(list(42))", "tuple()")]));
 
         // Only a registered ledger has a standing.
-        let orphan = evaluate(&system.state, &[lines(&changed(&entries, &nothing, &span(77, 0, &[0], &[1])))], workers);
+        let orphan = views(&system, &changed(&entries, &nothing, &span(77, 0, &[0], &[1])), workers);
         assert_eq!(orphan["standing"], out["standing"]);
 
         // TRANSACTIONS THAT ARE MADE.
         // A name moves to another ledger, and nothing else changes.
         assert_eq!(transact(&system, &mut entries, USER, &[alias(4, 3)], workers), none);
-        assert_eq!(evaluate(&system.state, &[lines(&entries)], workers)["names"], rows(&[("tuple(list(1))", "tuple(tuple(0,1))"), ("tuple(list(4))", "tuple(tuple(0,3))")]));
+        assert_eq!(views(&system, &entries, workers)["names"], rows(&[("tuple(list(1))", "tuple(tuple(0,1))"), ("tuple(list(4))", "tuple(tuple(0,3))")]));
         // A name is removed, and its ledger is as it was.
         assert_eq!(transact(&system, &mut entries, USER, &[unalias(1)], workers), none);
-        assert_eq!(evaluate(&system.state, &[lines(&entries)], workers)["names"], rows(&[("tuple(list(4))", "tuple(tuple(0,3))")]));
+        assert_eq!(views(&system, &entries, workers)["names"], rows(&[("tuple(list(4))", "tuple(tuple(0,3))")]));
         // A ledger that nothing names, reads, writes or follows is dropped.
         assert_eq!(transact(&system, &mut entries, USER, &[drop(5)], workers), none);
         // A computation is replaced by another that writes the same ledger, in one transaction.
@@ -376,10 +393,10 @@ fn commands_change_a_system_within_its_rules() {
         assert_eq!(transact(&system, &mut entries, &runner(103), &[append(4, 1, &[5], &[6])], workers), none);
         // The two appends of ledger 4 are merged into one span, and the two spans are let go. Its standing is as it was.
         // Anyone may do this, though the ledger is bound: it adds nothing to the ledger.
-        let was = evaluate(&system.state, &[lines(&entries)], workers);
+        let was = views(&system, &entries, workers);
         assert_eq!(transact(&system, &mut entries, USER, &[merge(4, 0, 2, &[0])], workers), none);
         assert_eq!(transact(&system, &mut entries, USER, &[discard(4, 0, 1, &[0]), discard(4, 1, 2, &[5])], workers), none);
-        assert_eq!(evaluate(&system.state, &[lines(&entries)], workers)["standing"], was["standing"]);
+        assert_eq!(views(&system, &entries, workers)["standing"], was["standing"]);
         assert!(entries.contains_key(&run(4, 0, 2, &[0], &[6], &[0], INLINE).into_keys().next().unwrap()));
         // The merged span cannot be taken apart again: what its appends were is no longer there.
         assert_eq!(transact(&system, &mut entries, USER, &[merge(4, 0, 1, &[0])], workers), broken(&["unmet"]));
@@ -411,7 +428,7 @@ fn commands_change_a_system_within_its_rules() {
         assert_eq!(transact(&system, &mut entries, USER, &clear, workers), broken(&["misheld"]));
         assert_eq!(transact(&system, &mut entries, USER, &[&clear[..], &[release(900, 4)]].concat(), workers), none);
 
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["standing"], rows(&[
             ("tuple(tuple(0,1))", "tuple(2,list())"), ("tuple(tuple(0,2))", "tuple(2,list(list(8)))"), ("tuple(tuple(0,3))", "tuple(1,list(list(7)))"),
             ("tuple(tuple(0,6))", "tuple(0,list(list(0)))"), ("tuple(tuple(0,7))", "tuple(0,list(list(0)))"),
@@ -446,7 +463,7 @@ fn a_derived_ledger_is_recorded_and_not_stored() {
         assert_eq!(transact(&system, &mut entries, &runner(101), &[append(3, 0, &[0], &[4])], workers), none);
 
         // Only the durable ledgers stand somewhere. The derived ledger is bound as any other.
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["standing"], rows(&[("tuple(tuple(0,1))", "tuple(1,list(list(9)))"), ("tuple(tuple(0,3))", "tuple(1,list(list(4)))")]));
         assert_eq!(out["bound"], rows(&[("tuple(tuple(0,2))", "tuple(tuple(0,100),0)"), ("tuple(tuple(0,3))", "tuple(tuple(0,101),0)")]));
         assert_eq!(out["unbound"], keyed(&[1]));
@@ -483,7 +500,7 @@ fn a_derived_ledger_is_recorded_and_not_stored() {
         // The writer is replaced by a computation of another program, and the reader is not touched: it names the ledger.
         let replace = [stop(500, 100), stop(501, 100), retire(100), define(102, 72, &[1], &[Some(2)]), start(500, 102), start(501, 102)];
         assert_eq!(transact(&system, &mut entries, USER, &replace, workers), none);
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["needs"], rows(&[
             ("tuple(tuple(0,1))", "tuple(tuple(0,102),tuple(0,3),list(list(4)))"),
             ("tuple(tuple(0,2))", "tuple(tuple(0,101),tuple(0,3),list(list(4)))"),
@@ -492,7 +509,7 @@ fn a_derived_ledger_is_recorded_and_not_stored() {
         // Ledger 1 is kept from [4] alone, so ledger 2 cannot be asked for from [3].
         assert_eq!(transact(&system, &mut entries, USER, &[hold(900, 2, &[3])], workers), broken(&["forgotten"]));
         assert_eq!(transact(&system, &mut entries, USER, &[hold(900, 2, &[6])], workers), none);
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["needs"], rows(&[
             ("tuple(tuple(0,1))", "tuple(tuple(0,102),tuple(0,2),list(list(6)))"),
             ("tuple(tuple(0,1))", "tuple(tuple(0,102),tuple(0,3),list(list(4)))"),
@@ -506,7 +523,7 @@ fn a_derived_ledger_is_recorded_and_not_stored() {
         // Ledger 1 is now kept from [6] alone, so a new reader of it cannot write a ledger that starts before [6].
         assert_eq!(transact(&system, &mut entries, USER, &[create(7, 7, 1, &[0], None), define(103, 73, &[1], &[None, Some(7)])], workers), broken(&["forgotten"]));
         assert_eq!(transact(&system, &mut entries, USER, &[create(7, 7, 1, &[6], None), define(103, 73, &[1], &[None, Some(7)])], workers), none);
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["bound"], rows(&[
             ("tuple(tuple(0,2))", "tuple(tuple(0,102),0)"), ("tuple(tuple(0,3))", "tuple(tuple(0,101),0)"), ("tuple(tuple(0,7))", "tuple(tuple(0,103),1)"),
         ]));
@@ -530,7 +547,7 @@ fn a_computation_may_read_the_state() {
             start(500, 100), start(500, 101),
         ];
         assert_eq!(transact(&system, &mut entries, USER, &setup, workers), none);
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["bound"], rows(&[("tuple(tuple(0,1))", "tuple(tuple(0,100),0)"), ("tuple(tuple(0,2))", "tuple(tuple(0,101),0)")]));
         assert_eq!(out["plan"], rows(&[
             ("tuple(tuple(0,500))", "tuple(tuple(0,100),list(71),list(inject(0,tuple())),list(inject(1,tuple(0,1))))"),
@@ -554,7 +571,7 @@ fn a_computation_may_read_the_state() {
         assert_eq!(transact(&system, &mut entries, USER, &[define(102, 71, &[STATE], &[None])], workers), none);
         // A hold on ledger 2 is passed back to 101, which needs ledger 1 from there, and then to 100, which reads no ledger.
         assert_eq!(transact(&system, &mut entries, USER, &[hold(900, 2, &[5])], workers), none);
-        let out = evaluate(&system.state, &[lines(&entries)], workers);
+        let out = views(&system, &entries, workers);
         assert_eq!(out["needs"], rows(&[("tuple(tuple(0,1))", "tuple(tuple(0,101),tuple(0,2),list(list(5)))")]));
     }
 }
@@ -634,7 +651,7 @@ fn a_round_makes_what_the_rules_make() {
             (43, None, vec![(6, 0, 0, 3)]),
         ], &[41, 42], &[40]),
     ];
-    let was = evaluate(&system.state, &[lines(&entries)], 1);
+    let was = views(&system, &entries, 1);
     let index = evaluate(&system.index, &[lines(&entries)], 1);
     for workers in [1, 2] {
         for (asked, waiting, refused) in &rounds {

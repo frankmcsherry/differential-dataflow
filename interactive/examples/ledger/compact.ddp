@@ -1,7 +1,7 @@
 -- Which spans of each ledger to merge next: a policy for compaction, as a view of the state.
 --
 --   input 0, entries : ((entry), ())
---   input 1, needs   : ((source), (computation, target, frontier))   what computations need, as system.ddp derives it
+--   input 1, needs   : ((source), (computation, target, frontier))   what computations need, as needs.ddp gives it
 --
 --   merge  : ((shard), (ledger, from, to, since, lower, upper))   the merge to make next of a ledger, if there is one,
 --                                                                 with where the merged span begins and ends

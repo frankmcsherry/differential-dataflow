@@ -7,6 +7,8 @@
 --   input 0, entries : ((entry), ())                       the entries the instance is told
 --   input 1, me      : ((instance), ())                    the instance's own id
 --   input 2, readers : ((reader), (ledger, read, need))    each reader the instance has of a durable ledger
+--   input 3, own     : ((id), (version, upper, following, clock, durable))   each ledger's row (index.ddp)
+--   input 4, standing : ((ledger), (version, frontier))   where each durable ledger stands (stand.ddp)
 --
 -- A reader is something in the instance that reads a ledger's appends in order. The instance names it as it likes,
 -- with two ints after a computation's id. `read` is the number of the ledger's appends it has read.
@@ -20,7 +22,6 @@
 --                                                                  with the shapes and the text of its program
 --   binds    : ((computation, position), (writer, place))          each input that reads a derived ledger, and the
 --                                                                  output of the computation that writes it
---   standing : ((ledger), (version, frontier))                     each durable ledger's version and write frontier
 --   resumes  : ((computation), (target, frontier))                 each durable ledger a computation's outputs reach,
 --                                                                  and where it stands: the computation begins from there
 --   fetch    : ((reader), (from, to, batch))                       the spans a reader reads next, which lead from the
@@ -54,6 +55,8 @@ type Reader = (Id, int, int);
 let entries = input 0 : ((Entry), ());
 let me = input 1 : ((Id), ());
 let readers = input 2 : ((Reader), (Id, int, Frontier));
+let own = input 3 : ((Id), (int, Frontier, int, Id, int));
+let standing = input 4 : ((Id), (int, Frontier));
 
 let table = entries | distinct;
 let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
@@ -62,7 +65,6 @@ let programs = table((Program((key, val))), ()) | map(((key, val), ()) -> (key, 
 let computations = table((Computation((key, val))), ()) | map(((key, val), ()) -> (key, val));
 let runs = table((Run((key, val))), ()) | map(((key, val), ()) -> (key, val));
 
-let durable = ledgers((id), (_, _, _, _, Durable)) | distinct;
 let derived = ledgers((id), (_, _, _, _, Derived)) | distinct;
 
 -- PLAN: each computation this instance is asked to run, with its program's text.
@@ -84,35 +86,7 @@ let writes = outs((computation, position), (Written(ledger))) | map(((computatio
 output "binds" = reads((ledger), (reader, position)) * derived((ledger), ()) * writes((ledger), (writer, place))
                | map(((_, reader, position, writer, place), ()) -> ((reader, position), (writer, place)));
 
--- STANDING, as in system.ddp.
--- OWN: a ledger's version is the number of its appends, and its own upper is the upper of the span that covers
--- the last of them, or its start if it has none.
--- MARKS is each number a ledger has come to, with the upper there: 0 with its start, and where each span ends.
--- A TIP is a mark that no span begins at. The version is the greatest tip, and there are few of them: one, unless
--- spans were discarded and left others that lead nowhere. So an append changes two rows here, and no more,
--- however many spans the ledger has.
-let marks = (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))))
-          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, to), (upper))));
-let started = spans | filter(((_, from, to, _), _) -> (from, to) lt) | map(((id, from, _, _), _) -> ((id, from), ())) | distinct;
-let tips = marks - (marks | join(started, (place, upper, ()) -> (place, upper)));
-let own = tips | map(((id, to), (upper)) -> ((id), (to, upper)))
-               | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
--- WRITE FRONTIER: the join of a ledger's own upper with the write frontier of the clock it follows, and so on up.
-let followed = ledgers((id), (_, _, _, Follows(clock), _)) | map(((id, clock), ()) -> ((clock), (id)));
-wf: {
-    let lifted = followed | join(write, ((clock), (id), (frontier)) -> ((id), (frontier)));
-    set write = (own | map((id, (_, upper)) -> (id, (upper)))) + lifted
-              | reduce((_id, frontiers) ->
-                    let none = [] : List(List(int)) in
-                    let joined = ((0, none), frontiers) fold (((seen, sofar), ((frontier), _count)) ->
-                        (1, (seen, (sofar, frontier) call frontier_join, frontier) select)) in
-                    ((joined.1), 1) enlist);
-}
-let standing = own((id), (version, _)) * wf::write((id), (frontier)) * durable((id), ())
-             | map(((id, version, frontier), ()) -> ((id), (version, frontier)));
-output "standing" = standing;
-
--- RESUMES, as in system.ddp: a computation begins from where its outputs stand. A derived ledger stands nowhere,
+-- RESUMES, as in NEEDS (needs.ddp): a computation begins from where its outputs stand. A derived ledger stands nowhere,
 -- so the computation that writes one begins from where its readers do, and so on back.
 -- A hold on a derived ledger is not passed back here: an instance is not told of holds.
 let relies = reads((ledger), (reader, _)) * derived((ledger), ()) * writes((ledger), (writer, _))
@@ -150,7 +124,7 @@ let hops = (plain((id, from, to, _), (_, _, batch)) * reading((id), (reader))
 -- The dead numbers are found, and not the ones that lead on, because an append makes no number dead. The numbers
 -- that lead on are each some steps from the version, and an append would move every one of them a step further.
 -- A reader can only come to a number where a hop begins or ends, where it has read to, or the version: PLACES.
-let ends = readers((reader), (id, _, _)) * own((id), (version, _)) | map(((reader, _, version), ()) -> ((reader, version), ()));
+let ends = readers((reader), (id, _, _)) * own((id), (version, _, _, _, _)) | map(((reader, _, version), ()) -> ((reader, version), ()));
 let begins = readers | map(((reader), (_, read, _)) -> ((reader, read), ()));
 let leaving = hops | map((place, _) -> (place, ()));
 let places = leaving + (hops | map(((reader, _), (to, _)) -> ((reader, to), ()))) + begins + ends | distinct;

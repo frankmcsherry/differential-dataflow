@@ -142,12 +142,16 @@ class Local:
     def __init__(self, server, instance):
         self.server, self.readers = server, {}      # each reader this has told the views of, and the row it told them
         self.seen = {}                              # each view's frames as last read, and their rows
-        server.ask(f"load local from {DIR}/instance.ddp input0=state::entries")
+        # Each ledger's row, and where each durable ledger stands, as a follower works them out (index.ddp, stand.ddp).
+        server.ask(f"load index from {DIR}/index.ddp input0=state::entries")
+        server.ask(f"load stand from {DIR}/stand.ddp input0=index::own")
+        server.ask(f"load local from {DIR}/instance.ddp input0=state::entries input3=index::own input4=stand::standing")
         server.many([f"feed local 1 tuple(tuple({instance[0]},{instance[1]})) val=tuple()", "tick"])
 
     def rows(self, view):
-        """The rows of a view. They are decoded only if the view's frames are not the ones it gave last."""
-        frames = self.server.ask(f"peek local::{view} as corgi")
+        """The rows of a view: of `local`, unless another program is named. They are decoded only if the view's frames
+        are not the ones it gave last."""
+        frames = self.server.ask(f"peek {view if '::' in view else 'local::' + view} as corgi")
         if self.seen.get(view, (None,))[0] != frames:
             self.seen[view] = (frames, [(key, val) for frame in frames for key, val, _, _ in plumbing.decode(frame)])
         return self.seen[view][1]
@@ -169,7 +173,7 @@ class Local:
 
     def standing(self):
         """Where each durable ledger stands: {ledger: (version, frontier)}, with a frontier of one time as that time."""
-        return {number(key[0]): (val[0], instant(val[1])) for key, val in self.rows("standing")}
+        return {number(key[0]): (val[0], instant(val[1])) for key, val in self.rows("stand::standing")}
 
     def spans(self, asks):
         """For each (reader, ledger, read, need): the spans that lead the reader of the ledger on from its append `read`

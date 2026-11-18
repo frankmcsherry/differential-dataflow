@@ -46,10 +46,10 @@ def label(computation): return LABELS.get(str(computation), str(computation))
 
 def look_views(copy):
     """One look at the views a follower keeps: what runs, where each ledger stands, the rules, and the entries."""
-    names = ["views::standing", "views::plan", "views::idle", "views::names", "views::bound", "checked::entries"] + [f"views::{rule}" for rule in RULES]
+    names = ["stand::standing", "views::plan", "views::idle", "views::names", "views::bound", "checked::entries"] + [f"views::{rule}" for rule in RULES]
     rows = dict(zip(names, copy.peek(*names)))
     parse = lambda name: [plumbing.row(line) for line in rows[name]]
-    standing = plumbing.stands(rows["views::standing"])
+    standing = plumbing.stands(rows["stand::standing"])
     kinds = {}
     for line in rows["checked::entries"]:
         found = line.split("inject(", 1)[1].split(",", 1)[0] if "inject(" in line else None

@@ -9,7 +9,7 @@
 -- Any other transaction is deferred: it is judged by the rules.
 --
 --   input 0, commands : ((index), (command))                 one transaction's commands, by their place in it
---   input 1, standing : ((id), (version, frontier))          each durable ledger's standing before, as system.ddp derives it
+--   input 1, standing : ((id), (version, frontier))          each durable ledger's standing before, as stand.ddp gives it
 --   input 2, bound    : ((ledger), (computation, position))  each ledger a computation writes, as system.ddp derives it
 --   input 3, actor    : ((), (actor))                        who makes the change: a user, or a runner of a computation
 --
