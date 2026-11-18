@@ -26,7 +26,9 @@ Standing programs on one server. There is one copy of the configuration, and one
   intake     the commands of the one transaction in hand, and who makes it
   change     commands.ddp: the entries those commands would remove and add
   trial      the state the transaction in hand would make: `state`, with what `change` adds, less what it removes.
-             It is not fed. With no transaction in hand it is the state. It also gives the change as one collection, `delta`.
+             The state is a set: an entry put in that is there already adds nothing, as in step.ddp.
+             It is not fed. With no transaction in hand it is the state. It also gives the change as one collection, `delta`,
+             and as what it puts in, `added`, and takes out, `removed`.
   views      system.ddp of `trial`: the model's views and its rules. Between transactions these are of the state,
              and with a transaction in hand they are of the state it would make
   step       step.ddp: the rules of a change, of `state` and what `change` takes out of it and puts in
@@ -275,9 +277,17 @@ class Keeper:
         state = types + 'let entries = input 0 : ((Entry), ());\noutput "entries" = entries;\n'
         intake = types + ('let commands = input 0 : ((int), (Command));\nlet actor = input 1 : ((), (Actor));\n'
                           'output "commands" = commands;\noutput "actor" = actor;\n')
+        # The state is a set. To put in an entry that is there adds nothing, and to take out one that is not there removes
+        # nothing: the change is what step.ddp calls ADDED and REMOVED (THE CHANGE), worked out here the same way.
         trial = types + ('let entries = input 0 : ((Entry), ());\nlet adds = input 1 : ((Entry), ());\n'
                          'let removes = input 2 : ((Entry), ());\n'
-                         'output "entries" = entries + adds - removes;\noutput "delta" = adds - removes;\n')
+                         'let found = adds + removes | distinct | join(entries, (entry, (), ()) -> (entry, ()));\n'
+                         'let had = found | distinct;\n'
+                         'let has = found - removes + adds | distinct;\n'
+                         'let added = has - (has | join(had, (entry, (), ()) -> (entry, ())));\n'
+                         'let removed = had - (had | join(has, (entry, (), ()) -> (entry, ())));\n'
+                         'output "added" = added;\noutput "removed" = removed;\n'
+                         'output "entries" = entries + added - removed;\noutput "delta" = added - removed;\n')
         rows = types + 'let own = input 0 : ((Id), (int, Frontier, int, Id, int));\noutput "own" = own;\n'
         gens = types + 'let rows = input 0 : ((Id), (int));\noutput "rows" = rows;\n'
         for name, text in (("state", state), ("intake", intake), ("rows", rows), ("gens", gens)):
@@ -286,7 +296,7 @@ class Keeper:
         self.ask(f"load trial input0=state::entries input1=change::adds input2=change::removes begin\n{trial}trial end-load")
         self.ask(f"load views from {DIR}/system.ddp input0=trial::entries")
         self.ask(f"load stand from {DIR}/stand.ddp input0=rows::own")
-        self.ask(f"load shift from {DIR}/shift.ddp input0=change::adds input1=change::removes input2=rows::own")
+        self.ask(f"load shift from {DIR}/shift.ddp input0=trial::added input1=trial::removed input2=rows::own")
         self.ask(f"load gone from {DIR}/gone.ddp input0=shift::dropped input1=gens::rows")
         # Each ledger's own hold, as the transaction in hand would leave it. Every need of a ledger, new or old, must be at
         # or after it: so a new use from before it is refused, and so is a move of it past a use (readers.ddp).
@@ -820,7 +830,9 @@ def define(computation, program, inputs, outputs):
     writes = ",".join("inject(0,tuple())" if o is None else f"inject(1,{ident(o)})" for o in outputs)
     return f"inject(8,tuple({ident(computation)},list({program}),list({reads}),list({writes})))"
 def start(instance, computation): return f"inject(10,tuple({ident(instance)},{ident(computation)}))"
+def stop(instance, computation): return f"inject(11,tuple({ident(instance)},{ident(computation)}))"
 def hold(holder, ledger, since): return f"inject(12,tuple({ident(holder)},{ident(ledger)},{frontier(since)}))"
+def release(holder, ledger): return f"inject(13,tuple({ident(holder)},{ident(ledger)}))"
 
 
 def check(label, ok, detail=""):
@@ -839,6 +851,18 @@ def main():
                  define(100, 71, [1], [2]), define(101, 71, ["state"], [3]), start(500, 100), start(500, 101), alias(1, 1)]
         check("a system is set up in one transaction", k.transact(USER, setup) == [])
         check("a ledger follows the clock", k.transact(USER, [create(8, clock=9)]) == [])
+        # To put in an entry that is there adds nothing (see step.ddp, THE CHANGE): a client that asks again, not knowing
+        # whether it was made, changes nothing, and the log records no change.
+        copies = lambda prefix: [row for row in k.ask("peek state::entries") if row.startswith(prefix)]
+        run = f"tuple(inject(5,tuple(tuple({ident(501)},{ident(100)}),tuple())))"
+        check("a run is started twice, and is in the state once", k.transact(USER, [start(501, 100)]) == []
+              and k.transact(USER, [start(501, 100)]) == [] and copies(run) == [run], str(copies(run)))
+        last = FileLog(log).read(whole=True)[-1]
+        check("the second start's record changes no entry", [diff for frame in last[1][:last[0]["entries"]] for _, _, diff, _ in plumbing.decode(frame)] == [], str(last[0]))
+        check("and a stop then takes it out", k.transact(USER, [stop(501, 100)]) == [] and copies(run) == [])
+        check("a ledger registered again, the same, keeps one row", k.transact(USER, [create(9)]) == []
+              and len([row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(9)}) ")]) == 1
+              and " diff=" not in "".join(row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(9)}) ")))
 
         # Appends, on admission alone.
         steps = 200

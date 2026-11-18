@@ -4,8 +4,8 @@
 -- ledgers it appends to. A transaction that registers a ledger gives it a row, and one that drops a ledger takes
 -- its row away. This says which, from what the transaction in hand puts into the state and takes out of it.
 --
---   input 0, adds    : ((entry), ())   the entries the transaction puts in, as commands.ddp gives them
---   input 1, removes : ((entry), ())   the entries it takes out
+--   input 0, adds    : ((entry), ())   the entries the transaction puts in that were not there (`trial::added` in keeper.py)
+--   input 1, removes : ((entry), ())   the entries it takes out that were there (`trial::removed`)
 --   input 2, own     : ((id), (version, upper, following, clock, durable))   the rows
 --
 --   moved : ((id), (version, upper, following, clock, durable))   the change to the rows: a new ledger's row,
