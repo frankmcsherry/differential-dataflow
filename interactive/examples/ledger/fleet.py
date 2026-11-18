@@ -25,7 +25,7 @@ Run from the repository root:
 import json, os, subprocess, sys, time, urllib.error
 import plumbing
 from plumbing import Client, Blobs, SPAN, number
-from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, FULL, USER, COUNT, OFTEN, TALLY, ROW, MANY, spans_program, create, create_derived, append,
+from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, USER, COUNT, OFTEN, TALLY, ROW, MANY, spans_program, create, create_derived, append,
                   publish, define, start, stop, hold, check, spawn, up, ready, contents, agree, wait, batch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -195,7 +195,7 @@ def main():
         # A compactor on machine 0, and a collector here. Each reads the state, and acts by transactions.
         processes["compactor"] = session(0, f"steward.py compact {URL} {FOLLOWER}", carry=False)
         # The collector reads a follower here that keeps the rules in full, and deletes only what is unnamed in a state they pass.
-        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", LEDGER_ETCD=ETCD, FOLLOWER_RULES=FULL)
+        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", LEDGER_ETCD=ETCD)
         ready(AUDITOR)
         auditor = plumbing.Follower(AUDITOR)
         processes["collector"] = spawn(steward_py, "collect", URL, AUDITOR, LEDGER_ETCD=ETCD)

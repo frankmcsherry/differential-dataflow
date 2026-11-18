@@ -24,7 +24,7 @@ It is a prototype: the programs are real and tested, and the processes around th
 
 | Program | Who runs it | What it is for |
 | --- | --- | --- |
-| [`system.ddp`](system.ddp) | the keeper | the state's views, and the rules that settle races |
+| [`system.ddp`](system.ddp) | the keeper, a follower that audits | the state's views, and the rules a state should keep |
 | [`step.ddp`](step.ddp) | the keeper | the rules of a change: what may not be undone |
 | [`commands.ddp`](commands.ddp) | the keeper | what each command removes and adds |
 | [`admit.ddp`](admit.ddp) | the keeper | the short check of a transaction of appends |
@@ -39,7 +39,6 @@ It is a prototype: the programs are real and tested, and the processes around th
 | [`instance.ddp`](instance.ddp) | each instance | what to run, where to begin, and which spans to read next |
 | [`compact.ddp`](compact.ddp) | the policy follower | which spans of each ledger to merge next |
 | [`needs.ddp`](needs.ddp) | the policy follower | what each ledger is needed from |
-| [`system-full.ddp`](system-full.ddp), [`step-full.ddp`](step-full.ddp) | a follower that audits | the model in full: `system.ddp` and `step.ddp` with every rule kept |
 | [`index.ddp`](index.ddp) | the tests | what a round reads of each ledger, derived from the entries, to check the keeper's rows against |
 
 ## Checks

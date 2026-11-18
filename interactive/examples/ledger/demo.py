@@ -24,7 +24,7 @@ A word is an int here, and so is a line: line t holds the words t % 5, t % 7 and
 import json, os, re, statistics, subprocess, sys, threading, time
 import plumbing
 from plumbing import Client, Blobs, SPAN, number
-from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, FULL, USER, COUNT, OFTEN, ROW, ints, ident, create, append, publish, define,
+from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, USER, COUNT, OFTEN, ROW, ints, ident, create, append, publish, define,
                   start, stop, spawn, up, ready, contents, agree, wait, batch)
 from fleet import MACHINES, HOME, ETCD, deploy, session, instances, settle
 
@@ -195,7 +195,7 @@ def walk():
         said("spans before: " + ", ".join(f"`{NAMES[l]}` {n}" for l, n in sorted(spans().items())))
         processes["compactor"] = spawn(steward_py, "compact", URL, FOLLOWER, LEDGER_ETCD=ETCD)
         # The collector reads a follower that keeps the rules in full, and deletes only what is unnamed in a state they pass.
-        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", LEDGER_ETCD=ETCD, FOLLOWER_RULES=FULL)
+        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", LEDGER_ETCD=ETCD)
         ready(AUDITOR)
         processes["collector"] = spawn(steward_py, "collect", URL, AUDITOR, LEDGER_ETCD=ETCD)
         tidied = lambda: not plumbing.Follower(FOLLOWER).rows("tidy::merge")[0]

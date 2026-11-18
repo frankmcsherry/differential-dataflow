@@ -12,7 +12,7 @@ import json, os, subprocess, sys, time
 import plumbing, runner
 import keeper as model
 from plumbing import Client, Blobs, SPAN, number
-from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, FULL, USER, COUNT, OFTEN, BOTH, TALLY, ROW, spans_program, create, create_derived, append,
+from live import (URL, HTTP, FOLLOW, FOLLOWER, AUDIT, AUDITOR, USER, COUNT, OFTEN, BOTH, TALLY, ROW, spans_program, create, create_derived, append,
                   publish, define, start, stop, spawn, up, ready, settle, contents, wait, batch)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -131,7 +131,7 @@ def main():
         assert contents(keeper, blobs, 4) == both
 
         # The rules are read of a follower that keeps the model's in full: this tree's keeper, and its other followers, keep fewer.
-        processes["auditor"] = spawn(os.path.join(HERE, "follower.py"), "serve", register, URL, str(AUDIT), "audit", FOLLOWER_RULES=FULL)
+        processes["auditor"] = spawn(os.path.join(HERE, "follower.py"), "serve", register, URL, str(AUDIT), "audit")
         ready(AUDITOR)
         auditor = plumbing.Follower(AUDITOR)
         assert settle(lambda: auditor.where()["at"] == keeper.length())

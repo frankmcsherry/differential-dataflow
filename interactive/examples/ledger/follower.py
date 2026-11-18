@@ -27,7 +27,7 @@ Standing programs on the follower's own server, for a follower that does everyth
   state    the entries, as the records leave them
   bundle   bundle.ddp of them: what each instance is told, and the instances each machine has
   checked  the entries again, for the two programs below: it is brought up to `state` only when one of them is read
-  views    system.ddp of `checked`: the model's views, and the keeper's copy of its rules
+  views    system.ddp of `checked`: the model's views, and its rules
   tidy     compact.ddp of `checked`: which spans of each ledger a compactor should merge next
 So what an instance is told of a record does not wait for the rules to be worked out for it.
 A follower may instead be started with a role, and then keeps only that role's programs (see `Follower`):
@@ -52,9 +52,6 @@ import plumbing
 DIR = "interactive/examples/ledger"
 # Whether a follower of the compaction policy feeds its views as records come, and how long it gathers records for each feed.
 EAGER, GATHER = os.environ.get("FOLLOWER_EAGER", "1") == "1", float(os.environ.get("FOLLOWER_GATHER", "0.05"))
-# The rules a follower that audits keeps: the model's, in full, unless another file is named; if it does not load,
-# the keeper's copy (system.ddp).
-FULL = os.environ.get("FOLLOWER_RULES", f"{DIR}/system-full.ddp")
 MOST = 1 << 14      # how many frames a follower that is only read now and then keeps unfed, at most
 BEHIND = 10000      # a reader that has this many lines waiting for it is let go, and may ask again
 LATE = 64           # how many frames of records the views' copy of the state may be owed before it is given them
@@ -130,10 +127,7 @@ class Follower:
             self.server.ask(f"load needs from {DIR}/needs.ddp input0=checked::entries")
             self.server.ask(f"load tidy from {DIR}/compact.ddp input0=checked::entries input1=needs::needs")
         if role == "audit":
-            try: self.server.ask(f"load views from {FULL} input0=checked::entries")
-            except RuntimeError as error:
-                print(f"follower: the rules at {FULL} did not load ({str(error)[:200]}); this tree's are kept", flush=True)
-                self.server.ask(f"load views from {DIR}/system.ddp input0=checked::entries")
+            self.server.ask(f"load views from {DIR}/system.ddp input0=checked::entries")
         self.owed = []                      # the frames of records that `checked` does not yet have
         self.dropping = False               # whether a record among those owed dropped a ledger
         self.snapped = 0                    # the log's length at the last snapshot of the entries this follower wrote

@@ -40,7 +40,7 @@ Everything on the page is a view of the state, read from the follower on this ma
 - **What the state asks to run, and where.** Machines, their instances, and the computations each is asked to run.
 - **Where each ledger stands.** Its name, how many appends it has, its frontier, how many spans hold it, and who may write it.
 - **Computations.** What each reads and writes, and where it runs.
-- **The rules.** That all 29 hold, or the names of those that do not, and any computation that no instance runs. In the walk these are the keeper's copy of the rules, in which the 8 that only a faulty party could break are left empty; in the running mode they are the audit follower's, the model in full.
+- **The rules.** That all 29 hold, or the names of those that do not, and any computation that no instance runs. They are read from a follower that has the spans: the one on this machine in the walk, and the audit follower in the running mode.
 - **At the top.** The keeper's rounds, the transactions it judged alone by the rules, and the records in its log.
 
 A cell that changes is marked for a moment.
@@ -157,8 +157,8 @@ The keeper here holds no spans, and these were not measured again on it:
 
 The sizes of things:
 
-- **The programs, as DDIR:** 18 programs, 2,528 lines, of which 500 are the model in full, kept a second time for the audit.
-- **The keeper, follower, instance, stewards and what they share, as Python:** 3,214 lines, in five files.
+- **The programs, as DDIR:** 16 programs, 2,052 lines.
+- **The keeper, follower, instance, stewards and what they share, as Python:** 3,210 lines, in five files.
 
 ## What is not shown, and why
 

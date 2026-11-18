@@ -35,7 +35,7 @@ import json, os, signal, statistics, subprocess, sys, threading, time, urllib.re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import plumbing
 from plumbing import Client, Blobs
-from live import (URL, HTTP, FOLLOW, FOLLOWER, FULL, USER, COUNT, OFTEN, ROW, ident, shape, frontier, publish, define,
+from live import (URL, HTTP, FOLLOW, FOLLOWER, USER, COUNT, OFTEN, ROW, ident, shape, frontier, publish, define,
                   start, stop as stopping, retire, spawn, up)
 from fleet import MACHINES, HOME, ETCD, deploy, session
 
@@ -139,7 +139,7 @@ def main(count, rate):
         part("keeper", path("keeper.py"), "serve", register, str(HTTP))
         up(URL)
         for role, port in ROLES.items():
-            env = {"FOLLOWER_RULES": FULL} if role == "audit" else {"FOLLOWER_WORKERS": "2"} if role == "tidy" else {}
+            env = {"FOLLOWER_WORKERS": "2"} if role == "tidy" else {}
             part(f"follower ({role})", path("follower.py"), "serve", register, URL, str(port), role, **env)
         for role, port in ROLES.items():
             for _ in range(600):

@@ -5,7 +5,8 @@ This is the plainest thing that obeys the model (system.ddp, step.ddp and comman
 (admit.ddp, round.ddp) and the programs over its own tables (see below).
 Nothing here has data: every batch is empty or a few bytes. The point is that the state is kept to its rules.
 
-The keeper holds no spans, and keeps no rule over them: those are an audit follower's (system-full.ddp).
+The keeper holds no spans. It keeps every rule of the model, as an audit follower does, and the rules over spans have
+nothing to read in its state: they are kept for it by the audit follower, which has the spans.
 The keeper holds one row for each ledger, which a round moves; each ledger's generation; and the configuration:
 ledgers, names, programs, computations, runs and holds. A round's spans go to the log, and a follower has them.
 Each ledger has an own hold (own.ddp): a `Hold` whose holder is (0, 0), the frontier from which every reader of the
@@ -35,7 +36,8 @@ Standing programs on one server. There is one copy of the configuration, and one
              It is not fed. With no transaction in hand it is the state. It also gives the change as one collection, `delta`,
              and as what it puts in, `added`, and takes out, `removed`.
   views      system.ddp of `trial`: the model's views and its rules. Between transactions these are of the state,
-             and with a transaction in hand they are of the state it would make
+             and with a transaction in hand they are of the state it would make. The views of spans are empty here
+             (`standing` puts every ledger at its start): where ledgers stand is read from `stand` and `later`
   step       step.ddp: the rules of a change, of `state` and what `change` takes out of it and puts in
   admit      admit.ddp: the short check of appends
 

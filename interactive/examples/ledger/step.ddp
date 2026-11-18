@@ -60,6 +60,7 @@ let added = has - (has | join(had, (entry, (), ()) -> (entry, ())));
 -- Each by its table's key. A key that is both removed and added is a row that was changed.
 let ledgers_out = removed((Ledger(((id), _))), ());
 let ledgers_in = added((Ledger(((id), _))), ());
+let spans_out = removed((Span(((id, from, to, since), _))), ());
 let spans_in = added((Span(((id, from, to, since), (lower, upper, _)))), ())
              | map(((id, from, to, since, lower, upper), ()) -> ((id, from, to, since), (lower, upper)));
 let programs_out = removed((Program(((program), _))), ());
@@ -73,18 +74,29 @@ let computations_in = added((Computation(((computation), _))), ());
 -- are another computation, with another id.
 -- Covering the same appends again, at another since or merged with others, changes nothing, and is not caught here.
 output "reshaped"  = ledgers_out((id), ())                * ledgers_in((id), ());                 -- a registration
--- Not kept in this variant: it guards against a faulty implementor.
-output "rewritten" = ledgers_in | filter((_, ()) -> 0);                                         -- a span, at one since
+output "rewritten" = spans_out((id, from, to, since), ()) * spans_in((id, from, to, since), _);   -- a span, at one since
 output "reworded"  = programs_out((program), ())          * programs_in((program), ());           -- a program
 output "rebound"   = computations_out((computation), ())  * computations_in((computation), ());   -- a computation
 
--- A ledger's version and write frontier do not go back.
--- Not kept in this variant: it guards against a faulty implementor.
-output "regressed" = ledgers_in | filter((_, ()) -> 0);
+-- A ledger's version and write frontier do not go back: (ledger, ((version, frontier) before, (version, frontier) after)).
+output "regressed" = stood | join(stands, (id, was, is) -> (id, (was, is)))
+                           | filter((_, ((version, frontier), (later, after))) ->
+                                 (((version, later) le, (frontier, after) call frontier_le) all, 0) eq);
 
--- An append keeps the frontiers it began and ended at.
--- Not kept in this variant: it guards against a faulty implementor. The edges of the state before, which it read, are not kept either.
-output "revised" = ledgers_in | filter((_, ()) -> 0);
+-- An append keeps the frontiers it began and ended at: (ledger, (side, number, frontier)).
+-- EDGES are as in system.ddp: where each append begins, side 0, and where each ends, side 1.
+-- A span added within a ledger's version covers again what was there, so each edge it has was there before.
+let spans_was = before((Span(((id, from, to, _), (lower, upper, _)))), ());
+let edges_was = (spans_was | map(((id, from, _, lower, _), ()) -> ((id, 0, from, lower), ())))
+              + (spans_was | map(((id, _, to, _, upper), ()) -> ((id, 1, (to, 1) sub, upper), ())))
+              | distinct;
+let edges_in = (spans_in | map(((id, from, _, _), (lower, _)) -> ((id, 0, from, lower), ())))
+             + (spans_in | map(((id, _, to, _), (_, upper)) -> ((id, 1, (to, 1) sub, upper), ())))
+             | distinct;
+let fresh = edges_in - (edges_in | join(edges_was, (edge, (), ()) -> (edge, ())));
+output "revised" = fresh((id, side, number, frontier), ()) * stood((id), (version, _))
+                 | filter(((_, _, number, _, version), ()) -> (number, version) lt)
+                 | map(((id, side, number, frontier, _), ()) -> ((id), (side, number, frontier)));
 
 -- APPENDS.
 

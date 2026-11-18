@@ -26,8 +26,6 @@ FOLLOW = 7990
 FOLLOWER = f"127.0.0.1:{FOLLOW}"
 AUDIT = 7996
 AUDITOR = f"127.0.0.1:{AUDIT}"
-# The rules a follower that audits keeps: the model's, in full. This tree's keeper keeps fewer, and holds no spans.
-FULL = os.environ.get("FOLLOWER_RULES", os.path.join(os.path.dirname(os.path.abspath(__file__)), "system-full.ddp"))
 USER = "inject(0,tuple())"
 ROW = "((int), (int))"
 
@@ -426,7 +424,7 @@ def main():
         # The hold steward moves each ledger's own hold to what its readers need, rounded down, now and then.
         processes["holder"] = spawn(steward_py, "hold", URL, FOLLOWER, "views::needs", HOLD_STEP="5", HOLD_EVERY="0.5")
         # The collector reads a follower that keeps the rules in full, and deletes only what is unnamed in a state they pass.
-        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", FOLLOWER_RULES=FULL)
+        processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit")
         auditor = plumbing.Follower(AUDITOR)
         ready(AUDITOR)
         processes["collector"] = spawn(steward_py, "collect", URL, AUDITOR, COLLECT_LINGER="2")   # this test's writers name what they write at once

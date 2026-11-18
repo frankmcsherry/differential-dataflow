@@ -183,24 +183,25 @@ output "blobs" = spans(_, (_, _, Blob(hash))) | distinct;
 -- RULES: each of these should be empty.
 
 -- KEYS. Each table has one row for each key: the rows under a key are counted, and no count is above one.
--- Not kept in this variant: it guards against a faulty implementor.
-output "repeated"     = ledgers | filter((_, _) -> 0);                                      -- an entry is in the state once
+output "repeated"     = entries      | count | filter((_, copies) -> (copies, 1) gt);   -- an entry is in the state once
 output "reregistered" = ledgers      | count | filter((_, copies) -> (copies, 1) gt);   -- a ledger has one registration
--- Not kept in this variant: it guards against a faulty implementor.
-output "doubled"      = ledgers | filter((_, _) -> 0);                                      -- a span has one batch at each since
+output "doubled"      = spans        | count | filter((_, copies) -> (copies, 1) gt);   -- a span has one batch at each since
 output "ambiguous"    = names        | count | filter((_, copies) -> (copies, 1) gt);   -- a name has one ledger
 output "reprogrammed" = programs     | count | filter((_, copies) -> (copies, 1) gt);   -- a program hash has one program
 output "redefined"    = computations | count | filter((_, copies) -> (copies, 1) gt);   -- a computation has one definition
 output "contested"    = writes       | count | filter((_, copies) -> (copies, 1) gt);   -- a ledger is written by one output
 output "reheld"       = holds        | count | filter((_, copies) -> (copies, 1) gt);   -- a holder has one hold on a ledger
--- An append begins at one frontier and ends at one, whichever spans cover it.
--- Not kept in this variant: it guards against a faulty implementor. EDGES, which it read, is not kept either.
-output "forked" = ledgers | filter((_, _) -> 0);
+-- An append begins at one frontier and ends at one, whichever spans cover it: ((ledger, side, number), (frontier)).
+-- EDGES is each: a span's lower is where its first append begins, side 0, and its upper is where its last ends, side 1.
+let edges = (spans | map(((id, from, _, _), (lower, _, _)) -> ((id, 0, from), (lower))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, 1, (to, 1) sub), (upper))))
+          | distinct;
+output "forked" = edges | count | filter((_, copies) -> (copies, 1) gt);
 
 -- REFERENCES. What a row names is there: the rows that name a key, less those whose key is there, are none.
 -- Every span belongs to a registered ledger.
--- Not kept in this variant: it guards against a faulty implementor.
-output "orphaned" = ledgers | filter((_, _) -> 0);
+let placed = spans | map(((id, from, to, since), _) -> ((id), (from, to, since)));
+output "orphaned" = placed - (placed | join(registered, (id, span, ()) -> (id, span)));
 -- A followed clock is registered.
 output "unclocked" = followed - (followed | join(registered, (clock, id, ()) -> (clock, id)));
 -- A name's ledger is registered.
@@ -230,16 +231,28 @@ output "mismatched" = ledgers((id), (_, ours, _, Follows(clock), _)) * ledgers((
 -- are those of computations, passed back through derived ledgers, and those of holders (see NEEDS).
 
 -- A span covers at least one append, and its lower is strictly before its upper.
--- Not kept in this variant: it guards against a faulty implementor.
-output "malformed" = ledgers | filter((_, _) -> 0);
+output "malformed" = spans | filter(((_, from, to, _), (lower, upper, _)) ->
+                                 (((from, to) lt, (lower, upper) call frontier_lt) all, 0) eq);
 
--- Each append begins no earlier than the one before it ended, and the first no earlier than the start.
--- Not kept in this variant: it guards against a faulty implementor.
-output "early" = ledgers | filter((_, _) -> 0);
+-- Each append begins no earlier than the one before it ended, and the first no earlier than the start:
+-- ((ledger, number), (end, lower)). Appends need not abut: a clock may have advanced the ledger in between.
+let ended = (edges((id, 1, number), (upper)) | map(((id, number, upper), ()) -> ((id, (number, 1) add), (upper))))
+          + (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))));
+output "early" = edges((id, 0, number), (lower)) * ended((id, number), (end))
+               | filter(((_, _, lower, end), ()) -> ((end, lower) call frontier_le, 0) eq)
+               | map(((id, number, lower, end), ()) -> ((id, number), (end, lower)));
 
--- A durable ledger's spans join up: from 0, one span and then the next reach the ledger's version.
--- Not kept in this variant: it guards against a faulty implementor. STEPS and REACHED, which it read, are not kept either.
-output "skipped" = ledgers | filter((_, _) -> 0);
+-- A durable ledger's spans join up: from 0, one span and then the next reach the ledger's version: (ledger, version).
+-- STEPS is each span, as a step from the number it begins at to the number it ends at.
+-- REACHED is each number that steps reach from 0.
+let steps = spans | map(((id, from, to, _), _) -> ((id, from), (to))) | distinct;
+joining: {
+    let next = reached | join(steps, (place, (), (to)) -> (place, (to)))
+                       | map(((id, _), (to)) -> ((id, to), ()));
+    set reached = (durable | map(((id), ()) -> ((id, 0), ()))) + next | distinct;
+}
+let ending = own((id), (version, _)) * durable((id), ());
+output "skipped" = ending - (ending | join(joining::reached, (place, (), ()) -> (place, ())));
 
 -- A ledger can be read from each frontier it is needed from: (ledger, need, version).
 -- ASKS is each need: what a computation needs, and what a holder asks.
@@ -275,8 +288,7 @@ output "forgotten" = due - met;
 -- DERIVED LEDGERS. A derived ledger's contents are only on the instances that write it.
 
 -- A derived ledger has no spans.
--- Not kept in this variant: it guards against a faulty implementor.
-output "spanned" = ledgers | filter((_, _) -> 0);
+output "spanned" = spans((id, from, to, since), _) * derived((id), ());
 -- A derived ledger is written by a computation.
 output "hollow" = derived - (derived | join(written, (ledger, (), ()) -> (ledger, ())));
 -- An instance that runs a reader of a derived ledger also runs the computation that writes it:

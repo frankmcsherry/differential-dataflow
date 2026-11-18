@@ -1,5 +1,5 @@
-//! The state of a system of ledgers (`examples/ledger/system-full.ddp`), changed by commands (`examples/ledger/commands.ddp`),
-//! with each change judged by the rules of a state and the rules of a step (`examples/ledger/step-full.ddp`), in full.
+//! The state of a system of ledgers (`examples/ledger/system.ddp`), changed by commands (`examples/ledger/commands.ddp`),
+//! with each change judged by the rules of a state and the rules of a step (`examples/ledger/step.ddp`).
 //!
 //! A transaction is made only if it breaks no rule. The test builds a small system by commands, reads its views,
 //! and then offers changes that each break rules, and checks that exactly those rules complain.
@@ -47,8 +47,8 @@ struct System { commands: Program, state: Program, step: Program, admit: Program
 fn system() -> System {
     System {
         commands: program(include_str!("../examples/ledger/commands.ddp")),
-        state: program(include_str!("../examples/ledger/system-full.ddp")),
-        step: program(include_str!("../examples/ledger/step-full.ddp")),
+        state: program(include_str!("../examples/ledger/system.ddp")),
+        step: program(include_str!("../examples/ledger/step.ddp")),
         admit: program(include_str!("../examples/ledger/admit.ddp")),
         round: program(include_str!("../examples/ledger/round.ddp")),
         index: program(include_str!("../examples/ledger/index.ddp")),
