@@ -11,14 +11,14 @@
 -- This refuses every reader that `forgotten` refuses. It may refuse one that `forgotten` would let by: one from before
 -- the own hold, when no merge has yet taken out the spans it would use.
 --
--- The transaction in hand may register a ledger, which has no row yet (see shift.ddp). It stands at its start,
--- joined with where the clock it follows stands, if that clock stands anywhere.
+-- Where the ledgers stand is read from the rows the transaction in hand would leave: the keeper's rows with the rows it
+-- gives and takes (shift.ddp), through stand.ddp. So a ledger it registers stands at its start joined with where its
+-- clock stands, and that clock may be registered by the same transaction.
 --
 --   input 0, config   : ((entry), ())                     the configuration the transaction in hand would make
---   input 1, standing : ((ledger), (version, frontier))   where each durable ledger stands, from the keeper's rows
---   input 2, moved    : ((ledger), (version, upper, following, clock, durable))   the rows the transaction gives and takes
---   input 3, floors   : ((ledger), (frontier))            each ledger's own hold, as the transaction in hand would leave it
---   input 4, before   : ((ledger), (frontier))            each ledger's own hold before the transaction
+--   input 1, standing : ((ledger), (version, frontier))   where each durable ledger would stand after the transaction
+--   input 2, floors   : ((ledger), (frontier))            each ledger's own hold, as the transaction in hand would leave it
+--   input 3, before   : ((ledger), (frontier))            each ledger's own hold before the transaction
 --
 --   forgotten : ((ledger), (need, floor))   a need of a ledger that is before the ledger's own hold
 --   receded   : ((ledger), (frontier))      a ledger whose own hold the transaction would move back, or take away while the
@@ -46,20 +46,8 @@ enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
 
 let config = input 0 : ((Entry), ());
 let standing = input 1 : ((Id), (int, Frontier));
-let moved = input 2 : ((Id), (int, Frontier, int, Id, int));
-let floors = input 3 : ((Id), (Frontier));
-let before = input 4 : ((Id), (Frontier));
-
--- WHERE THE LEDGERS STAND, with the ledgers the transaction in hand registers. A row it takes away has a count
--- below zero, and is not one of those: the rows are counted, since `distinct` keeps a row of either sign.
-let born = moved | map((id, row) -> ((id, row), ())) | count | filter((_, copies) -> (copies, 0) gt)
-                 | map(((id, (_, start, following, clock, durable)), _) -> (id, (start, following, clock, durable)))
-                 | filter((_, (_, _, _, durable)) -> durable);
-let led = born | filter((_, (_, following, _, _)) -> following) | map(((id), (start, _, clock, _)) -> ((clock), (id, start)));
-let lifted = led | join(standing, ((clock), (id, start), (_, frontier)) -> ((id), (0, (start, frontier) call frontier_join)));
-let rises = lifted | map((id, _) -> (id, ())) | distinct;
-let level = born | map((id, (start, _, _, _)) -> (id, (0, start)));
-let stood = standing + lifted + (level - (level | join(rises, (id, place, ()) -> (id, place))));
+let floors = input 2 : ((Id), (Frontier));
+let before = input 3 : ((Id), (Frontier));
 
 -- WHAT EACH LEDGER IS NEEDED FROM: NEEDS of system.ddp, with where the ledgers stand read from the rows.
 let table = config | distinct;
@@ -77,7 +65,7 @@ let reads = ins((computation, position), (Read(ledger))) | map(((computation, po
 let writes = outs((computation, position), (Written(ledger))) | map(((computation, position, ledger), ()) -> ((ledger), (computation, position))) | distinct;
 let relies = reads((ledger), (reader, _)) * derived((ledger), ()) * writes((ledger), (writer, _))
            | map(((ledger, reader, writer), ()) -> ((reader), (writer, ledger)));
-let stands = writes | join(stood, ((ledger), (computation, _), (_, frontier)) -> ((computation), (ledger, frontier)));
+let stands = writes | join(standing, ((ledger), (computation, _), (_, frontier)) -> ((computation), (ledger, frontier)));
 let pinned = holds((_, ledger), (frontier)) * derived((ledger), ()) * writes((ledger), (writer, _))
            | map(((ledger, frontier, writer), ()) -> ((writer), (ledger, frontier)));
 resuming: {

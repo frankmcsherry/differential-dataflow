@@ -22,6 +22,8 @@ Standing programs on one server. There is one copy of the configuration, and one
   gens       each ledger's generation: the log's length at its last pass of merges or drop
   own        own.ddp: each ledger's own hold, as the transaction in hand would leave it
   owned      own.ddp: each ledger's own hold before the transaction in hand
+  after      the rows the transaction in hand would leave: `rows`, with what `shift` gives and takes. It is not fed.
+  later      stand.ddp of `after`: where each durable ledger would stand after the transaction in hand
   readers    readers.ddp: a need, of the transaction in hand or of the state, that is before its ledger's own hold;
              and an own hold that the transaction would move back (`receded`)
   state      the entries of every transaction that was made, less the spans: a round's spans go to the log only
@@ -305,7 +307,12 @@ class Keeper:
         self.ask(f"load own from {DIR}/own.ddp input0=trial::entries")
         # And as it was before: the own hold only moves forward (readers.ddp, `receded`).
         self.ask(f"load owned from {DIR}/own.ddp input0=state::entries")
-        self.ask(f"load readers from {DIR}/readers.ddp input0=trial::entries input1=stand::standing input2=shift::moved input3=own::holds input4=owned::holds")
+        # Where the ledgers would stand after the transaction in hand: stand.ddp over the rows it would leave.
+        after = types + ('let own = input 0 : ((Id), (int, Frontier, int, Id, int));\nlet moved = input 1 : ((Id), (int, Frontier, int, Id, int));\n'
+                         'output "own" = own + moved;\n')
+        self.ask(f"load after input0=rows::own input1=shift::moved begin\n{after}after end-load")
+        self.ask(f"load later from {DIR}/stand.ddp input0=after::own")
+        self.ask(f"load readers from {DIR}/readers.ddp input0=trial::entries input1=later::standing input2=own::holds input3=owned::holds")
         # Where ledgers stand is the rows' to say, before and after: a transaction the rules judge moves no ledger.
         self.ask(f"load step from {DIR}/step.ddp input0=state::entries input1=change::removes input2=change::adds "
                  "input3=stand::standing input4=stand::standing input5=intake::actor")
@@ -945,6 +952,12 @@ def main():
         check("one whose output stands at it is made", k.transact(USER, [create(11, start=steps), define(103, 71, [1], [11])]) == [])
         check("one whose new output follows a clock that stands past it is made too",
               k.transact(USER, [create(12, clock=9), define(104, 71, [1], [12])]) == [])
+        # Where a new ledger stands is worked out over the rows the transaction would leave, clocks and all: here its clock
+        # is new too, and starts at the own hold.
+        said = k.transact(USER, [create(15, start=steps), create(16, clock=15), define(105, 71, [1], [16])])
+        check("and one whose new output follows a new clock that starts at it, in one transaction", said == [], str(said))
+        check("the new output stands where its clock starts", plumbing.stands(k.read("views::standing")).get(16) == (0, steps),
+              str(plumbing.stands(k.read("views::standing")).get(16)))
         check("a merge held from the own hold may now take out what it covers: both versions there, the one as written and the one held from 5",
               k.merges(k.number, *frames([(1, 0, steps, steps)], [(1, span(1, 0, steps, 0)), (1, span(1, 0, steps, 5))])) == [] and k.left == 2)
         # The own hold only moves forward: that merge took out spans that a reader from before it would need.
@@ -999,7 +1012,7 @@ def main():
               and not [row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(6)})")])
         check("an append to it is then absent", k.transact(USER, [append(6, 0, 0, 1)]) == ["absent"])
         judged = k.slow - before
-        check(f"{judged} transactions are judged by every rule", judged == 26,
+        check(f"{judged} transactions are judged by every rule", judged == 27,
               f"{1000 * (time.perf_counter() - begin) / judged:.0f} ms each")
 
         check("the state keeps every rule", k.audit() == [])
