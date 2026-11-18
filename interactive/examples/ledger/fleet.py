@@ -17,7 +17,7 @@ A machine's launcher runs under an SSH session that is held open from here. The 
 to this machine, the keeper's and the blob store's, so both are bound only to 127.0.0.1 on every machine.
 When the session ends, the launcher and its instances end with it: this is how a machine is lost, below.
 
-Before the first run the programs and the server binary are copied to `~/ledger-spike` on each machine.
+Before the first run the programs and the server binary are copied to `~/ledger-spike-rows` on each machine.
 
 Run from the repository root:
   python3 interactive/examples/ledger/fleet.py

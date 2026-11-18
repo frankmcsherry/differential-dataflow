@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Two stewards of a system of ledgers. Each reads the state and acts on what it says, and neither is told anything else.
+"""The stewards of a system of ledgers. Each reads the state and acts on what it says, and none is told anything else.
 
   python3 interactive/examples/ledger/steward.py compact <keeper url> <follower>   merge the spans of each ledger, as far as its readers allow
+  python3 interactive/examples/ledger/steward.py hold <keeper url> <follower>      move each ledger's own hold forward, to what its readers need
   python3 interactive/examples/ledger/steward.py collect <keeper url> <follower>   delete the blobs that no span names
+  python3 interactive/examples/ledger/steward.py vacuum <seconds>                  reclaim the blob store's space, now and then
 
-THIS IS A SCRATCH VARIANT, for a keeper that holds no spans.
+The keeper holds no spans.
 The compactor reads a follower's view of which spans to merge next (see compact.ddp): the merge to make of each ledger,
 and the entries each merge takes out. It asks the keeper for every merge of the pass together, and hands both over as
 the frames the follower gave it: it opens neither. Of its own it says one line: how many records of the log its follower
 had. What to merge and when is the view's to say, and the compactor decides none of it.
 After a pass it reads the proposals again only of a copy of the state that has that pass, so it asks nothing twice.
 A merge whose spans hold blobs has a batch to make: the frames of the parts, each with its times moved up to what the
-merged span is held from. The compactor does not open them. So equal updates are not added together, and ones that
-cancel are both kept: the merge makes a ledger's spans fewer, and not yet its batches smaller (see BACKLOG.md).
+merged span is held from. The compactor does not open them.
 It names each batch it made to the keeper in a frame it writes itself: the ledger, and the batch. That is the one
 thing it reads rows for: which blobs to fetch. A merge of spans that hold none has an empty batch, and nothing is said of it.
-THIS STEP: a merged batch is made in a server of the compactor's own (see `Merger`), so equal updates are added
-together and ones that cancel are gone. A batch is written to blobs of its own ledger, in parts of a bounded size,
+A merged batch is made in a server of the compactor's own (see `Merger`), so equal updates are added together and
+ones that cancel are gone; if a shape does not load there, the frames are put one after another instead. A batch is written to blobs of its own ledger, in parts of a bounded size,
 each its own blob, and names its parts in order; batches under a small size share one blob of the pass, a part each.
 A part is read by range and held to its own hash: no blob is read whole to read a part of it.
 The frames of a pass may be too long for a server to take. The policy's views are under shards, 64 of them by a ledger's
 id, and the compactor then asks for them a few shards at a time: as few as should fit, by how long they were.
 The policy bounds what one merge takes out and how many merges one shard offers, so one shard can always be handed
 over, however far behind compaction is, and a pass of fewer shards is always a smaller one.
-The keeper judges only that a ledger was not merged since the compactor's follower read, and that the merged span is
-held from no later than the ledger is needed from. Whether the entries are right is for a follower's rules to say after.
+The keeper judges that a ledger was not merged since the compactor's follower read, that the merge covers appends the
+ledger has, and that a merge that takes spans out is held from no later than the ledger's own hold (see pass.ddp).
+Whether the entries it takes out are there is for a follower's rules to say after.
 
 The collector reads the view `blobs` of a follower that keeps the rules, since the keeper holds no spans and cannot say
 which blobs are named. Nothing judges a delete, so the collector deletes only what is unnamed in a state whose every rule
@@ -213,7 +215,8 @@ def compact(url, follower):
             held -= len(cache.pop(key))
         if proposed:
             # The merges of the pass are asked for together. The keeper refuses those of ledgers that were merged after the
-            # copy read, and those held from later than their ledger is needed from, and says how long the log then is.
+            # copy read, those that take spans out and are held from later than their ledger's own hold, and those that do
+            # not cover their ledger's appends (see pass.ddp), and says how long the log then is.
             begin = time.perf_counter()
             turned, record, fused, left = keeper.merges(at, proposed, leaving, [plumbing.encode(plumbing.BATCHES, batches, timed=False)] if batches else [])
             took = time.perf_counter() - begin

@@ -10,11 +10,10 @@
 --
 --   moved : ((id), (version, upper, following, clock, durable))   the change to the rows: a new ledger's row,
 --                                                                 and, with a count of -1, a dropped ledger's row
---   kept    : ((id), (version))  a ledger the transaction would drop that has appends. A keeper that holds no spans
---                                cannot drop it: its spans are in the log, and a follower holds them, and that keeper has
---                                no way to say which entries leave with the ledger. One that holds them in a table drops
---                                it with its spans (see gone.ddp), and does not read this.
 --   dropped : ((id), ())         each ledger the transaction would drop
+--
+-- A ledger with appends may be dropped. Its spans are in the log, not here: a follower that applies the drop takes
+-- them out of its own copy (see gone.ddp, and follower.py).
 
 type Id = (int, int);
 type Bytes = List(int);
@@ -55,4 +54,3 @@ let dropped = taken((Ledger((key, val))), ()) | map(((id, _), ()) -> (id, ()))
             | join(own, (id, (), row) -> (id, row));
 output "moved" = created - dropped;
 output "dropped" = dropped | map((id, _) -> (id, ()));
-output "kept" = dropped | filter((_, (version, _, _, _, _)) -> (version, 0) gt) | map((id, (version, _, _, _, _)) -> (id, (version)));

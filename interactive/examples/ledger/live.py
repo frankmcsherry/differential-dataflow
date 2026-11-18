@@ -334,7 +334,7 @@ def main():
         # A merge is asked for as a pass of one: the keeper holds no spans, and is handed the entries that leave (see `Client.merge`).
         version = keeper.standing()[2][0]
         parts = [key for key, _ in keeper.entries()[SPAN] if number(key[0]) == 2]
-        # THIS COPY (tree_hold): a merge may take spans out only if it is held from at or before the ledger's own hold,
+        # A merge may take spans out only if it is held from at or before the ledger's own hold,
         # and the own hold moves only as far as the ledger's readers allow.
         own = lambda ledger, at: [f"inject(13,tuple({ident(0)},{ident(ledger)}))"] * bool(own_of(ledger)) + [hold(0, ledger, at)]
         own_of = lambda ledger: [row for row in copy.peek("own::holds")[0] if row.startswith(f"tuple({ident(ledger)})")]
@@ -417,12 +417,13 @@ def main():
         # through the derived ledger to ledger 1. The appends below go on through it.
         subprocess.run(["pkill", "-f", "runner.py run 0.505 "])
 
-        # Two stewards are started: a compactor and a collector. They read the state, and act by transactions.
+        # Three stewards are started, a compactor, a hold steward and a collector, and a follower that audits for the last.
+        # They read the state, and act by transactions; the collector deletes blobs.
         # Holder 900 asks for ledger 1 from time 10, so the compactor may merge it, and only as far as 10.
         check("a holder asks for ledger 1 from time 10", keeper.transact(USER, [hold(900, 1, 10)]) == [])
         steward_py = os.path.join(HERE, "steward.py")
         processes["compactor"] = spawn(steward_py, "compact", URL, FOLLOWER)
-        # THIS COPY: a steward moves each ledger's own hold to what its readers need, rounded down, now and then.
+        # The hold steward moves each ledger's own hold to what its readers need, rounded down, now and then.
         processes["holder"] = spawn(steward_py, "hold", URL, FOLLOWER, "views::needs", HOLD_STEP="5", HOLD_EVERY="0.5")
         # The collector reads a follower that keeps the rules in full, and deletes only what is unnamed in a state they pass.
         processes["auditor"] = spawn(follower_py, "serve", register, URL, str(AUDIT), "audit", FOLLOWER_RULES=FULL)
@@ -448,7 +449,7 @@ def main():
               f"{len(spans_of(2))} and {len(spans_of(3))} spans")
         # The hold is released, and more is appended. The compactor then follows the reader, past 10.
         check("the hold is released", keeper.transact(USER, [f"inject(13,tuple({ident(900)},{ident(1)}))"]) == [])
-        # THIS COPY: the steward then moves ledger 1's own hold to where its reader stands, rounded down; merges follow it.
+        # The hold steward then moves ledger 1's own hold to where its reader stands, rounded down; merges follow it.
         own_at = lambda ledger: [plumbing.parse(row.split(" val=")[1])[0][0][0] for row in copy.peek("own::holds")[0] if row.startswith(f"tuple({ident(ledger)})")]
         check("ledger 1's own hold then moves past 10", settle(lambda: own_at(1) and own_at(1)[0] > 10), f"to {own_at(1)}")
         for at in range(65, 75): assert write(at) == []

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """A keeper of a system of ledgers: the model's programs, on the stock server.
 
-This is the plainest thing that obeys the model (system.ddp, step.ddp, commands.ddp, admit.ddp, round.ddp).
+This is the plainest thing that obeys the model (system.ddp, step.ddp and commands.ddp), with the checks of appends
+(admit.ddp, round.ddp) and the programs over its own tables (see below).
 Nothing here has data: every batch is empty or a few bytes. The point is that the state is kept to its rules.
 
-THIS IS A SCRATCH VARIANT: a keeper that holds no spans, and keeps no rule over them.
+The keeper holds no spans, and keeps no rule over them: those are an audit follower's (system-full.ddp).
 The keeper holds one row for each ledger, which a round moves; each ledger's generation; and the configuration:
 ledgers, names, programs, computations, runs and holds. A round's spans go to the log, and a follower has them.
 Each ledger has an own hold (own.ddp): a `Hold` whose holder is (0, 0), the frontier from which every reader of the
@@ -1064,7 +1065,7 @@ def main():
         begin = time.perf_counter()
         k = Keeper(log)
         check("a keeper that starts again has the same state", sorted(k.ask("peek state::entries")) == entries,
-              f"{len(FileLog(log).read())} records read back in {time.perf_counter() - begin:.1f} s, each round's frames judged again whole")
+              f"{len(FileLog(log).read())} records read back in {time.perf_counter() - begin:.1f} s, with what each changed fed as it was")
         check("and the same rows, made again by the rounds", sorted(k.ask("peek rows::own")) == rows)
         check("and the same generations, from the marks the log kept: two ledgers merged, and three dropped", sorted(k.ask("peek gens::rows")) == gens and len(gens) == 5, str(gens))
         check("and takes the next append", k.transact(runner(100), [append(2, steps + 2, steps + 2, steps + 3)]) == [])

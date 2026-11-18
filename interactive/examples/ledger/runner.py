@@ -66,7 +66,7 @@ STORE = {"puts": 0, "gets": 0, "inline": 0, "blob": 0}      # what this instance
 
 def frames_of(found, blobs, cache):
     """The frames of some spans' batches, in order. Each span is (from, to, batch). The frames are not opened.
-    A batch names parts of blobs (or, in the older forms, a blob or a part of one). A part that is not in `cache` is
+    A batch names parts of blobs (or, in the short forms, a blob or a part of one). A part that is not in `cache` is
     read from `blobs` by range, held to its own hash, and kept there: what is read is no more than what is named."""
     read = []
     for _, _, batch in found: read += plumbing.frames_of_batch(blobs, batch, cache)
@@ -75,7 +75,7 @@ def frames_of(found, blobs, cache):
 
 def wanted(found, cache):
     """What the batches of some spans need read that `cache` does not have: parts, as (blob, offset, length, digest), and
-    blobs whole for a name of the older forms. Each as the key it is kept under in `cache`, and how to read it."""
+    blobs whole for a name of the short forms. Each as the key it is kept under in `cache`, and how to read it."""
     need = {}
     for spans in found:
         for _, _, batch in spans or []:

@@ -636,8 +636,8 @@ def piece_ints(name, place):
     digest = held if len(held) == DIGEST else hashlib.sha256(held).digest()[:DIGEST]
     return list(bytes.fromhex(name) + struct.pack(">QQ", at, long) + digest)
 def pieces_of(ints):
-    """The parts a batch's name names, in order: [(blob, offset, length, digest)]. A name of the older forms, a hash or
-    a hash and a place, has none."""
+    """The parts a batch's name names, in order: [(blob, offset, length, digest)]. A name of the short forms, a hash or
+    a hash and a place, has none: it names a blob whole, or a place in one. Tests and demos still write the first."""
     if len(ints) in (32, 48): return []
     assert len(ints) % PIECE == 0, "a batch's name is a hash, a hash and a place, or parts"
     data, found = bytes(ints), []
@@ -683,7 +683,7 @@ def fetch(blobs, pieces, cache):
 
 def batch_frames(blobs, ints, cache=None):
     """The frames of a batch, read from `blobs`: the parts its name names, each read by range and held to its hash, or,
-    for the older forms, the blob whole. `cache`, if given, is what was read before: by (blob, offset) for parts, and by
+    for the short forms, the blob whole. `cache`, if given, is what was read before: by (blob, offset) for parts, and by
     blob for wholes. What is read is put there."""
     cache = {} if cache is None else cache
     pieces = pieces_of(ints)
@@ -783,7 +783,8 @@ class Client:
         """Ask for one merge, as a user who has read a follower: a ledger's appends from `first` up to `last`, as one span
         held from `since`, with the spans it covers taken out. This is a pass of one (see the keeper's `merges`): what is
         proposed, and the entries that leave, written here as frames. Returns why it was refused: "late" if the ledger was
-        merged since the follower read, "beyond" if it is held from later than the ledger is needed from, or none."""
+        merged since the follower read, "beyond" if it takes spans out and is held from later than the ledger's own hold,
+        or none."""
         at, (entries,), _ = self.follower.views(["state::entries"], [], after=self.length())
         spans = [entry for (entry,), _ in entries if entry[1] == SPAN and entry[2][0][0] == ledger and first <= entry[2][0][1] and entry[2][0][2] <= last]
         lower = next(entry[2][1][0] for entry in spans if entry[2][0][1] == first)

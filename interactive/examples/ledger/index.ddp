@@ -1,8 +1,9 @@
 -- What round.ddp reads of each ledger, derived from the entries.
 --
 -- round.ddp does not derive this in each round: it is kept beside the entries, and each round's own output moves it.
--- This program says what it should be. A keeper that starts makes the index with it, and anyone may check with it,
--- off the path of a round, that the index a keeper holds is still what the entries say.
+-- This program says what it should be. The keeper does not load it: it makes its rows from its snapshots and the
+-- log's records. tests/ledger_system.rs checks with it, off the path of a round, that the rows a round leaves are
+-- still what the entries say.
 --
 --   input 0, entries : ((entry), ())
 --
@@ -12,9 +13,8 @@
 -- `clock` is that clock, or (0, 0). `durable` says whether its contents are its spans.
 --
 --   standing : ((id), (version, frontier))
--- Each durable ledger's version and write frontier, as system.ddp derives them. A keeper judges a transaction by
--- the rules of the state it would make, and so its one copy of system.ddp is of that state while it judges.
--- This is where the ledgers stand in the state as it is, before the transaction: admit.ddp and step.ddp read it.
+-- Each durable ledger's version and write frontier, as system.ddp derives them. Nothing reads it now: the keeper
+-- works out where each ledger stands from its rows, with stand.ddp, and the test reads only `own`.
 
 type Id = (int, int);
 type Bytes = List(int);

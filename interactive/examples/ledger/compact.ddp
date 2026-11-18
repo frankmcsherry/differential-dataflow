@@ -14,8 +14,8 @@
 -- frames, unopened, and a frame may be too large to hand over. It then asks for them a few shards at a time.
 -- So that one shard can always be handed over, a merge takes out at most 64 spans, and a shard's merges under 320.
 --
--- A compactor reads these three, makes the merged batch from the parts, and asks for the merge and the discards
--- in one transaction. The rules judge that transaction like any other. This says only what is worth asking for.
+-- A compactor reads these three, makes the merged batch from the parts, and hands the merges and what they take out
+-- to the keeper as one pass, which pass.ddp judges. This says only what is worth asking for.
 --
 -- The policy keeps the spans of a ledger few, and reads each append only a few times over.
 -- A ledger's CHAIN is the spans a reader would read now: one after another, they cover its appends from the first.
@@ -24,15 +24,16 @@
 -- So a chain of n appends has about log n spans. Each time an append is merged again, the span it is in has
 -- grown by half or more, so an append is read about log n times in all.
 -- A merge is not asked for until it would cover `least` appends, here 4, so that the newest appends are not
--- merged one by one: each merge is a transaction that every rule judges.
+-- merged one by one: each merge is a batch the compactor writes, and a part of a pass the keeper judges.
 --
--- What a merged span is held from is the least frontier the ledger is needed from, by computations and by holders.
--- Nothing that is needed is compacted away, and no more is kept than is needed.
+-- What a merged span is held from is the ledger's own hold (own.ddp), which every reader is promised it can read from.
+-- Nothing that is promised is compacted away.
 -- That frontier may be before where the merged appends begin. The merge then moves no time, and the span says so:
 -- a since at or before a span's lower means its times are as they were written.
--- A ledger that nothing needs is merged too, held from its start, and so keeps its times: someone may come to need it.
--- The least of two frontiers is taken to be one of them. That is right when one is before the other, as it is
--- for times of one coordinate. In general it wants the meet of the two, which DDIR does not yet have.
+-- A ledger with no own hold is merged too, held from its start, and so keeps its times: someone may come to need it.
+-- How far a merge reaches is bounded by where the ledger's readers have read to (LIMIT, from the needs).
+-- The least of their frontiers is taken to be one of them. That is right when one is before the other, as it is
+-- for times of one coordinate. In general it wants their meet: all their points together, by `frontier_normalize`.
 
 type Id = (int, int);
 type Bytes = List(int);
@@ -73,12 +74,11 @@ let version = tips | map(((id, to), ()) -> ((id), (to)))
                    | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
 
 -- WANTED: the frontier each durable ledger is to be kept readable from.
--- It is the least of what is asked of the ledger, by computations and by holders. If nothing is asked, it is the
--- ledger's start, which is before every time in it: the ledger is then kept as it was written.
--- The rows of a ledger are handed over with what is asked first, kind 0, and its start last, kind 1.
--- THIS VARIANT: what is wanted is the ledger's own hold (see own.ddp), which every reader is promised it can read
--- from, and is at or before every need: a merge held from there may take out what it covers. With no own hold, it is
--- the start, and merges keep the times as written. The needs (input 1) are not read here: the hold already answers them.
+-- It is the ledger's own hold (see own.ddp), which every reader is promised it can read from, and which is at or
+-- before every need: a merge held from there may take out what it covers. With no own hold, it is the ledger's
+-- start, which is before every time in it, and merges keep the times as written.
+-- The rows of a ledger are handed over with the own hold first, kind 0, and its start last, kind 1, and the first is kept.
+-- The needs (input 1) are not read here: the hold already answers them. LIMIT, below, reads them.
 let asks = (holds | filter(((holder, _), _) -> (holder, (0, 0)) eq) | map(((_, ledger), (need)) -> ((ledger), (0, need))))
          + (ledgers((id), (_, _, start, _, Durable)) | map(((id, start), ()) -> ((id), (1, start))))
          | distinct;

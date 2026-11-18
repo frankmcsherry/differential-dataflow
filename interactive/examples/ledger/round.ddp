@@ -4,7 +4,7 @@
 -- admit.ddp covers such a change when its appends are each to a different ledger, and judges each
 -- against the state before the change. So this does the same:
 --   of the transactions that append to a ledger in the round, the one of least key goes on, and the others wait;
---   a transaction that appends to one ledger twice waits too, in every round: it is for the rules to judge;
+--   a transaction that appends to one ledger twice is refused (TWICE, below): a round cannot order the two;
 --   an append to a ledger reads the clocks above it, so a transaction waits if one of lesser key appends to such a clock;
 --   each transaction that goes on is judged against the state as the round found it, by admit.ddp's checks,
 --   and is made if none of its appends is refused.
@@ -126,8 +126,8 @@ let judged = (met | filter((_, (_, _, _, _, _, _, _, following, _, _)) -> (follo
 -- WHO WAITS, in all: those crowded off a ledger, and those behind an append to a clock they read.
 let behind = judged | filter((_, (_, _, _, _, _, _, _, _, _, _, _, late)) -> late)
                     | map((_, (tx, _, _, _, _, _, _, _, _, _, _, _)) -> ((tx), ()));
--- THIS IS A SCRATCH VARIANT. A round's transactions come as frames, which the keeper does not open, so it cannot
--- keep out one that appends to a ledger twice. Such a one would wait in every round. Here it is refused: TWICE.
+-- A round's transactions come as frames, which the keeper does not open, so it cannot order two appends of one
+-- transaction to one ledger. Such a one would wait in every round, so it is refused: TWICE. The rules alone would make it.
 let twice = asked | map((ledger, (tx, _, _, _, _)) -> ((ledger, tx), ())) | count
                   | filter((_, copies) -> (copies, 1) gt) | map(((_, tx), _) -> ((tx), ())) | distinct;
 let pending = (crowded + behind) | distinct;

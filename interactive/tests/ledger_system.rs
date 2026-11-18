@@ -1,5 +1,5 @@
-//! The state of a system of ledgers (`examples/ledger/system.ddp`), changed by commands (`examples/ledger/commands.ddp`),
-//! with each change judged by the rules of a state and the rules of a step (`examples/ledger/step.ddp`).
+//! The state of a system of ledgers (`examples/ledger/system-full.ddp`), changed by commands (`examples/ledger/commands.ddp`),
+//! with each change judged by the rules of a state and the rules of a step (`examples/ledger/step-full.ddp`), in full.
 //!
 //! A transaction is made only if it breaks no rule. The test builds a small system by commands, reads its views,
 //! and then offers changes that each break rules, and checks that exactly those rules complain.

@@ -31,7 +31,7 @@ The second stops before each act and goes on at Enter.
     python3 interactive/examples/ledger/demo.py scale 200 4 10 20 the last act alone: computations, instances, ticks a second, seconds
 
 Without stopping, the walk takes about 25 seconds and the last act about 30.
-The walk copies the programs and the server to `~/ledger-spike` on each machine before it starts.
+The walk copies the programs and the server to `~/ledger-spike-rows` on each machine before it starts.
 
 ## What is on the page
 
@@ -40,7 +40,7 @@ Everything on the page is a view of the state, read from the follower on this ma
 - **What the state asks to run, and where.** Machines, their instances, and the computations each is asked to run.
 - **Where each ledger stands.** Its name, how many appends it has, its frontier, how many spans hold it, and who may write it.
 - **Computations.** What each reads and writes, and where it runs.
-- **The rules.** That all 29 hold, or the names of those that do not, and any computation that no instance runs.
+- **The rules.** That all 29 hold, or the names of those that do not, and any computation that no instance runs. In the walk these are the keeper's copy of the rules, in which the 8 that only a faulty party could break are left empty; in the running mode they are the audit follower's, the model in full.
 - **At the top.** The keeper's rounds, the transactions it judged alone by the rules, and the records in its log.
 
 A cell that changes is marked for a moment.
@@ -144,7 +144,8 @@ From the demo's own runs:
 - **A lost machine's two computations, on two other machines:** caught up 6 lines in 0.27 to 0.28 s.
 - **Load, 200 computations at 10 ticks a second for 20 s:** every tick done, median delay 129 to 145 ms, nine in ten under 218 to 238 ms, with the page up, over three runs.
 
-From the scale probes of 2026-11-16 (`ledger-fabric-sweeps-2026-11-10/scale`):
+From the scale probes of 2026-11-16 (`ledger-fabric-sweeps-2026-11-10/scale`), on the keeper of then, which held every span and kept every rule over them.
+The keeper here holds no spans, and these were not measured again on it:
 
 - **One server, 1,000 small computations, one step of all of them:** 85 ms, where it was 2.1 s before `advance` and `spin` were parted.
 - **A keeper that only admits, with no rules installed:** a round of 1,000 appends in 13 ms, and a tick of 2,000 appends in 55 ms.
@@ -156,16 +157,16 @@ From the scale probes of 2026-11-16 (`ledger-fabric-sweeps-2026-11-10/scale`):
 
 The sizes of things:
 
-- **The model and the views, as DDIR:** nine programs, 1,393 lines.
-- **The keeper, follower, instance, stewards and what they share, as Python:** 1,588 lines.
+- **The programs, as DDIR:** 18 programs, 2,528 lines, of which 500 are the model in full, kept a second time for the audit.
+- **The keeper, follower, instance, stewards and what they share, as Python:** 3,214 lines, in five files.
 
 ## What is not shown, and why
 
-- **1,000 computations at 10 ticks a second.** The keeper in the demo keeps every rule up to date as each append lands, and that is what gives out first. The numbers above say how far it is.
+- **1,000 computations at 10 ticks a second.** The walk is sized for the page. The numbers above are of an earlier keeper, and were not measured again on this one.
 - **Two instances of one computation, on purpose.** Act 3 shows it for a moment, by accident of timing. It is not tested as a way to run.
 - **Derived ledgers, and computations over the state.** They work, and `fleet.py` checks them. They are left out to keep the walk short.
 - **Clocks.** The model has them, and the round admits appends under them. No demo ticks one.
-- **Merges at a high rate.** A merge is judged by every rule, one transaction at a time. That is fine for four ledgers and not for a thousand.
-- **Blob clean-up that can be trusted.** The collector deletes a blob that no span has named for two seconds. That rests on time, and it should not.
+- **Merges at a high rate.** The keeper judges a pass of many merges at once (`pass.ddp`), and the walk has four ledgers, so few are made.
+- **Blob clean-up that can be trusted.** The collector deletes a blob as soon as no span names it, and one never seen named after a wait. That rests on time, and it should not.
 - **Who may transact.** The actor of a transaction is claimed, and nothing proves it.
 - **Times of more than one coordinate.** The model allows them. Every ledger here has times of one int.

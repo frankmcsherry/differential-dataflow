@@ -32,8 +32,11 @@ if STEADY:
     LAGS = {"tells instances": "127.0.0.1:7990", "compaction policy": "127.0.0.1:8000", "audit, every rule": "127.0.0.1:8010"}
 else:
     VIEWS, ROSTER, DRIVER = "127.0.0.1:7990", "127.0.0.1:7990", None
-    LAGS = {"this machine's": "127.0.0.1:7990"}          # the walk keeps no audit follower; this one has the rules
+    LAGS = {"this machine's": "127.0.0.1:7990"}          # this follower keeps the keeper's copy of the rules, not the model in full
 RULES = model.STATE_RULES
+# Whose rules the page reads: the audit follower's, the model in full, when running; else the keeper's copy, in which
+# the rules only a faulty party could break are left empty.
+WHOSE = "the model, in full" if STEADY else "the keeper's copy"
 MANY = 40                   # with more computations than this, each instance's are counted, not listed
 PORT = 8910
 
@@ -243,7 +246,7 @@ def frag():
     rules = ""
     if v:
         rules = (f'<p class="bad">Broken: {esc(", ".join(v["broken"]))}</p>' if v["broken"]
-                 else f'<p class="good">All {len(RULES)} rules of the model hold.</p>')
+                 else f'<p class="good">All {len(RULES)} rules of {WHOSE} hold.</p>')
     sections.append(f'<section><h2>Followers here, behind the keeper</h2>{table(["", "#"], rows)}<h2 class="second">The rules</h2>{rules}</section>')
 
     if not STEADY and v and len(v["standing"]) <= MANY:

@@ -1,7 +1,8 @@
 -- What an instance asks of the entries it is told: what to run, where its ledgers stand, and which spans to read.
 --
 -- An instance keeps this in its own server, over its copy of the entries (see bundle.ddp, and runner.py).
--- The instance acts on what these views say, and works none of it out for itself.
+-- The instance acts on what these views say. Its Python decides a few things itself (runner.py): where a computation
+-- begins, the least of its `resumes`; whether its outputs stand apart; and whether another wrote its outputs.
 --
 --   input 0, entries : ((entry), ())                       the entries the instance is told
 --   input 1, me      : ((instance), ())                    the instance's own id
@@ -10,7 +11,9 @@
 -- A reader is something in the instance that reads a ledger's appends in order. The instance names it as it likes,
 -- with two ints after a computation's id. `read` is the number of the ledger's appends it has read.
 -- `need` is the frontier it reads from: it can use a span whose since is at or before the need and the span's lower
--- together (see `forgotten` in system.ddp). The empty frontier is after every time, so a reader with that need
+-- together. `forgotten` in system.ddp asks the same of times of one coordinate; of times of more, it asks more, a
+-- since at or before the need alone, and so may call a ledger unreadable where this finds spans to read.
+-- The empty frontier is after every time, so a reader with that need
 -- can use any span: it is for one that wants what the ledger holds in the end, and not when.
 --
 --   plan     : ((computation), (inputs, outputs, takes, gives, text))   each computation the instance is asked to run,
