@@ -18,7 +18,7 @@ Standing programs on one server. There is one copy of the configuration, and one
              It is what round.ddp reads as `own`. Each round moves it with its own output, `moved`.
   stand      stand.ddp: where each durable ledger stands, from the rows
   shift      shift.ddp: the row a transaction in hand gives a ledger it registers, or takes from one it drops
-  gone       gone.ddp: what leaves the keeper's tables with a ledger the transaction in hand drops: its generation
+  gone       gone.ddp: what a drop in the transaction in hand does to the generations: it marks the dropped ledger's
   gens       each ledger's generation: the log's length at its last pass of merges or drop
   own        own.ddp: each ledger's own hold, as the transaction in hand would leave it
   owned      own.ddp: each ledger's own hold before the transaction in hand
@@ -355,7 +355,8 @@ class Keeper:
                 pending.extend([(f"feed gens 0 frame {len(frame)}", frame) for frame in marks])
             elif "moved" in record:
                 # A transaction the rules judged. Its entries, and what it changed in the rows, are fed: it is not judged again.
-                # After its change to the rows come the generations of the ledgers it dropped, which leave.
+                # After its change to the rows comes its change to the generations of the ledgers it dropped (`unmarked`
+                # counts those frames: in a record written before a drop marked the generation, they take it away).
                 at = entries + record["moved"]
                 unmarked = record.get("unmarked", 0)
                 pending.extend([(f"feed state 0 frame {len(frame)}", frame) for frame in frames[:entries]]
@@ -406,8 +407,10 @@ class Keeper:
         # A span is not the rules' to judge here. An append beside other commands, or two to one ledger, is turned away.
         if any(command.startswith(SPANNED) for command in commands): return ["spans"]
         # With its commands in hand, `trial` is the state it would make, and `views` and `step` are the rules of that.
+        # `gone` is told the log's length once this transaction is written: a ledger it drops is marked with it.
+        now = f"feed gone 2 tuple() val=tuple({self.number + 1})"
         self.many([f"feed intake 0 {index} val=tuple({command})" for index, command in enumerate(commands)]
-                  + [f"feed intake 1 tuple() val=tuple({actor})", "tick"])
+                  + [f"feed intake 1 tuple() val=tuple({actor})", now, "tick"])
         # `forgotten` is asked of the own holds: the rules' own answer is of a state with no spans, and is always none.
         refused = [rule for rule in STATE_RULES if self.ask("peek readers::forgotten" if rule == "forgotten" else f"peek views::{rule}")]
         refused += [rule for rule in STEP_RULES if self.ask(f"peek step::{rule}")]
@@ -419,19 +422,19 @@ class Keeper:
         # Beside the entries it changes, the record keeps what it changes in the rows: a restart feeds both. A ledger it
         # drops leaves with its own hold (see commands.ddp); its spans are in no table here, and a follower takes them out
         # of its copy itself (see follower.py): the record says how many ledgers it drops. After the change to the rows
-        # come the dropped ledgers' generations, which leave.
+        # comes the change to the dropped ledgers' generations, which are marked with the log's length.
         if not refused and self.log:
             some = lambda frames: [frame for frame in frames if plumbing.rows_of(frame)]
             moved = some(self.ask("peek shift::moved as corgi"))
             dropped = len(self.ask("peek shift::dropped"))
-            unmarked = some(self.ask("peek gone::unmarked as corgi"))
+            unmarked = some(self.ask("peek gone::marked as corgi"))
             self.write({"actor": actor, "commands": commands, "moved": len(moved), "drops": dropped, "unmarked": len(unmarked)},
                        some(self.ask("peek trial::delta as corgi")), moved + unmarked)
         # To make it, the state is fed what it changes as its commands are taken back: `trial` is then as it was.
-        # A ledger it registers is given its row, and one it drops loses its row and its generation.
+        # A ledger it registers is given its row, and one it drops loses its row, and its generation is marked.
         # To refuse it, its commands are taken back alone.
-        self.many(([] if refused else ["feed state 0 from trial::delta", "feed rows 0 from shift::moved", "feed gens 0 from gone::unmarked"])
-                  + ["feed intake 0 from intake::commands diff=-1", "feed intake 1 from intake::actor diff=-1", "tick"])
+        self.many(([] if refused else ["feed state 0 from trial::delta", "feed rows 0 from shift::moved", "feed gens 0 from gone::marked"])
+                  + ["feed intake 0 from intake::commands diff=-1", "feed intake 1 from intake::actor diff=-1", now + " diff=-1", "tick"])
         self.checkpoint()
         return refused
 
@@ -973,13 +976,22 @@ def main():
               and k.transact(USER, [hold(0, 13, 1)]) == [])
         check("a ledger with appends is dropped", k.transact(USER, [drop(7)]) == []
               and not [row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(7)})")])
-        check("and one that was merged, and held by itself, loses its row, its generation and its own hold", k.transact(USER, [drop(13)]) == [] and gen(13) == []
+        read = k.number
+        stale = frames([(13, 0, 2, 0)], [(13, span(13, 0, 2, 0))])
+        check("and one that was merged, and held by itself, loses its row and its own hold", k.transact(USER, [drop(13)]) == []
               and not [row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(13)})")]
               and not [row for row in k.ask("peek own::holds") if row.startswith(f"tuple({ident(13)})")])
+        # A drop marks the ledger's generation, as a pass does: a compactor that read before the drop is late, whatever has
+        # been registered under the id since.
         last = [each for each in FileLog(log).read(whole=True) if "actor" in each[0]][-1]
         left = [(key[0], diff) for frame in last[1][:last[0]["entries"]] for key, _, diff, _ in plumbing.decode(frame)]
         check("the drop's record says the ledger and its own hold leave, and that it drops one: its spans are the followers' to take out",
               sorted((entry[1], diff) for entry, diff in left) == [(0, -1), (6, -1)] and last[0].get("drops") == 1, str(left)[:300])
+        check("and its generation is the log's length at the drop", gen(13) == [f"tuple({k.number})"], str(gen(13)))
+        check("its id is registered again, and appended to twice", k.transact(USER, [create(13)]) == []
+              and k.transact(USER, [append(13, 0, 0, 1)]) == [] and k.transact(USER, [append(13, 1, 1, 2)]) == [])
+        check("a merge asked by a compactor that read before the drop is refused as late", k.merges(read, *stale) == [ident(13)] and k.late == [ident(13)])
+        check("and the ledger under that id is dropped again", k.transact(USER, [drop(13)]) == [] and gen(13) == [f"tuple({k.number})"], str(gen(13)))
         said = k.transact(USER, [drop(2)])
         check("nor one that a computation writes, a name names, and a holder holds", said == ["misnamed", "unregistered", "misheld"], str(said))
         k.many(["drop handed", "tick"])
@@ -987,7 +999,7 @@ def main():
               and not [row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(6)})")])
         check("an append to it is then absent", k.transact(USER, [append(6, 0, 0, 1)]) == ["absent"])
         judged = k.slow - before
-        check(f"{judged} transactions are judged by every rule", judged == 24,
+        check(f"{judged} transactions are judged by every rule", judged == 26,
               f"{1000 * (time.perf_counter() - begin) / judged:.0f} ms each")
 
         check("the state keeps every rule", k.audit() == [])
@@ -1041,7 +1053,7 @@ def main():
         check("a keeper that starts again has the same state", sorted(k.ask("peek state::entries")) == entries,
               f"{len(FileLog(log).read())} records read back in {time.perf_counter() - begin:.1f} s, each round's frames judged again whole")
         check("and the same rows, made again by the rounds", sorted(k.ask("peek rows::own")) == rows)
-        check("and the same generations, from the marks the log kept", sorted(k.ask("peek gens::rows")) == gens and len(gens) == 2, str(gens))
+        check("and the same generations, from the marks the log kept: two ledgers merged, and three dropped", sorted(k.ask("peek gens::rows")) == gens and len(gens) == 5, str(gens))
         check("and takes the next append", k.transact(runner(100), [append(2, steps + 2, steps + 2, steps + 3)]) == [])
     finally:
         k.close()

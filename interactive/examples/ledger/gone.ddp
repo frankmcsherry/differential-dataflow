@@ -1,14 +1,17 @@
--- What leaves the keeper's tables with a ledger that a transaction drops: its generation.
+-- What a drop does to the keeper's generations: it marks the dropped ledger's, as a pass of merges does.
 --
 -- The keeper holds no spans. A follower that applies a drop takes the dropped ledger's spans out of its copy itself
 -- (see follower.py): a span whose ledger is not registered is an orphan, and every follower finds the same ones at the
 -- same record. Its row leaves through shift.ddp, and its own hold through commands.ddp, with the ledger.
--- An id is taken never to be registered again once dropped, so its generation can go too.
+-- Its generation stays, and becomes the log's length at the drop. So a compactor that read before the drop is late
+-- (pass.ddp, `refused`), even if the id is registered again: what it read is not that ledger's.
+-- One row stays for each ledger that was ever dropped.
 --
 --   input 0, dropped : ((id), ())          the ledgers the transaction in hand drops (see shift.ddp)
 --   input 1, gens    : ((id), (number))    each ledger's generation
+--   input 2, now     : ((), (length))      the log's length once the transaction in hand is written
 --
---   unmarked  : ((id), (number))       the generations of the ledgers dropped, each with a count of -1
+--   marked  : ((id), (number))       the change to the generations: each dropped ledger's is now the log's length
 
 type Id = (int, int);
 type Bytes = List(int);
@@ -32,5 +35,7 @@ enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
 
 let dropped = input 0 : ((Id), ());
 let gens = input 1 : ((Id), (int));
-let marks = gens | join(dropped, (id, (number), ()) -> (id, (number)));
-output "unmarked" = (marks | filter((_, _) -> 0)) - marks;
+let now = input 2 : ((), (int));
+let before = gens | join(dropped, (id, (number), ()) -> (id, (number)));
+let after = dropped | map((id, ()) -> ((), (id))) | join(now, ((), (id), (length)) -> (id, (length)));
+output "marked" = after - before;
