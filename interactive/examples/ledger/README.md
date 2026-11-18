@@ -32,8 +32,7 @@ It is a prototype: the programs are real and tested, and the processes around th
 | [`commands.ddp`](commands.ddp) | the keeper | what each command removes and adds |
 | [`admit.ddp`](admit.ddp) | the keeper | the short check of a transaction of appends |
 | [`round.ddp`](round.ddp) | the keeper | the same check for many transactions at once |
-| [`shift.ddp`](shift.ddp) | the keeper | the row a transaction gives a ledger it registers, or takes from one it drops |
-| [`gone.ddp`](gone.ddp) | the keeper | what leaves the keeper's tables with a dropped ledger |
+| [`shift.ddp`](shift.ddp) | the keeper | what a transaction does to the keeper's tables: the row it gives a ledger it registers or takes from one it drops, and a dropped ledger's generation |
 | [`own.ddp`](own.ddp) | the keeper, the policy follower, the hold steward | each ledger's own read hold |
 | [`readers.ddp`](readers.ddp) | the keeper | a new reader that would begin before its ledger's read hold |
 | [`pass.ddp`](pass.ddp) | the keeper | a pass of merges: the generation, the cover, and the merge's bounds |

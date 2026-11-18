@@ -19,13 +19,12 @@ Standing programs on one server. There is one copy of the configuration, and one
   rows       one row for each ledger: its version, its own upper, the clock it follows, and whether it is durable.
              It is what round.ddp reads as `own`. Each round moves it with its own output, `moved`.
   stand      stand.ddp: where each durable ledger stands, from the rows
-  shift      shift.ddp: the row a transaction in hand gives a ledger it registers, or takes from one it drops
-  gone       gone.ddp: what a drop in the transaction in hand does to the generations: it marks the dropped ledger's
+  shift      shift.ddp: the row a transaction in hand gives a ledger it registers, or takes from one it drops, the rows
+             it would leave (`after`), and what a drop does to the generations: it marks the dropped ledger's
   gens       each ledger's generation: the log's length at its last pass of merges or drop
   own        own.ddp: each ledger's own hold, as the transaction in hand would leave it
   owned      own.ddp: each ledger's own hold before the transaction in hand
-  after      the rows the transaction in hand would leave: `rows`, with what `shift` gives and takes. It is not fed.
-  later      stand.ddp of `after`: where each durable ledger would stand after the transaction in hand
+  later      stand.ddp of `shift::after`: where each durable ledger would stand after the transaction in hand
   readers    readers.ddp: a need, of the transaction in hand or of the state, that is before its ledger's own hold;
              and an own hold that the transaction would move back (`receded`)
   state      the entries of every transaction that was made, less the spans: a round's spans go to the log only
@@ -304,18 +303,15 @@ class Keeper:
         self.ask(f"load change from {DIR}/commands.ddp input0=intake::commands input1=state::entries")
         self.ask(f"load trial input0=state::entries input1=change::adds input2=change::removes begin\n{trial}trial end-load")
         self.ask(f"load stand from {DIR}/stand.ddp input0=rows::own")
-        self.ask(f"load shift from {DIR}/shift.ddp input0=trial::added input1=trial::removed input2=rows::own")
-        self.ask(f"load gone from {DIR}/gone.ddp input0=shift::dropped input1=gens::rows")
+        # What the transaction in hand does to the rows and the generations; input 4, the log's length, is fed with it.
+        self.ask(f"load shift from {DIR}/shift.ddp input0=trial::added input1=trial::removed input2=rows::own input3=gens::rows")
         # Each ledger's own hold, as the transaction in hand would leave it. Every need of a ledger, new or old, must be at
         # or after it: so a new use from before it is refused, and so is a move of it past a use (readers.ddp).
         self.ask(f"load own from {DIR}/own.ddp input0=trial::entries")
         # And as it was before: the own hold only moves forward (readers.ddp, `receded`).
         self.ask(f"load owned from {DIR}/own.ddp input0=state::entries")
         # Where the ledgers would stand after the transaction in hand: stand.ddp over the rows it would leave.
-        after = types + ('let own = input 0 : ((Id), (int, Frontier, int, Id, int));\nlet moved = input 1 : ((Id), (int, Frontier, int, Id, int));\n'
-                         'output "own" = own + moved;\n')
-        self.ask(f"load after input0=rows::own input1=shift::moved begin\n{after}after end-load")
-        self.ask(f"load later from {DIR}/stand.ddp input0=after::own")
+        self.ask(f"load later from {DIR}/stand.ddp input0=shift::after")
         # What each computation reads and writes, and what each ledger is needed from, with where ledgers would stand.
         self.ask(f"load needs from {DIR}/needs.ddp input0=trial::entries input1=later::standing")
         # Each ledger's row as the entries say, for the rules over spans: the keeper's entries have no spans, so every
@@ -425,8 +421,8 @@ class Keeper:
         # A span is not the rules' to judge here. An append beside other commands, or two to one ledger, is turned away.
         if any(command.startswith(SPANNED) for command in commands): return ["spans"]
         # With its commands in hand, `trial` is the state it would make, and `views` and `step` are the rules of that.
-        # `gone` is told the log's length once this transaction is written: a ledger it drops is marked with it.
-        now = f"feed gone 2 tuple() val=tuple({self.number + 1})"
+        # `shift` is told the log's length once this transaction is written: a ledger it drops is marked with it.
+        now = f"feed shift 4 tuple() val=tuple({self.number + 1})"
         self.many([f"feed intake 0 {index} val=tuple({command})" for index, command in enumerate(commands)]
                   + [f"feed intake 1 tuple() val=tuple({actor})", now, "tick"])
         # `forgotten` is asked of the own holds: the rules' own answer is of a state with no spans, and is always none.
@@ -445,13 +441,13 @@ class Keeper:
             some = lambda frames: [frame for frame in frames if plumbing.rows_of(frame)]
             moved = some(self.ask("peek shift::moved as corgi"))
             dropped = len(self.ask("peek shift::dropped"))
-            unmarked = some(self.ask("peek gone::marked as corgi"))
+            unmarked = some(self.ask("peek shift::marked as corgi"))
             self.write({"actor": actor, "commands": commands, "moved": len(moved), "drops": dropped, "unmarked": len(unmarked)},
                        some(self.ask("peek trial::delta as corgi")), moved + unmarked)
         # To make it, the state is fed what it changes as its commands are taken back: `trial` is then as it was.
         # A ledger it registers is given its row, and one it drops loses its row, and its generation is marked.
         # To refuse it, its commands are taken back alone.
-        self.many(([] if refused else ["feed state 0 from trial::delta", "feed rows 0 from shift::moved", "feed gens 0 from gone::marked"])
+        self.many(([] if refused else ["feed state 0 from trial::delta", "feed rows 0 from shift::moved", "feed gens 0 from shift::marked"])
                   + ["feed intake 0 from intake::commands diff=-1", "feed intake 1 from intake::actor diff=-1", now + " diff=-1", "tick"])
         self.checkpoint()
         return refused
