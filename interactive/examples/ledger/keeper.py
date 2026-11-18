@@ -21,7 +21,9 @@ Standing programs on one server. There is one copy of the configuration, and one
   gone       gone.ddp: what leaves the keeper's tables with a ledger the transaction in hand drops: its generation
   gens       each ledger's generation: the log's length at its last pass of merges or drop
   own        own.ddp: each ledger's own hold, as the transaction in hand would leave it
-  readers    readers.ddp: a need, of the transaction in hand or of the state, that is before its ledger's own hold
+  owned      own.ddp: each ledger's own hold before the transaction in hand
+  readers    readers.ddp: a need, of the transaction in hand or of the state, that is before its ledger's own hold;
+             and an own hold that the transaction would move back (`receded`)
   state      the entries of every transaction that was made, less the spans: a round's spans go to the log only
   intake     the commands of the one transaction in hand, and who makes it
   change     commands.ddp: the entries those commands would remove and add
@@ -301,7 +303,9 @@ class Keeper:
         # Each ledger's own hold, as the transaction in hand would leave it. Every need of a ledger, new or old, must be at
         # or after it: so a new use from before it is refused, and so is a move of it past a use (readers.ddp).
         self.ask(f"load own from {DIR}/own.ddp input0=trial::entries")
-        self.ask(f"load readers from {DIR}/readers.ddp input0=trial::entries input1=stand::standing input2=shift::moved input3=own::holds")
+        # And as it was before: the own hold only moves forward (readers.ddp, `receded`).
+        self.ask(f"load owned from {DIR}/own.ddp input0=state::entries")
+        self.ask(f"load readers from {DIR}/readers.ddp input0=trial::entries input1=stand::standing input2=shift::moved input3=own::holds input4=owned::holds")
         # Where ledgers stand is the rows' to say, before and after: a transaction the rules judge moves no ledger.
         self.ask(f"load step from {DIR}/step.ddp input0=state::entries input1=change::removes input2=change::adds "
                  "input3=stand::standing input4=stand::standing input5=intake::actor")
@@ -408,6 +412,7 @@ class Keeper:
         refused = [rule for rule in STATE_RULES if self.ask("peek readers::forgotten" if rule == "forgotten" else f"peek views::{rule}")]
         refused += [rule for rule in STEP_RULES if self.ask(f"peek step::{rule}")]
         if self.ask("peek change::unmet"): refused.append("unmet")
+        if self.ask("peek readers::receded"): refused.append("receded")
         self.slow += 1
         # It is written down, or handed to the writer, as it is made. If the log does not take it, the keeper stops,
         # and no one has seen what it made.
@@ -939,6 +944,11 @@ def main():
               k.transact(USER, [create(12, clock=9), define(104, 71, [1], [12])]) == [])
         check("a merge held from the own hold may now take out what it covers: both versions there, the one as written and the one held from 5",
               k.merges(k.number, *frames([(1, 0, steps, steps)], [(1, span(1, 0, steps, 0)), (1, span(1, 0, steps, 5))])) == [] and k.left == 2)
+        # The own hold only moves forward: that merge took out spans that a reader from before it would need.
+        check("the own hold cannot move back", k.transact(USER, [hold(0, 1, steps - 1)]) == ["receded"])
+        check("nor by a release and a hold in one transaction", k.transact(USER, [release(0, 1), hold(0, 1, steps - 1)]) == ["receded"])
+        check("nor be taken away while its ledger is registered", k.transact(USER, [release(0, 1)]) == ["receded"])
+        check("and a reader from before it is still refused", k.transact(USER, [hold(903, 1, steps - 1)]) == ["forgotten"])
         # Two compactors that read the same state: the second is refused by the ledger's generation.
         read = k.number
         check("two compactors read one state, and the first's merge is made", k.merges(read, *frames([(2, 0, steps, 0)], [(2, span(2, t, t + 1, t)) for t in range(steps)])) == [])
@@ -977,7 +987,7 @@ def main():
               and not [row for row in k.ask("peek rows::own") if row.startswith(f"tuple({ident(6)})")])
         check("an append to it is then absent", k.transact(USER, [append(6, 0, 0, 1)]) == ["absent"])
         judged = k.slow - before
-        check(f"{judged} transactions are judged by every rule", judged == 20,
+        check(f"{judged} transactions are judged by every rule", judged == 24,
               f"{1000 * (time.perf_counter() - begin) / judged:.0f} ms each")
 
         check("the state keeps every rule", k.audit() == [])

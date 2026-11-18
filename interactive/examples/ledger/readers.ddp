@@ -3,13 +3,13 @@
 -- A reader of a ledger begins from some frontier: a holder from what it holds, and a computation from where its outputs
 -- stand (NEEDS, in system.ddp). The ledger must be readable from there. With the spans in hand that is the rule
 -- `forgotten` of system.ddp, which asks whether the spans a reader from that frontier can use join up.
--- This keeper has no spans. It keeps one frontier for each ledger that a merge has compacted, its floor (see pass.ddp):
--- the join of what every such merge was held from. Any chain of the ledger's spans asks of a reader no more than that.
--- So a reader that begins at or after the floor can read the ledger, as long as its spans join up at all, which is a
--- follower's rule to keep. One that begins before the floor is refused here.
--- This refuses every reader that `forgotten` refuses. It may refuse one that `forgotten` would let by: when a merged
--- span stands beside the spans it covers, which a reader from before could still use; and when two merges were held
--- from frontiers neither of which is before the other, where the join is after both.
+-- This keeper has no spans. It keeps each ledger's own hold (own.ddp), the frontier from which every reader of the ledger
+-- is promised it can read it. A merge that takes spans out must be held from at or before it (pass.ddp), and it only
+-- moves forward (RECEDED, below). So any chain of the ledger's spans asks of a reader no more than its own hold.
+-- So a reader that begins at or after the own hold can read the ledger, as long as its spans join up at all, which is a
+-- follower's rule to keep. One that begins before the own hold is refused here.
+-- This refuses every reader that `forgotten` refuses. It may refuse one that `forgotten` would let by: one from before
+-- the own hold, when no merge has yet taken out the spans it would use.
 --
 -- The transaction in hand may register a ledger, which has no row yet (see shift.ddp). It stands at its start,
 -- joined with where the clock it follows stands, if that clock stands anywhere.
@@ -17,9 +17,12 @@
 --   input 0, config   : ((entry), ())                     the configuration the transaction in hand would make
 --   input 1, standing : ((ledger), (version, frontier))   where each durable ledger stands, from the keeper's rows
 --   input 2, moved    : ((ledger), (version, upper, following, clock, durable))   the rows the transaction gives and takes
---   input 3, floors   : ((ledger), (frontier))            what each ledger that a merge has compacted can be read from
+--   input 3, floors   : ((ledger), (frontier))            each ledger's own hold, as the transaction in hand would leave it
+--   input 4, before   : ((ledger), (frontier))            each ledger's own hold before the transaction
 --
---   forgotten : ((ledger), (need, floor))   a need of a ledger that is before the ledger's floor
+--   forgotten : ((ledger), (need, floor))   a need of a ledger that is before the ledger's own hold
+--   receded   : ((ledger), (frontier))      a ledger whose own hold the transaction would move back, or take away while the
+--                                           ledger stays registered: with the own hold it had
 
 type Id = (int, int);
 type Bytes = List(int);
@@ -45,6 +48,7 @@ let config = input 0 : ((Entry), ());
 let standing = input 1 : ((Id), (int, Frontier));
 let moved = input 2 : ((Id), (int, Frontier, int, Id, int));
 let floors = input 3 : ((Id), (Frontier));
+let before = input 4 : ((Id), (Frontier));
 
 -- WHERE THE LEDGERS STAND, with the ledgers the transaction in hand registers. A row it takes away has a count
 -- below zero, and is not one of those: the rows are counted, since `distinct` keeps a row of either sign.
@@ -89,3 +93,17 @@ let asks = (needs | map(((source), (need)) -> ((source), (need))))
 
 output "forgotten" = asks | join(floors, (ledger, (need), (floor)) -> (ledger, (need, floor)))
                           | filter((_, (need, floor)) -> ((floor, need) call frontier_le, 0) eq);
+
+-- RECEDED: a ledger's own hold only moves forward. Merges may already have taken out spans that a reader from before it
+-- would need, and this keeper, which has no spans, cannot tell. So a transaction that would leave a ledger's own hold
+-- before where it was, or take it away while the ledger stays registered, is refused. A ledger that the transaction drops
+-- takes its own hold with it (see commands.ddp). A ledger with no own hold before may be given one from anywhere.
+-- The model has no such rule: it judges a move of the own hold by the spans, in `forgotten`.
+let registered = ledgers | map((id, _) -> (id, ())) | distinct;
+let kept = before | join(registered, (id, (was), ()) -> (id, (was)));
+let back = kept | join(floors, (id, (was), (now)) -> (id, (was, now)))
+                | filter((_, (was, now)) -> ((was, now) call frontier_le, 0) eq)
+                | map((id, (was, _)) -> (id, (was)));
+let still = floors | map((id, _) -> (id, ())) | distinct;
+let lost = kept - (kept | join(still, (id, (was), ()) -> (id, (was))));
+output "receded" = back + lost;

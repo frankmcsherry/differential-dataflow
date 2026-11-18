@@ -79,6 +79,7 @@ The spike uses binary tails, so this matters only to someone who reads a tail as
 - **A clock that follows a clock** is not tested in a round.
 - **Text is still read** by the keeper, of the keys a round leaves waiting or refused and of whether a rule is empty, and by the collector, of the blobs that spans name. Each is a few small rows.
 - **Two copies of the rules.** `system.ddp` and `step.ddp` are the keeper's: the same views and the same rule names as the model, with each rule that only a faulty party could break left empty. `system-full.ddp` and `step-full.ddp` are the model in full, kept by a follower that audits, and by `tests/ledger_system.rs`. One program for each role's rules would replace the copies.
+- **An own hold only moves forward, and the model does not say so.** The keeper refuses a transaction that would move a ledger's own hold back, or take it away while the ledger stays registered (`receded`, in `readers.ddp`), because it cannot tell which spans merges have taken out. The model judges such a move by the spans, in `forgotten`, and would let one by when the spans a reader needs are still there. Whether the model should have the rule too is not decided.
 - **A round refuses a transaction that appends to one ledger twice.** A round takes appends as frames it does not open, so it cannot order two appends to one ledger within a transaction. The rules alone would make such a transaction. `round.ddp` marks this as a scratch variant.
 
 ## What a scale probe found
