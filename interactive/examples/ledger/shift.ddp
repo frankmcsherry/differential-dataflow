@@ -1,0 +1,75 @@
+-- What a change to the configuration does to the keeper's own tables: its rows, and its generations.
+--
+-- A keeper that holds no spans keeps one row for each ledger (see round.ddp, `own`). A round moves the rows of the
+-- ledgers it appends to. A transaction that registers a ledger gives it a row, and one that drops a ledger takes
+-- its row away. This says which, from what the transaction in hand puts into the state and takes out of it.
+--
+-- A drop also marks the dropped ledger's generation, as a pass of merges does (see pass.ddp): it becomes the log's
+-- length at the drop. So a compactor that read before the drop is late (pass.ddp, `refused`), even if the id is
+-- registered again: what it read is not that ledger's. One generation stays for each ledger that was ever dropped.
+--
+-- A ledger with appends may be dropped. Its spans are in the log, not here: a follower that applies the drop takes
+-- them out of its own copy (see follower.py): a span whose ledger is not registered is an orphan, and every follower
+-- finds the same ones at the same record. Its own hold leaves through commands.ddp, with the ledger.
+--
+--   input 0, adds    : ((entry), ())   the entries the transaction puts in that were not there (`trial::added` in keeper.py)
+--   input 1, removes : ((entry), ())   the entries it takes out that were there (`trial::removed`)
+--   input 2, own     : ((id), (version, upper, following, clock, durable))   the rows
+--   input 3, gens    : ((id), (number))    each ledger's generation
+--   input 4, now     : ((), (length))      the log's length once the transaction in hand is written
+--
+--   moved   : ((id), (version, upper, following, clock, durable))   the change to the rows: a new ledger's row,
+--                                                                   and, with a count of -1, a dropped ledger's row
+--   after   : ((id), (version, upper, following, clock, durable))   the rows the transaction would leave
+--   dropped : ((id), ())             each ledger the transaction would drop
+--   marked  : ((id), (number))       the change to the generations: each dropped ledger's is now the log's length
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let adds = input 0 : ((Entry), ());
+let removes = input 1 : ((Entry), ());
+let own = input 2 : ((Id), (int, Frontier, int, Id, int));
+let gens = input 3 : ((Id), (int));
+let now = input 4 : ((), (int));
+
+-- What is put in and taken out again is neither. The entries are counted, since `distinct` keeps a row whose
+-- count is below zero as it keeps one whose count is above.
+let put = adds - removes | count | filter((_, copies) -> (copies, 0) gt) | map((entry, _) -> (entry, ()));
+let taken = removes - adds | count | filter((_, copies) -> (copies, 0) gt) | map((entry, _) -> (entry, ()));
+
+-- A new ledger has no appends, and its own upper is its start.
+let created = put((Ledger((key, val))), ())
+            | map(((id, (_, _, start, clock, keep)), ()) ->
+                  let (following, above) = clock match (Free (_ -> (0, (0, 0))), Follows (clock -> (1, clock))) in
+                  let durable = keep match (Durable (_ -> 1), Derived (_ -> 0)) in
+                  (id, (0, start, following, above, durable)));
+let dropped = taken((Ledger((key, val))), ()) | map(((id, _), ()) -> (id, ()))
+            | join(own, (id, (), row) -> (id, row));
+let moved = created - dropped;
+output "moved" = moved;
+output "after" = own + moved;
+let gone = dropped | map((id, _) -> (id, ()));
+output "dropped" = gone;
+
+-- MARKED: each dropped ledger's generation, from what it was to the log's length.
+let was = gens | join(gone, (id, (number), ()) -> (id, (number)));
+let fresh = gone | map((id, ()) -> ((), (id))) | join(now, ((), (id), (length)) -> (id, (length)));
+output "marked" = fresh - was;

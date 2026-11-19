@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// A time as a client writes it: its first coordinate alone when the others are zero.
+pub(super) fn coordinates(time: &HostTime) -> String {
+    if time.len() <= 1 { time.get(0).copied().unwrap_or(0).to_string() } else { format!("{:?}", time.to_vec()) }
+}
+
 pub(super) fn caught_up(probe: &ProbeHandle<HostTime>, point: &HostTime) -> bool {
     probe.with_frontier(|frontier| frontier.iter().all(|t| point.less_equal(t)))
 }
@@ -24,6 +29,77 @@ impl Server {
         self.validate_feed(prog, input, point)?;
         self.programs.get_mut(&canonical_source_name(prog)).unwrap().inputs.get_mut(&input).unwrap().advance_to_point(point);
         Ok(())
+    }
+
+    /// Whether `prog` is piloted: a client moves its inputs, and `tick` leaves them be.
+    pub fn is_piloted(&self, prog: &str) -> bool {
+        self.programs.get(&canonical_source_name(prog)).is_some_and(|p| p.pace == Pace::Piloted)
+    }
+
+    /// Whether `trace` is published by a piloted program.
+    pub fn trace_is_piloted(&self, trace: &str) -> bool {
+        self.outputs.get(&canonical_source_name(trace)).is_some_and(|o| self.is_piloted(&o.owner))
+    }
+
+    /// The frontier `trace` has once it has caught up with every `tick` and `advance` so far:
+    /// the current epoch, or for a piloted program's trace the least of the times that its
+    /// inputs, and those of the programs it reads, stand at. A reader of the trace that has
+    /// reached this frontier has every change the commands so far have made.
+    pub fn target(&self, trace: &str) -> Result<Antichain<HostTime>, String> {
+        let name = canonical_source_name(trace);
+        let output = self.outputs.get(&name).ok_or_else(|| format!("no trace {trace:?}"))?;
+        let mut frontier = Antichain::new();
+        if self.trace_is_piloted(&name) {
+            self.collect_frontier(&output.owner, &mut std::collections::HashSet::new(), &mut frontier);
+        } else {
+            frontier.insert(host_time(self.epoch));
+        }
+        Ok(frontier)
+    }
+
+    /// The time a reader of `trace` started now reads it as of: [`Server::import_as_of`], or
+    /// for a piloted program's trace its own compaction frontier, which no epoch moves.
+    pub fn read_as_of(&self, trace: &str) -> HostTime {
+        match self.outputs.get(&canonical_source_name(trace)) {
+            Some(output) if self.is_piloted(&output.owner) => output.since.clone(),
+            _ => self.import_as_of(),
+        }
+    }
+
+    /// Move one input of a piloted program to `time`, alone: no other input moves, of this
+    /// program or of any other. This does not wait for what follows from it: [`Server::spin`]
+    /// does, once, for as many inputs as were moved. Collective across workers.
+    ///
+    /// The input must be at or before `time`. What was fed to it at times before `time` takes
+    /// effect; nothing may be fed to it before `time` afterwards.
+    pub fn advance(&mut self, prog: &str, input: usize, time: &HostTime) -> Result<(), String> {
+        if !self.is_piloted(prog) {
+            return Err(format!("cannot advance input {prog:?}/{input}: `tick` moves this program's inputs; install it piloted to move them one at a time"));
+        }
+        let frontier = self.input_frontier(prog, input)?;
+        if !frontier.less_equal(time) {
+            return Err(format!("cannot advance input {prog:?}/{input} to {}: it stands at {}", coordinates(time), coordinates(frontier)));
+        }
+        self.advance_input(prog, input, time)
+    }
+
+    /// Run until every piloted program's outputs have caught up with their inputs, and let
+    /// those outputs compact. Collective across workers.
+    pub fn spin(&mut self, worker: &mut Worker) { self.settle_piloted(worker); }
+
+    /// Run until every piloted program's outputs have caught up with what was commanded, then
+    /// let each compact to just before its frontier, as `tick` compacts the rest to just before
+    /// the epoch: [`Server::peek`] reads the last complete time, so it must stay distinct.
+    pub(super) fn settle_piloted(&mut self, worker: &mut Worker) {
+        let names: Vec<_> = self.outputs.iter().filter(|(_, o)| o.width == 1 && self.programs[&o.owner].pace == Pace::Piloted).map(|(n, _)| n.clone()).collect();
+        for name in names {
+            let frontier = self.target(&name).expect("a published trace has a frontier");
+            self.wait_for_frontier(worker, &name, &frontier).expect("a width-one frontier fits a width-one trace");
+            if let Some(least) = frontier.elements().iter().map(|t| t.get(0).copied().unwrap_or(0)).min() {
+                let since = self.outputs[&name].since.join(&host_time(least.saturating_sub(1)));
+                self.compact(&name, &since).expect("monotone compaction of a piloted trace");
+            }
+        }
     }
 
     /// Wait for this export alone to reach a point frontier. Advance all of its producers

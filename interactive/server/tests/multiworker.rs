@@ -507,6 +507,7 @@ fn tail_frames_sum_to_peeks_on_four_workers() {
 }
 
 /// Send `header` and then `payload` as one write, and read through the request's `ok` or `err`.
+/// A frame that a binary tail sends meanwhile is read past, bytes and all.
 fn framed(writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, reqid: &str, header: &str, payload: &[u8]) -> Result<(), String> {
     let mut wire = header.as_bytes().to_vec();
     wire.extend_from_slice(payload);
@@ -515,6 +516,10 @@ fn framed(writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, reqid: &str
     loop {
         let mut line = String::new();
         assert_ne!(reader.read_line(&mut line).unwrap(), 0, "server disconnected");
+        if let [_, "frame", _, length] = line.trim_end().split(' ').collect::<Vec<_>>()[..] {
+            reader.read_exact(&mut vec![0; length.parse().unwrap()]).unwrap();
+            continue;
+        }
         let Some(rest) = line.trim_end().strip_prefix(reqid).and_then(|line| line.strip_prefix(' ')) else { continue };
         if rest == "ok" || rest.starts_with("ok ") {
             return Ok(());
@@ -663,6 +668,237 @@ fn loads_bind_inputs_to_published_outputs() {
     request(&mut writer, &mut reader, "f", "f feed g::e 1 val=3 diff=-1\n");
     request(&mut writer, &mut reader, "t", "t tick\n");
     assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::hop\n"), ["tuple(tuple(2))"]);
+    drop(reader);
+    drop(writer);
+    server.stop();
+}
+
+/// A span as a binary frame: the columns of `rows`, each `(key, val, diff, time)`, read at `shape`,
+/// with one time lane, as a binary tail's frames have.
+fn span_frame(shape: &interactive::server::RowShape, rows: &[(&str, Option<&str>, i64, u64)]) -> Vec<u8> {
+    let mut decoder = interactive::runtime::feed::FeedDecoder::new(&shape.0, &shape.1);
+    for (key, val, diff, _) in rows {
+        decoder.push(key, *val, *diff).unwrap();
+    }
+    interactive::runtime::frame::encode(&decoder.finish(), &[rows.iter().map(|row| row.3).collect()])
+}
+
+/// The rows of the `data` frames among `frames`, sorted, and the upper of the last `progress`
+/// frame among them: a tail may say its progress in several steps.
+fn heard(frames: &mut Vec<(String, Vec<u8>)>) -> (Vec<String>, Option<u64>) {
+    let mut rows: Vec<String> = frames.iter().filter(|f| f.0 == "data").flat_map(|f| frame_rows(&f.1)).collect();
+    rows.sort();
+    let progress = frames.iter().rev().find(|f| f.0 == "progress").map(|f| u64::from_le_bytes(f.1[..8].try_into().unwrap()));
+    frames.clear();
+    (rows, progress)
+}
+
+/// A piloted program's inputs each take a span, updates at their own times, and each moves alone
+/// with `advance`. No `tick` is sent. A binary tail of its output sends each change at its time,
+/// and `progress` as the least of the inputs' times moves; a peek reads what is complete.
+fn assert_spans(workers: usize) {
+    let (server, mut writer, mut reader) = start_server(workers);
+    let loaded = framed(&mut writer, &mut reader, "l", "l load p piloted begin\nlet a = input \"a\" : ((int), (int));\nlet b = input \"b\" : ((int), (int));\noutput \"both\" = a + b;\nl end-load\n", &[]);
+    assert_eq!(loaded, Ok(()));
+    let shape = declared("((int), (int))");
+    let mut frames = Vec::new();
+    request_observing(&mut writer, &mut reader, "w", "w tail p::both as corgi\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    let a = span_frame(&shape, &[("1", Some("10"), 1, 0), ("2", Some("20"), 1, 1), ("3", Some("30"), 1, 2), ("1", Some("10"), -1, 2)]);
+    let b = span_frame(&shape, &[("1", Some("100"), 1, 0), ("2", Some("200"), 1, 3)]);
+    framed(&mut writer, &mut reader, "f", &format!("f feed p a frame {}\n", a.len()), &a).unwrap();
+    framed(&mut writer, &mut reader, "f", &format!("f feed p::b frame {}\n", b.len()), &b).unwrap();
+    let mut advance = |writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, command: &str| {
+        request_observing(writer, reader, "s", &format!("a advance {command}\ns spin\n"), |line, payload| keep_frame(&mut frames, "w", line, payload));
+        heard(&mut frames)
+    };
+
+    // Input `b` is still at 0, so nothing is complete.
+    assert!(advance(&mut writer, &mut reader, "p a 2").0.is_empty());
+    assert!(request(&mut writer, &mut reader, "p", "p peek p::both\n").is_empty());
+    // Time 0 is complete once `b` passes it. The changes come before the `spin` after it is answered.
+    assert_eq!(advance(&mut writer, &mut reader, "p::b 1"), (vec!["time=0 diff=1 key=tuple(1) val=tuple(10)".into(), "time=0 diff=1 key=tuple(1) val=tuple(100)".into()], Some(1)));
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek p::both\n"), ["tuple(1) val=tuple(10)", "tuple(1) val=tuple(100)"]);
+    // `a` is at 2 and `b` at 4: time 1 is complete.
+    assert_eq!(advance(&mut writer, &mut reader, "p b 4"), (vec!["time=1 diff=1 key=tuple(2) val=tuple(20)".into()], Some(2)));
+    // `a` is at 5 and `b` at 4: times 2 and 3 are complete.
+    let (rows, progress) = advance(&mut writer, &mut reader, "p a 5");
+    assert_eq!(rows, ["time=2 diff=-1 key=tuple(1) val=tuple(10)", "time=2 diff=1 key=tuple(3) val=tuple(30)", "time=3 diff=1 key=tuple(2) val=tuple(200)"]);
+    assert_eq!(progress, Some(4));
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek p::both\n"), ["tuple(1) val=tuple(100)", "tuple(2) val=tuple(20)", "tuple(2) val=tuple(200)", "tuple(3) val=tuple(30)"]);
+
+    // A span with a time before its input, an advance backwards, and a row of text before its
+    // input are refused, and nothing of them is fed.
+    let late = span_frame(&shape, &[("7", Some("70"), 1, 9), ("8", Some("80"), 1, 4)]);
+    let error = framed(&mut writer, &mut reader, "f", &format!("f feed p a frame {}\n", late.len()), &late).unwrap_err();
+    assert_eq!(error, "cannot feed at time 4: input \"p\"/0 stands at 5");
+    let error = framed(&mut writer, &mut reader, "a", "a advance p a 3\n", &[]).unwrap_err();
+    assert_eq!(error, "cannot advance input \"p\"/0 to 3: it stands at 5");
+    assert!(framed(&mut writer, &mut reader, "f", "f feed p a 7 val=70 time=4\n", &[]).is_err());
+    assert!(framed(&mut writer, &mut reader, "a", "a advance p a soon\n", &[]).unwrap_err().contains("must be a number"));
+    // A row of text at a time is a span of one row.
+    request(&mut writer, &mut reader, "f", "f feed p b 5 val=500 time=6\n");
+    assert!(advance(&mut writer, &mut reader, "p b 7").0.is_empty(), "`a` is at 5");
+    assert_eq!(advance(&mut writer, &mut reader, "p a 7"), (vec!["time=6 diff=1 key=tuple(5) val=tuple(500)".into()], Some(7)));
+
+    request(&mut writer, &mut reader, "s", "s stop w\n");
+    drop(reader);
+    drop(writer);
+    server.stop();
+}
+
+#[test]
+fn spans_feed_inputs_that_move_alone_on_one_worker() {
+    assert_spans(1);
+}
+
+#[test]
+fn spans_feed_inputs_that_move_alone_on_three_workers() {
+    assert_spans(3);
+}
+
+/// `tick` leaves a piloted program's inputs where they are, and still moves the others. A
+/// program that `tick` moves is not advanced, and `tick` bindings do not reach a piloted program.
+#[test]
+fn tick_leaves_piloted_inputs_alone() {
+    let (server, mut writer, mut reader) = start_server(2);
+    request(&mut writer, &mut reader, "l", "l load p piloted begin\noutput \"rows\" = input 0 : ((int), (int));\nl end-load\n");
+    request(&mut writer, &mut reader, "l", "l load t begin\noutput \"rows\" = input 0 : ((int), (int));\nl end-load\n");
+    let shape = declared("((int), (int))");
+    let mut frames = Vec::new();
+    request_observing(&mut writer, &mut reader, "w", "w tail p::rows as corgi\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    request(&mut writer, &mut reader, "f", "f feed t 0 1 val=1\n");
+    request_observing(&mut writer, &mut reader, "t", "t tick 7\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek t::rows\n"), ["tuple(1) val=tuple(1)"]);
+    assert!(heard(&mut frames).0.is_empty(), "seven ticks made no change to a piloted program's output");
+    // After seven ticks the piloted input still takes a span from time 0 on.
+    let early = span_frame(&shape, &[("1", Some("10"), 1, 0), ("2", Some("20"), 1, 3)]);
+    framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", early.len()), &early).unwrap();
+    request_observing(&mut writer, &mut reader, "s", "a advance p 0 2\ns spin\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    assert_eq!(heard(&mut frames), (vec!["time=0 diff=1 key=tuple(1) val=tuple(10)".into()], Some(2)));
+    request_observing(&mut writer, &mut reader, "t", "t tick\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek p::rows\n"), ["tuple(1) val=tuple(10)"], "a tick does not complete time 3");
+    assert!(heard(&mut frames).0.is_empty());
+
+    let error = framed(&mut writer, &mut reader, "a", "a advance t 0 9\n", &[]).unwrap_err();
+    assert!(error.contains("`tick` moves this program's inputs"), "{error}");
+    assert!(framed(&mut writer, &mut reader, "b", "b bind t::rows p 0\n", &[]).unwrap_err().contains("piloted"));
+    assert!(framed(&mut writer, &mut reader, "b", "b bind p::rows t 0\n", &[]).unwrap_err().contains("piloted"));
+    let listed = request(&mut writer, &mut reader, "ls", "ls list\n");
+    assert!(listed.iter().any(|line| line.starts_with("program name=\"p\"") && line.ends_with(" piloted")), "{listed:?}");
+    assert!(listed.iter().any(|line| line.starts_with("program name=\"t\"") && !line.contains("piloted")), "{listed:?}");
+    request(&mut writer, &mut reader, "s", "s stop w\n");
+    drop(reader);
+    drop(writer);
+    server.stop();
+}
+
+/// The frames a binary tail sends are spans: fed unchanged to another program's input, they
+/// give it the first program's contents at the first program's times. A tail started late
+/// replays the trace from its compaction frontier, which follows the program's inputs.
+fn assert_tail_frames_feed_on(workers: usize) {
+    let (server, mut writer, mut reader) = start_server(workers);
+    for name in ["p", "q"] {
+        request(&mut writer, &mut reader, "l", &format!("l load {name} piloted begin\noutput \"rows\" = input 0 : ((int, List(int)), Option(int));\nl end-load\n"));
+    }
+    let shape = declared("((int, List(int)), Option(int))");
+    let first = span_frame(&shape, &[("tuple(1,list(2,3))", Some("inject(1,7)"), 1, 0), ("tuple(2,list())", Some("inject(0,tuple())"), 2, 0), ("tuple(3,list(4))", Some("inject(1,-1)"), 1, 2)]);
+    framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", first.len()), &first).unwrap();
+    request(&mut writer, &mut reader, "s", "a advance p 0 1\ns spin\n");
+
+    // The tail's replay is time 0, and what follows is each later change. Each frame goes to `q`
+    // as it came.
+    let mut frames = Vec::new();
+    let mut fed = 0;
+    let mut pass_on = |writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, frames: &mut Vec<(String, Vec<u8>)>| {
+        for (_, payload) in frames.iter().filter(|f| f.0 == "data") {
+            framed(writer, reader, "f", &format!("f feed q 0 frame {}\n", payload.len()), payload).unwrap();
+            fed += 1;
+        }
+        heard(frames)
+    };
+    request_observing(&mut writer, &mut reader, "w", "w tail p::rows as corgi\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    let (rows, progress) = pass_on(&mut writer, &mut reader, &mut frames);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|row| row.starts_with("time=0 ")), "a frame says its times, zero included: {rows:?}");
+    assert_eq!(progress, Some(1));
+    request(&mut writer, &mut reader, "s", "a advance q 0 1\ns spin\n");
+    let at_zero = request(&mut writer, &mut reader, "p", "p peek p::rows\n");
+    assert_eq!(at_zero.len(), 2);
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::rows\n"), at_zero);
+
+    let second = span_frame(&shape, &[("tuple(1,list(2,3))", Some("inject(1,7)"), -1, 4), ("tuple(5,list())", Some("inject(1,0)"), 1, 6)]);
+    framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", second.len()), &second).unwrap();
+    request_observing(&mut writer, &mut reader, "s", "a advance p 0 5\ns spin\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    let (rows, progress) = pass_on(&mut writer, &mut reader, &mut frames);
+    assert_eq!(rows.len(), 2, "times 2 and 4: {rows:?}");
+    assert_eq!(progress, Some(5));
+    // `q` is fed times 2 and 4 while it stands at 1, and is complete through 4 once it passes it.
+    request(&mut writer, &mut reader, "s", "a advance q 0 3\ns spin\n");
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::rows\n").len(), 3, "time 2");
+    request(&mut writer, &mut reader, "s", "a advance q 0 5\ns spin\n");
+    let through_four = request(&mut writer, &mut reader, "p", "p peek p::rows\n");
+    assert_eq!(through_four.len(), 2);
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek q::rows\n"), through_four);
+
+    // A tail started now replays from the trace's compaction frontier, the time before its
+    // frontier: every earlier change is at time 4, and sums to the peek.
+    let mut late = Vec::new();
+    request_observing(&mut writer, &mut reader, "v", "v tail p::rows as corgi\n", |line, payload| keep_frame(&mut late, "v", line, payload));
+    let (rows, progress) = heard(&mut late);
+    assert!(!rows.is_empty() && rows.iter().all(|row| row.starts_with("time=4 ")), "{rows:?}");
+    assert_eq!(progress, Some(5));
+
+    // Everything `q`'s input holds is taken back from its own output, at the input's time.
+    request(&mut writer, &mut reader, "r", "r feed q 0 from q::rows diff=-1\n");
+    request(&mut writer, &mut reader, "s", "a advance q 0 6\ns spin\n");
+    assert!(request(&mut writer, &mut reader, "p", "p peek q::rows\n").is_empty());
+    assert!(fed >= 2);
+    request(&mut writer, &mut reader, "s", "s stop w\n");
+    request(&mut writer, &mut reader, "s", "s stop v\n");
+    drop(reader);
+    drop(writer);
+    server.stop();
+}
+
+#[test]
+fn tail_frames_feed_another_program_on_one_worker() {
+    assert_tail_frames_feed_on(1);
+}
+
+#[test]
+fn tail_frames_feed_another_program_on_three_workers() {
+    assert_tail_frames_feed_on(3);
+}
+
+/// A program bound to a piloted program's output is piloted too, though its load does not say
+/// so: it reads the output from where it is complete, and then follows it, at its times.
+#[test]
+fn a_bound_consumer_follows_a_piloted_producer() {
+    let (server, mut writer, mut reader) = start_server(2);
+    request(&mut writer, &mut reader, "l", "l load p piloted begin\noutput \"rows\" = input 0 : ((int), (int));\nl end-load\n");
+    let shape = declared("((int), (int))");
+    let first = span_frame(&shape, &[("1", Some("10"), 1, 0), ("2", Some("20"), 1, 1), ("3", Some("30"), 1, 5)]);
+    framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", first.len()), &first).unwrap();
+    request(&mut writer, &mut reader, "s", "a advance p 0 3\ns spin\n");
+
+    let mut answer = Vec::new();
+    request_observing(&mut writer, &mut reader, "c", "c load c rows=p::rows begin\nlet rows = input \"rows\" : ((int), (int));\noutput \"tens\" = rows | map((k, (v)) -> (k, ((v, 10) mul)));\nc end-load\n", |line, _| answer.push(line.to_string()));
+    assert!(answer.iter().any(|line| line.starts_with("c ok installed \"c\"") && line.ends_with(", piloted")), "{answer:?}");
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek c::tens\n"), ["tuple(1) val=tuple(100)", "tuple(2) val=tuple(200)"]);
+
+    let mut frames = Vec::new();
+    request_observing(&mut writer, &mut reader, "w", "w tail c::tens as corgi\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    let (rows, progress) = heard(&mut frames);
+    assert_eq!(rows, ["time=2 diff=1 key=tuple(1) val=tuple(100)", "time=2 diff=1 key=tuple(2) val=tuple(200)"], "read from the producer's compaction frontier");
+    assert_eq!(progress, Some(3));
+    let second = span_frame(&shape, &[("1", Some("10"), -1, 7)]);
+    framed(&mut writer, &mut reader, "f", &format!("f feed p 0 frame {}\n", second.len()), &second).unwrap();
+    request_observing(&mut writer, &mut reader, "s", "a advance p 0 9\ns spin\n", |line, payload| keep_frame(&mut frames, "w", line, payload));
+    assert_eq!(heard(&mut frames), (vec!["time=5 diff=1 key=tuple(3) val=tuple(300)".into(), "time=7 diff=-1 key=tuple(1) val=tuple(100)".into()], Some(9)));
+    assert_eq!(request(&mut writer, &mut reader, "p", "p peek c::tens\n"), ["tuple(2) val=tuple(200)", "tuple(3) val=tuple(300)"]);
+    // The producer cannot be dropped while the consumer reads it, as for any import.
+    assert!(framed(&mut writer, &mut reader, "d", "d drop p\n", &[]).is_err());
+    request(&mut writer, &mut reader, "s", "s stop w\n");
     drop(reader);
     drop(writer);
     server.stop();

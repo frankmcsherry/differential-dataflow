@@ -1,0 +1,58 @@
+-- Each ledger's row, derived from the entries: its version, its own upper, the clock it follows, and whether it is durable.
+--
+-- This is the one place that says how a ledger's version and own upper follow from its spans.
+-- A follower and an instance read it over their copies of the entries, and stand.ddp says where each ledger stands
+-- from it. The keeper reads it over its own entries, which have no spans, for the rules over spans (system.ddp).
+-- The keeper's own rows are not made with it: a round moves them (round.ddp, `moved`), and the keeper starts from its
+-- snapshots and the log's records. So tests/ledger_system.rs can check with this, off the path of a round, that the
+-- rows a round leaves are still what the entries say.
+--
+--   input 0, entries : ((entry), ())
+--
+--   own : ((id), (version, upper, following, clock, durable))
+-- A ledger's version is the number of its appends, and its own upper is the upper of the span that covers the last
+-- of them, or its start if it has none. `following` says whether it follows a clock, and
+-- `clock` is that clock, or (0, 0). `durable` says whether its contents are its spans.
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let entries = input 0 : ((Entry), ());
+
+let table = entries | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let spans = table((Span((key, val))), ()) | map(((key, val), ()) -> (key, val));
+
+-- MARKS is each number a ledger has come to, with the upper there: 0 with its start, and where each span ends.
+-- A TIP is a mark that no span begins at. The version is the greatest tip, and there are few of them: one, unless
+-- spans were discarded and left others that lead nowhere. So an append changes two rows here, and no more,
+-- however many spans the ledger has.
+-- TOP is each ledger's greatest tip: its version, and its own upper.
+let marks = (ledgers | map(((id), (_, _, start, _, _)) -> ((id, 0), (start))))
+          + (spans | map(((id, _, to, _), (_, upper, _)) -> ((id, to), (upper))));
+let started = spans | filter(((_, from, to, _), _) -> (from, to) lt) | map(((id, from, _, _), _) -> ((id, from), ())) | distinct;
+let tips = marks - (marks | join(started, (place, upper, ()) -> (place, upper)));
+let top = tips | map(((id, to), (upper)) -> ((id), (to, upper)))
+               | reduce((_id, marks) -> ((marks len, 1) sub enlist, marks) gather map ((mark, _count) -> (mark, 1)));
+
+output "own" = ledgers | join(top, (id, (_, _, _, clock, keep), (version, upper)) ->
+                   let (following, clock) = clock match (Free (_ -> (0, (0, 0))), Follows (clock -> (1, clock))) in
+                   let durable = keep match (Durable (_ -> 1), Derived (_ -> 0)) in
+                   (id, (version, upper, following, clock, durable)));

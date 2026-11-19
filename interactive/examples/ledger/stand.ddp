@@ -1,0 +1,46 @@
+-- Where each durable ledger stands, from the ledgers' rows.
+--
+-- This is the one place that says it: a ledger's version, and its write frontier, which is its own upper joined with
+-- the write frontier of the clock it follows, and so on up. An append must name both.
+-- The rows are a follower's or an instance's from its copy of the entries (index.ddp), or the keeper's own: a keeper
+-- that holds no spans keeps one row for each ledger, which each round moves (see round.ddp, `moved`).
+--
+--   input 0, own : ((id), (version, upper, following, clock, durable))   the rows, as round.ddp reads them
+--
+--   standing : ((id), (version, frontier))                               each durable ledger's standing
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let own = input 0 : ((Id), (int, Frontier, int, Id, int));
+
+let followed = own | filter((_, (_, _, following, _, _)) -> following)
+                   | map(((id), (_, _, _, clock, _)) -> ((clock), (id)));
+wf: {
+    let lifted = followed | join(write, ((clock), (id), (frontier)) -> ((id), (frontier)));
+    set write = (own | map((id, (_, upper, _, _, _)) -> (id, (upper)))) + lifted
+              | reduce((_id, frontiers) ->
+                    let none = [] : List(List(int)) in
+                    let joined = ((0, none), frontiers) fold (((seen, sofar), ((frontier), _count)) ->
+                        (1, (seen, (sofar, frontier) call frontier_join, frontier) select)) in
+                    ((joined.1), 1) enlist);
+}
+output "standing" = own | filter((_, (_, _, _, _, durable)) -> durable)
+                        | join(wf::write, (id, (version, _, _, _, _), (frontier)) -> (id, (version, frontier)));

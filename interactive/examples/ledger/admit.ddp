@@ -1,0 +1,90 @@
+-- Admission of appends: a short check that stands in for the rules (see system.ddp and step.ddp).
+--
+-- The rules say what a sound state is, and to judge a change by all of them is slow.
+-- Most changes are appends, and an append can break only a few of the rules. This checks for those few.
+-- The claim is: of a sound state, a transaction that is admitted here breaks no rule, and one that is
+-- refused here breaks some rule. The test holds this program to that claim, against the rules themselves.
+--
+-- This covers a transaction whose commands are all appends, each to a different ledger.
+-- Any other transaction is deferred: it is judged by the rules.
+--
+--   input 0, commands : ((index), (command))                 one transaction's commands, by their place in it
+--   input 1, standing : ((id), (version, frontier))          each durable ledger's standing before, as stand.ddp gives it
+--   input 2, bound    : ((ledger), (computation, position))  each ledger a computation writes, as system.ddp derives it
+--   input 3, actor    : ((), (actor))                        who makes the change: a user, or a runner of a computation
+--
+-- The transaction is admitted when every output is empty. Each row is the index of a command.
+--
+--   deferred : a command that this does not cover
+--   absent   : an append to a ledger with no standing: it is not registered, or it is derived
+--   stale    : an append that does not name its ledger's version, or does not begin at its write frontier
+--   empty    : an append whose lower is not strictly before its upper
+--   barred   : an append to a bound ledger, by other than a runner of its computation
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Command = Create (Id, Shape, int, Frontier, Clock, Keep)
+             | Append (Id, int, Frontier, Frontier, Batch)
+             | Merge (Id, int, int, Frontier, Batch)
+             | Discard (Id, int, int, Frontier)
+             | Drop Id
+             | Alias (Text, Id)
+             | Unalias Text
+             | Publish (Hash, List(Shape), List(Shape), Text)
+             | Define (Id, Hash, List(Input), List(Output))
+             | Retire Id
+             | Start (Id, Id)
+             | Stop (Id, Id)
+             | Hold (Id, Id, Frontier)
+             | Release (Id, Id);
+enum Actor = User | Runner Id;
+
+let commands = input 0 : ((int), (Command));
+let standing = input 1 : ((Id), (int, Frontier));
+let bound = input 2 : ((Id), (Id, int));
+let actor = input 3 : ((), (Actor));
+
+-- THE APPENDS, each by its ledger: ((ledger), (index, number, lower, upper)).
+let appends = commands((index), (Append((ledger, number, lower, upper, _))))
+            | map(((index, ledger, number, lower, upper), ()) -> ((ledger), (index, number, lower, upper)));
+let asked = appends | map((_, (index, _, _, _)) -> ((index), ()));
+
+-- DEFERRED: the commands that are not appends, and the appends that share a ledger with another.
+-- A second append to a ledger begins where the first ends, which the standing before does not say.
+let crowded = appends | map((ledger, _) -> (ledger, ())) | count | filter((_, copies) -> (copies, 1) gt);
+output "deferred" = ((commands | map((index, _) -> (index, ()))) - asked)
+                  + (appends | join(crowded, (_, (index, _, _, _), _) -> ((index), ())));
+
+-- An append is to a ledger with a standing.
+-- PLACED is each such append, with the standing of its ledger.
+let placed = appends | join(standing, (_, (index, number, lower, upper), (version, frontier)) ->
+                                      ((index), (number, lower, upper, version, frontier)));
+output "absent" = asked - (placed | map((index, _) -> (index, ())));
+
+-- An append names its ledger's version, and begins at its write frontier.
+-- So its writer knew all that the ledger had, and no time is passed over.
+-- The two frontiers are equal when each is at or before the other, however either is written.
+output "stale" = placed | filter((_, (number, lower, _, version, frontier)) ->
+                              let same = ((lower, frontier) call frontier_le, (frontier, lower) call frontier_le) all in
+                              (((number, version) eq, same) all, 0) eq)
+                        | map((index, _) -> (index, ()));
+
+-- An append's lower is strictly before its upper.
+output "empty" = appends | filter((_, (_, _, lower, upper)) -> ((lower, upper) call frontier_lt, 0) eq)
+                         | map((_, (index, _, _, _)) -> ((index), ()));
+
+-- Only a runner of its computation appends to a bound ledger.
+let acting = actor((), (Runner(computation))) | distinct;
+let claimed = appends | join(bound, (_, (index, _, _, _), (computation, _)) -> ((computation), (index)));
+output "barred" = (claimed - (claimed | join(acting, (computation, index, ()) -> (computation, index))))
+                | map((_, (index)) -> ((index), ()));

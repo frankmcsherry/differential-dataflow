@@ -55,6 +55,26 @@ impl ServerInput {
         Ok(())
     }
 
+    /// Add fed `columns`, each at its own time in `times`, none before the input's frontier.
+    /// Their shapes must be the input's, as its declaration says.
+    pub(super) fn give_columns_timed(&mut self, columns: Updates, times: Vec<OuterTime>) -> Result<(), String> {
+        let shape = (corgi::shape_of_value(&columns.keys), corgi::shape_of_value(&columns.vals));
+        if shape != self.shape {
+            return Err(format!("a feed of shape {} reached an input of shape {}", fmt_shape(&shape), fmt_shape(&self.shape)));
+        }
+        let Updates { keys, vals, diffs } = columns;
+        let n = diffs.len();
+        if times.len() != n {
+            return Err(format!("a feed of {n} rows with {} times", times.len()));
+        }
+        // The times are the first root coordinate, and any others are zero.
+        let mut lanes = vec![times];
+        lanes.resize(self.width, vec![0; n]);
+        let times = crate::runtime::col_times::ColTimes::from_raw_lanes(lanes, n);
+        self.give(InputContainer { keys, vals, times, diffs });
+        Ok(())
+    }
+
     /// Add the updates of `container`, each at `time` whatever time it carries.
     pub(super) fn give_at(&mut self, container: HostContainer, time: OuterTime) {
         let time = host_time(time);
@@ -280,6 +300,7 @@ impl Server {
                 dataflow_id,
                 root_width: 1,
                 now: host_time(self.epoch),
+                pace: Pace::Ticked,
                 origin: Origin::Generated,
                 generators: HashMap::from([(0usize, (recipe, 0u64))]),
             },
@@ -310,6 +331,7 @@ impl Server {
                 dataflow_id,
                 root_width: 1,
                 now: host_time(self.epoch),
+                pace: Pace::Ticked,
                 origin: Origin::Clock,
                 generators: HashMap::new(),
             },

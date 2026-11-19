@@ -1,0 +1,145 @@
+-- A pass of merges, for a keeper that holds no spans.
+--
+-- A compactor reads a follower's copy of the state, and asks the keeper to make the merges the follower's policy
+-- proposes (compact.ddp): for each ledger, which appends to cover again as one span, what that span is held from, and
+-- where it begins and ends; and the entries those merges take out, whole. The compactor hands both on as the frames
+-- the follower gave it, and opens neither. It adds one thing of its own: how many records of the log its follower had
+-- when it read. And, for a merge whose batch it has made, the batch: the rest are empty.
+-- The entry a merge puts in is made here, from what is proposed and the batch.
+--
+-- The keeper cannot look the entries up. What it checks, each from one row per ledger or from the keys named:
+--   GENERATION. A ledger's generation is the log's length at its last pass or drop. The merge is refused if that is
+--   later than the log the compactor read: then every span the compactor saw is still the ledger's, since an append
+--   only adds after the version. Two compactors that read the same state cannot both merge one ledger.
+--   SOUND. The merge covers appends the ledger has: it ends at or before the version, and where the ledger's row says
+--   where it begins or ends, the merged span agrees.
+--   COVER. An entry taken out is a span of the ledger within what the merge covers, and the merged span is its cover:
+--   so the cover's since must be at or before the ledger's own hold (own.ddp), which is what every reader of the
+--   ledger is promised it can read from. A merge that takes nothing out needs no such check, whatever its since: it
+--   removes nothing, and stands beside the spans it covers. So a ledger may hold more than one version of its appends.
+--   Whether the entries taken out are there is not checked: that is a follower's rule, read after the fact.
+--
+-- What is proposed and what leaves are each under a shard, one of 64 by the ledger's id. The shard is not read here.
+--
+--   input 0, proposed : ((shard), (ledger, from, to, since, lower, upper))   each merge that is asked for
+--   input 1, batches  : ((ledger), (batch))         the batch of a merge that is not empty
+--   input 2, gens     : ((ledger), (length))        each ledger's generation: the log's length at its last pass or drop
+--   input 3, now      : ((), (length))              the log's length once this pass is written
+--   input 4, config   : ((entry), ())               the configuration: ledgers and holds are read
+--   input 6, leaving  : ((shard), (ledger, entry))  what a merge of each ledger takes out
+--   input 7, seen     : ((), (length))              the log's length as the compactor's follower had it
+--   input 9, own      : ((ledger), (version, upper, following, clock, durable))   the keeper's row of each ledger
+--
+--   refused : ((ledger), ())         a ledger whose generation is later than what the compactor read
+--   beyond  : ((ledger), ())         a ledger whose merge takes spans out, and is held from after its own hold
+--   forged  : ((ledger), ())         a ledger whose merge does not cover its appends, or takes out what it does not cover
+--   change  : ((entry), ())          what the merges that are made put in, and, with a count of -1, what they take out
+--   marked  : ((ledger), (length))   the change to `gens`
+--   made    : ((), count)            how many merges are made
+--   left    : ((), count)            how many entries they take out
+
+type Id = (int, int);
+type Bytes = List(int);
+type Shape = Bytes;             -- the shape of a ledger's rows
+type Text = Bytes;              -- a name, or a program's text
+type Hash = Bytes;              -- what a program or a blob is known by
+type Time = List(int);          -- one int per coordinate
+type Frontier = List(Time);
+enum Batch = Empty | Inline Bytes | Blob Hash;
+enum Clock = Free | Follows Id;
+enum Keep = Durable | Derived;
+enum Input = State | Read Id;
+enum Output = Unwritten | Written Id;
+enum Entry = Ledger ((Id), (Shape, int, Frontier, Clock, Keep))
+           | Span ((Id, int, int, Frontier), (Frontier, Frontier, Batch))
+           | Name ((Text), (Id))
+           | Program ((Hash), (List(Shape), List(Shape), Text))
+           | Computation ((Id), (Hash, List(Input), List(Output)))
+           | Run ((Id, Id), ())
+           | Hold ((Id, Id), (Frontier));
+
+let proposed = input 0 : ((int), (Id, int, int, Frontier, Frontier, Frontier));
+let batches = input 1 : ((Id), (Batch));
+let gens = input 2 : ((Id), (int));
+let now = input 3 : ((), (int));
+let config = input 4 : ((Entry), ());
+let leaving = input 6 : ((int), (Id, Entry));
+let seen = input 7 : ((), (int));
+let own = input 9 : ((Id), (int, Frontier, int, Id, int));
+-- Each merge that is asked for, by its ledger, and with how far the compactor's follower had read.
+let merges = proposed | map((_, (ledger, from, to, since, lower, upper)) -> ((ledger), (from, to, since, lower, upper))) | distinct;
+let asked = merges | map(((ledger), (_, _, since, _, _)) -> ((), (ledger, since)))
+                   | join(seen, ((), (ledger, since), (at)) -> ((ledger), (at, since)));
+let late = asked | join(gens, (ledger, (at, _), (length)) -> (ledger, (at, length)))
+                 | filter((_, (at, length)) -> (length, at) gt)
+                 | map((ledger, _) -> (ledger, ())) | distinct;
+output "refused" = late;
+let named = asked | map((ledger, _) -> (ledger, ())) | distinct;
+-- THE OWN HOLD of each ledger: the frontier its readers are promised. With none, a ledger is read from its start.
+let table = config | distinct;
+let ledgers = table((Ledger((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let holds = table((Hold((key, val))), ()) | map(((key, val), ()) -> (key, val));
+let starts = ledgers | map((id, (_, _, start, _, _)) -> (id, (start)));
+let pledged = holds | filter(((holder, _), _) -> (holder, (0, 0)) eq) | map(((_, ledger), (frontier)) -> ((ledger), (frontier)));
+let promised = pledged + (starts - (starts | join(pledged | map((ledger, _) -> (ledger, ())) | distinct, (ledger, start, ()) -> (ledger, start))));
+-- MANY is a ledger with two merges in the pass, or two batches.
+let many = (merges | map((ledger, _) -> (ledger, ())) | count | filter((_, copies) -> (copies, 1) gt))
+         + (batches | map((ledger, _) -> (ledger, ())) | count | filter((_, copies) -> (copies, 1) ne))
+         | map((ledger, _) -> (ledger, ())) | distinct;
+let alone = merges | map((ledger, _) -> (ledger, ())) | count | filter((_, copies) -> (copies, 1) eq) | map((ledger, _) -> (ledger, ()));
+-- SOUND is a merge that covers appends the ledger has: the ledger is durable, the merge begins before it ends, and
+-- ends no later than the ledger's version. If it ends at the version, its upper is the ledger's own upper, and if it
+-- begins at the first append, its lower is the ledger's start. Elsewhere the keeper's row does not say.
+let sound = merges | join(own, (ledger, (from, to, _, lower, upper), (version, mine, _, _, durable)) ->
+                          (ledger, (from, to, lower, upper, version, mine, durable)))
+                   | join(starts, (ledger, (from, to, lower, upper, version, mine, durable), (start)) ->
+                          (ledger, (from, to, lower, upper, version, mine, durable, start)))
+                   | filter((_, (from, to, lower, upper, version, mine, durable, start)) ->
+                         let ends = ((to, version) lt, ((upper, mine) call frontier_le, (mine, upper) call frontier_le) all) any in
+                         let begins = ((from, 0) gt, ((lower, start) call frontier_le, (start, lower) call frontier_le) all) any in
+                         (durable, (0, from) le, (from, to) lt, (to, version) le, ends, begins) all)
+                   | map((ledger, _) -> (ledger, ())) | distinct;
+-- ODD is a ledger with an entry that leaves other than once.
+let odd = leaving | map((_, (ledger, entry)) -> ((ledger, entry), ())) | count
+                  | filter((_, copies) -> (copies, 1) ne) | map(((ledger, _), _) -> ((ledger), ())) | distinct;
+-- STRAY is a ledger with an entry that leaves and is not a span of that ledger within its merge: the merge is not
+-- its cover. This is read from the entry's key alone.
+let filed = leaving | map((_, (ledger, entry)) -> ((ledger), (entry)));
+let total = filed | map((ledger, _) -> (ledger, ())) | count;
+let fit = filed((ledger), (Span(((id, begin, end, _), _))))
+        | map(((ledger, id, begin, end), ()) -> ((ledger), (id, begin, end)))
+        | join(merges, (ledger, (id, begin, end), (from, to, _, _, _)) -> (ledger, (id, begin, end, from, to)))
+        | filter((ledger, (id, begin, end, from, to)) -> ((ledger, (id)) eq, (from, begin) le, (begin, end) lt, (end, to) le) all)
+        | map((ledger, _) -> (ledger, ())) | count;
+let whole = total | join(fit, (ledger, all_of, some_of) -> (ledger, (all_of, some_of)))
+                  | filter((_, (all_of, some_of)) -> (all_of, some_of) eq) | map((ledger, _) -> (ledger, ()));
+let stray = (total | map((ledger, _) -> (ledger, ()))) - whole;
+-- BEYOND is a ledger whose merge takes spans out and is held from after the ledger's own hold: what it takes out
+-- holds updates at times a reader is promised, and the cover would not show them as they were.
+let parting = total | map((ledger, _) -> (ledger, ()));
+let covered = merges | join(promised, (ledger, (_, _, since, _, _), (hold)) -> (ledger, (since, hold)))
+                     | filter((_, (since, hold)) -> (since, hold) call frontier_le)
+                     | map((ledger, _) -> (ledger, ())) | distinct;
+let beyond = parting - (parting | join(covered, (ledger, (), ()) -> (ledger, ())));
+output "beyond" = beyond | join(named, (ledger, (), ()) -> (ledger, ()));
+let fine = alone | join(sound, (ledger, (), ()) -> (ledger, ()));
+let forged = ((named - (named | join(fine, (ledger, (), ()) -> (ledger, ()))))
+            + (named | join((many + odd + stray) | distinct, (ledger, (), ()) -> (ledger, ())))) | distinct;
+output "forged" = forged;
+let unmade = late + beyond + forged | distinct;
+let made = named - (named | join(unmade, (ledger, (), ()) -> (ledger, ())));
+-- THE ENTRY EACH MERGE PUTS IN: the span the merge asks for, with the batch the compactor made, or an empty one.
+let stated = batches | map((ledger, _) -> (ledger, ())) | distinct;
+let bare = merges - (merges | join(stated, (ledger, merge, ()) -> (ledger, merge)));
+let arriving = (bare | map(((ledger), (from, to, since, lower, upper)) ->
+                         ((ledger), (((ledger, from, to, since), (lower, upper, () inject Empty)) inject Span))))
+             + (merges | join(batches, ((ledger), (from, to, since, lower, upper), (batch)) ->
+                         ((ledger), (((ledger, from, to, since), (lower, upper, batch)) inject Span))));
+let goes = leaving | map((_, (ledger, entry)) -> ((ledger), (entry))) | join(made, (ledger, (entry), ()) -> (ledger, (entry)));
+output "change" = (arriving | join(made, (ledger, (entry), ()) -> ((entry), ())))
+                - (goes | map((_, (entry)) -> ((entry), ())));
+output "made" = made | map((_, ()) -> ((), ())) | count;
+output "left" = goes | map((_, _) -> ((), ())) | count;
+let before = made | join(gens, (ledger, (), (length)) -> (ledger, (length)));
+let after = made | map(((ledger), ()) -> ((), (ledger))) | join(now, ((), (ledger), (length)) -> ((ledger), (length)));
+output "marked" = after - before;

@@ -13,8 +13,9 @@
 //!
 //! `feed <prog> <in> frame <nbytes>` is followed by exactly `nbytes` bytes: the
 //! updates as columns, in the binary frame format `peek … as corgi` answers with
-//! (`interactive::runtime::frame`), with no time lanes. On WebSocket the header
-//! line and its bytes are one binary message.
+//! (`interactive::runtime::frame`). A frame with no time lane is fed at the input's
+//! time; one with a time lane, as `tail … as corgi` answers with, feeds each update
+//! at its own time. On WebSocket the header line and its bytes are one binary message.
 
 use std::any::{type_name_of_val, Any};
 use std::collections::{BTreeMap, HashMap};
@@ -87,11 +88,14 @@ pub enum Cmd {
     /// `explain` — `explain` or `explain=debug`: apply the explanation rewrite,
     /// with `debug` tapping every demand collection with an inspect; the query
     /// input is the one after the program's own, the demand sets its exports.
+    /// `piloted` — the client moves the program's inputs, each alone, with `advance`,
+    /// and `tick` leaves them be.
     Load {
         id_hint: String,
         bindings: BTreeMap<String, String>,
         program: String,
         explain: Option<bool>,
+        piloted: bool,
     },
     /// Print preparation stages without installing, using the live export catalog.
     Plan { name: String, program: String, timings: bool },
@@ -126,6 +130,21 @@ pub enum Cmd {
         input: InputId,
         columns: Updates,
     },
+    /// Stage many rows, read into columns at the input's declared shapes, into one
+    /// program input, each at its own time: a framed feed whose frame has a time lane.
+    FeedSpan {
+        prog: String,
+        input: InputId,
+        columns: Updates,
+        times: Vec<OuterTime>,
+    },
+    /// Move one input of a piloted program to `time`, alone.
+    /// `advance <prog> <in> <time>`.
+    Advance {
+        prog: String,
+        input: InputId,
+        time: OuterTime,
+    },
     /// Fill one program input from a source the server reads itself — a recipe
     /// (`random:…`, `iota:N`), a published trace, or a file of integer rows —
     /// each worker taking its shard, so no row crosses the wire.
@@ -149,6 +168,8 @@ pub enum Cmd {
         prog: String,
         input: InputId,
     },
+    /// Wait until every piloted program's outputs have caught up with their inputs. `spin`.
+    Spin,
     /// Advance ambient time by `n` (default 1).
     Tick { n: u64 },
     /// End the session.
@@ -223,6 +244,7 @@ pub fn prepare(command: Cmd, catalog: &Catalog) -> Result<PreparedCommand, Strin
             bindings,
             program,
             explain,
+            piloted,
         } => {
             let mut program = catch_unwind(AssertUnwindSafe(|| {
                 interactive::lower::lower_tree(interactive::parse::pipe::parse(&program))
@@ -239,6 +261,7 @@ pub fn prepare(command: Cmd, catalog: &Catalog) -> Result<PreparedCommand, Strin
             ServerCommand::Install {
                 name: id_hint,
                 program,
+                piloted,
             }
         }
         Cmd::Plan { name, program, timings } => return Ok(PreparedCommand::Plan { name, program, timings }),
@@ -249,9 +272,12 @@ pub fn prepare(command: Cmd, catalog: &Catalog) -> Result<PreparedCommand, Strin
         Cmd::Stop { tail_reqid } => return Ok(PreparedCommand::Stop { tail_reqid }),
         Cmd::Feed { prog, input, columns, time } => ServerCommand::Feed { prog, input, columns, time },
         Cmd::FeedColumns { prog, input, columns } => ServerCommand::FeedColumns { prog, input, columns },
+        Cmd::FeedSpan { prog, input, columns, times } => ServerCommand::FeedSpan { prog, input, columns, times },
+        Cmd::Advance { prog, input, time } => ServerCommand::Advance { prog, input, time },
         Cmd::Source { prog, input, source, diff } => ServerCommand::Load { prog, input, source, diff },
         Cmd::Bind { trace, prog, input } => ServerCommand::Bind { trace, prog, input },
         Cmd::Unbind { trace, prog, input } => ServerCommand::Unbind { trace, prog, input },
+        Cmd::Spin => ServerCommand::Spin,
         Cmd::Tick { n } => ServerCommand::Tick { n },
         Cmd::Exit => ServerCommand::Exit,
     };
@@ -348,7 +374,7 @@ pub struct LineParser {
 /// instead of an explicit reqid, the parser synthesizes a reqid.
 const COMMAND_KEYWORDS: &[&str] = &[
     "load", "plan", "drop", "list", "peek", "tail", "stop", "tick", "exit", "feed", "bind",
-    "unbind",
+    "unbind", "advance", "spin",
 ];
 
 /// Program-size gate: a `load` body larger than this is rejected at intake,
@@ -378,6 +404,7 @@ struct PendingLoad {
     id_hint: String,
     bindings: BTreeMap<String, String>,
     explain: Option<bool>,
+    piloted: bool,
     body: String,
     /// Set once the body exceeds the size gate; the rest of the body is
     /// swallowed (not stored) and `end-load` reports this error, so an
@@ -502,6 +529,7 @@ impl LineParser {
                                 bindings: done.bindings,
                                 program: done.body,
                                 explain: done.explain,
+                                piloted: done.piloted,
                             }
                         }),
                     ));
@@ -554,6 +582,7 @@ impl LineParser {
                 id_hint,
                 bindings,
                 explain,
+                piloted,
             } => {
                 self.pending_load = Some(PendingLoad {
                     plan,
@@ -562,6 +591,7 @@ impl LineParser {
                     id_hint,
                     bindings,
                     explain,
+                    piloted,
                     body: String::new(),
                     poisoned: None,
                 });
@@ -612,7 +642,11 @@ impl LineParser {
             interactive::runtime::frame::decode_feed(payload, &shape, self.max_feed_bytes as u64).map_err(|error| format!("feed: {error}"))
         });
         let (prog, input) = (frame.prog, frame.input);
-        Some((frame.reqid, columns.map(|columns| Cmd::FeedColumns { prog, input, columns })))
+        // A frame with a time lane is a span: each update at its own time.
+        Some((frame.reqid, columns.map(|(columns, times)| match times {
+            Some(times) => Cmd::FeedSpan { prog, input, columns, times },
+            None => Cmd::FeedColumns { prog, input, columns },
+        })))
     }
 }
 
@@ -625,6 +659,7 @@ enum ParseOutcome {
         id_hint: String,
         bindings: BTreeMap<String, String>,
         explain: Option<bool>,
+        piloted: bool,
     },
     BeginFeed {
         prog: String,
@@ -664,7 +699,7 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                     Err(error) => ParseOutcome::Err(format!("plan: cannot read {path:?}: {error}")),
                 },
                 None => ParseOutcome::BeginLoad {
-                    plan: true, timings, id_hint: name.into(), bindings: BTreeMap::new(), explain: None,
+                    plan: true, timings, id_hint: name.into(), bindings: BTreeMap::new(), explain: None, piloted: false,
                 },
             }
         },
@@ -673,7 +708,7 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
             // file, read here on the session thread. `load <name> [options] begin`
             // switches the parser into
             // body-collection mode; subsequent lines are program text terminated by
-            // `<reqid> end-load`. Options: `explain`, `explain=debug`, `name=binding`.
+            // `<reqid> end-load`. Options: `explain`, `explain=debug`, `piloted`, `name=binding`.
             const USAGE: &str = "load: expected `<name> from <path> [options]` or `<name> [options] begin`";
             let Some((id_hint, rest)) = args.split_first() else {
                 return ParseOutcome::Err(USAGE.into());
@@ -685,15 +720,17 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
             };
             let mut bindings = BTreeMap::new();
             let mut explain = None;
+            let mut piloted = false;
             for tok in options {
                 match *tok {
                     "explain" => { explain = Some(false); continue; }
                     "explain=debug" => { explain = Some(true); continue; }
+                    "piloted" => { piloted = true; continue; }
                     _ => {}
                 }
                 let Some((k, v)) = tok.split_once('=') else {
                     return ParseOutcome::Err(format!(
-                        "load: argument {:?} must be `explain`, `explain=debug`, or `name=binding`",
+                        "load: argument {:?} must be `explain`, `explain=debug`, `piloted`, or `name=binding`",
                         tok
                     ));
                 };
@@ -711,6 +748,7 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                         bindings,
                         program,
                         explain,
+                        piloted,
                     }),
                     Err(error) => ParseOutcome::Err(format!("load: cannot read {path:?}: {error}")),
                 },
@@ -720,6 +758,7 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                     id_hint,
                     bindings,
                     explain,
+                    piloted,
                 },
             }
         }
@@ -737,7 +776,8 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
             if let [prog, input, "begin"] = args {
                 return ParseOutcome::BeginFeed { prog: (*prog).to_string(), input: InputId::parse(input) };
             }
-            // Syntax: `feed <prog> <in> frame <nbytes>`, then exactly `nbytes` bytes: a binary frame.
+            // Syntax: `feed <prog> <in> frame <nbytes>`, then exactly `nbytes` bytes: a binary frame,
+            // whose updates are fed at the input's time, or each at its own if the frame has times.
             // A bad `<in>` still has its bytes read past; a bad `<nbytes>` leaves none to find.
             if let [prog, input, "frame", nbytes] = args {
                 let Ok(nbytes) = nbytes.parse() else {
@@ -830,6 +870,18 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                 ParseOutcome::Cmd(Cmd::Unbind { trace, prog, input })
             }
         }
+        "advance" => {
+            // The input is `<prog> <in>` or `<prog>::<in>`, and `<in>` is its position or its name.
+            let (prog, input, time) = match args {
+                [prog, input, time] => (*prog, *input, *time),
+                [target, time] if target.contains("::") => { let (prog, input) = target.split_once("::").unwrap(); (prog, input, *time) }
+                _ => return ParseOutcome::Err("advance: expected `<prog> <in> <time>` or `<prog>::<in> <time>`".into()),
+            };
+            match time.parse() {
+                Ok(time) => ParseOutcome::Cmd(Cmd::Advance { prog: prog.to_string(), input: InputId::parse(input), time }),
+                Err(_) => ParseOutcome::Err(format!("advance: <time> must be a number, got {time:?}")),
+            }
+        }
         "drop" => match args {
             [name] => ParseOutcome::Cmd(Cmd::Drop { name: (*name).to_string() }),
             _ => ParseOutcome::Err("drop: expected `<name>`".into()),
@@ -855,6 +907,10 @@ fn parse_cmd(cmd: &str, args: &[&str], catalog: &Catalog) -> ParseOutcome {
                 tail_reqid: (*rid).to_string(),
             }),
             _ => ParseOutcome::Err("stop: expected `<tail-reqid>`".into()),
+        },
+        "spin" => match args {
+            [] => ParseOutcome::Cmd(Cmd::Spin),
+            _ => ParseOutcome::Err("spin: expected no arguments".into()),
         },
         "tick" => match args {
             [] => ParseOutcome::Cmd(Cmd::Tick { n: 1 }),
@@ -883,7 +939,7 @@ mod tests {
             output "ones" = input 3 : ((int), (int));
         "#;
         let catalog = Catalog::default();
-        let load = Cmd::Load { id_hint: "world".into(), bindings: BTreeMap::new(), program: program.into(), explain: None };
+        let load = Cmd::Load { id_hint: "world".into(), bindings: BTreeMap::new(), program: program.into(), explain: None, piloted: false };
         prepare(load, &catalog).expect("the program lowers");
         LineParser::new(catalog)
     }
@@ -933,6 +989,46 @@ mod tests {
         assert_eq!(p.frame_bytes(), Some((64, false)));
         assert!(matches!(p.frame(&[]), Some((_, Err(_)))));
         assert!(matches!(feed_all(&mut p, &["r7 feed world 0 frame x"])[..], [(_, Err(_))]));
+    }
+
+    /// A frame with a time lane, as a binary tail sends, is a span: its updates, each at its own
+    /// time. The frame's shapes are checked as any feed's.
+    #[test]
+    fn framed_feeds_with_times_are_spans() {
+        let mut p = world();
+        let mut rows = p.catalog.decoder("world", &InputId::Position(0)).unwrap();
+        rows.push("tuple(1,2)", None, 1).unwrap();
+        rows.push("tuple(3,-4)", None, 2).unwrap();
+        let columns = rows.finish();
+        let bytes = interactive::runtime::frame::encode(&columns, &[vec![5, 9]]);
+        assert!(p.feed(&format!("r1 feed world 0 frame {}", bytes.len())).is_none());
+        match p.frame(&bytes) {
+            Some((reqid, Ok(Cmd::FeedSpan { prog, input, columns: got, times }))) => {
+                assert_eq!((reqid.as_str(), prog.as_str(), input), ("r1", "world", InputId::Position(0)));
+                assert_eq!((got, times), (columns, vec![5, 9]));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(p.feed(&format!("r2 feed world 1 frame {}", bytes.len())).is_none());
+        assert!(matches!(p.frame(&bytes), Some((_, Err(e))) if e.contains("shape")));
+    }
+
+    /// `load … piloted` says that a client moves the program's inputs, and `advance` moves one.
+    #[test]
+    fn piloted_loads_and_advances_parse() {
+        let mut p = LineParser::new(Catalog::default());
+        let got = feed_all(&mut p, &[
+            "r1 load p piloted e=other::rows begin", "output \"r\" = input 0 : ((int), ());", "r1 end-load",
+            "r2 advance p 0 7", "r3 advance p::rows 12", "advance p rows 3",
+            "r5 advance p 0", "r6 advance p 0 soon", "r7 advance p 0 -1",
+        ]);
+        assert!(matches!(&got[0].1, Ok(Cmd::Load { piloted: true, bindings, .. }) if bindings.len() == 1));
+        assert!(matches!(&got[1].1, Ok(Cmd::Advance { prog, input: InputId::Position(0), time: 7 }) if prog == "p"));
+        assert!(matches!(&got[2].1, Ok(Cmd::Advance { prog, input: InputId::Name(name), time: 12 }) if prog == "p" && name == "rows"));
+        assert!(matches!(&got[3].1, Ok(Cmd::Advance { input: InputId::Name(name), time: 3, .. }) if name == "rows"), "a bare command gets a reqid");
+        assert!(matches!(&got[4].1, Err(e) if e.contains("expected")));
+        assert!(matches!(&got[5].1, Err(e) if e.contains("must be a number")));
+        assert!(matches!(&got[6].1, Err(e) if e.contains("must be a number")));
     }
 
     #[test]
@@ -1025,7 +1121,9 @@ mod tests {
                 bindings,
                 program,
                 explain,
+                piloted,
             }) => {
+                assert!(!piloted, "`tick` moves a program's inputs unless its load says otherwise");
                 assert_eq!(id_hint, "gen");
                 assert_eq!(
                     bindings.get("edges").map(String::as_str),
@@ -1049,7 +1147,8 @@ mod tests {
         let prepared = prepare(parsed.expect("protocol parse succeeds"), &Catalog::default())
             .expect("DDIR parsing and lowering succeed");
         match prepared {
-            PreparedCommand::Server(ServerCommand::Install { name, program }) => {
+            PreparedCommand::Server(ServerCommand::Install { name, program, piloted }) => {
+                assert!(!piloted);
                 assert_eq!(name, "world");
                 assert_eq!(program.root.exports[0].name, "rows");
             }
@@ -1074,7 +1173,7 @@ mod tests {
             &format!("r5 load p from {} explain\n", ddp.display()),
         ]);
         match &got[0].1 {
-            Ok(Cmd::Load { id_hint, bindings, program, explain }) => {
+            Ok(Cmd::Load { id_hint, bindings, program, explain, piloted: false }) => {
                 assert_eq!(id_hint, "p");
                 assert_eq!(program, "output \"r\" = input 0;\n");
                 assert_eq!(*explain, Some(true));
@@ -1298,7 +1397,7 @@ mod tests {
     fn inputs_are_fed_by_name() {
         let catalog = Catalog::default();
         let program = "let e = input \"edges\" : ((int), (int));\nlet r = input \"roots\" : ((int), ());\noutput \"reach\" = r | join(e, (_, (), d) -> (d, ()));";
-        let load = Cmd::Load { id_hint: "g".into(), bindings: BTreeMap::new(), program: program.into(), explain: None };
+        let load = Cmd::Load { id_hint: "g".into(), bindings: BTreeMap::new(), program: program.into(), explain: None, piloted: false };
         prepare(load, &catalog).expect("the program lowers");
         let mut p = LineParser::new(catalog);
         let got = feed_all(&mut p, &["r0 feed g roots 1", "r1 feed g::edges 1 val=2", "r2 feed g 1 1", "r3 feed g::e 1", "r4 bind g::reach g::roots", "r5 unbind g::reach g roots"]);
@@ -1318,7 +1417,7 @@ mod tests {
         let catalog = Catalog::default();
         let text = "let edges = input \"edges\" : ((int), (int));\nlet roots = input \"roots\" : ((int), ());\noutput \"hop\" = roots | join(edges, (_, (), d) -> ((d), ()));";
         let bindings: BTreeMap<String, String> = [("edges".to_string(), "g::edges".to_string())].into();
-        let load = Cmd::Load { id_hint: "q".into(), bindings, program: text.into(), explain: None };
+        let load = Cmd::Load { id_hint: "q".into(), bindings, program: text.into(), explain: None, piloted: false };
         let Ok(PreparedCommand::Server(ServerCommand::Install { program, .. })) = prepare(load, &catalog) else { panic!("the program lowers") };
         let edges = program.root.imports.iter().find(|i| i.name == "edges").expect("an import named edges");
         assert_eq!(edges.from, Source::Trace("g::edges".into()));
@@ -1328,7 +1427,7 @@ mod tests {
         assert!(matches!(&got[0].1, Ok(Cmd::Feed { input: InputId::Name(name), .. }) if name == "roots"), "{:?}", got[0]);
         assert!(matches!(&got[1].1, Err(e) if e.contains("no input named \"edges\"")), "{:?}", got[1]);
         let bindings: BTreeMap<String, String> = [("paths".to_string(), "g::edges".to_string())].into();
-        let load = Cmd::Load { id_hint: "r".into(), bindings, program: text.into(), explain: None };
+        let load = Cmd::Load { id_hint: "r".into(), bindings, program: text.into(), explain: None, piloted: false };
         assert!(matches!(prepare(load, &Catalog::default()), Err(e) if e.contains("binding names no input or import \"paths\"")));
     }
 }

@@ -91,6 +91,33 @@ impl Work {
                     })
                     .collect()
             }
+            // A span enters at worker 0 alone; the others replay the command with no rows.
+            Work::Request {
+                token,
+                reqid,
+                command: Ok(PreparedCommand::Server(ServerCommand::FeedSpan { prog, input, columns, times })),
+                connection_id,
+                logical_count: _,
+            } => {
+                let logical_count = columns.len();
+                let none = (columns.select(&[]), Vec::new());
+                let mut rows = Some((columns, times));
+                (0..peers)
+                    .map(|target| {
+                        let (columns, times) = rows.take().unwrap_or_else(|| none.clone());
+                        (
+                            target as u64,
+                            Work::Request {
+                                token,
+                                reqid: reqid.clone(),
+                                command: Ok(PreparedCommand::Server(ServerCommand::FeedSpan { prog: prog.clone(), input: input.clone(), columns, times })),
+                                connection_id,
+                                logical_count: Some(logical_count),
+                            },
+                        )
+                    })
+                    .collect()
+            }
             work => (0..peers)
                 .map(|target| (target as u64, work.clone()))
                 .collect(),
@@ -267,9 +294,11 @@ fn dispatch(
     let result = match command {
         Err(error) => Err(error),
         Ok(PreparedCommand::Server(command)) => match command {
-            ServerCommand::Install { name, program } => server
-                .install(worker, &name, &program)
-                .map(|()| format!("installed {:?} ({} ops)", name, program.op_count())),
+            ServerCommand::Install { name, program, piloted } => {
+                let installed = if piloted { server.install_piloted(worker, &name, &program) } else { server.install(worker, &name, &program) };
+                // A program that reads a piloted program's output is piloted too, and is told so.
+                installed.map(|()| format!("installed {:?} ({} ops){}", name, program.op_count(), if server.is_piloted(&name) { ", piloted" } else { "" }))
+            }
             ServerCommand::Drop { name } => {
                 if tails.values().any(|tail| {
                     server
@@ -322,6 +351,26 @@ fn dispatch(
                     server.epoch()
                 )
             })),
+            // A span enters whole, at worker 0, so that it is refused whole if one of its times
+            // is before the input's frontier. Its dataflow's exchanges place each row.
+            ServerCommand::FeedSpan { prog, input, columns, times } => server.input_position(&prog, &input).and_then(|input| {
+                let result = if worker.index() == 0 { server.feed_span(&prog, input, columns, times) } else { Ok(()) };
+                result.map(|()| format!(
+                    "fed {} rows to {prog:?} input {input} at their times",
+                    logical_count.expect("a span retains its logical row count"),
+                ))
+            }),
+            // Collective: every worker moves its own handle. Nothing is waited for.
+            ServerCommand::Advance { prog, input, time } => server.input_position(&prog, &input).and_then(|input| {
+                server.advance(&prog, input, &host_time(time))?;
+                Ok(format!("advanced {prog:?} input {input} to {time}"))
+            }),
+            // Collective: every worker runs until the piloted outputs, and the tails, have caught up.
+            ServerCommand::Spin => {
+                server.spin(worker);
+                settle_tails(server, tails, worker);
+                Ok("spun".to_string())
+            }
             // Collective: every worker sources its own shard.
             ServerCommand::Load { prog, input, source, diff } => server.input_position(&prog, &input).and_then(|input| {
                 let local = server.loads_from_trace(&source);
@@ -347,12 +396,13 @@ fn dispatch(
                             reqid,
                             "data",
                             format!(
-                                "program name={:?} origin={} inputs={:?} imports={:?} exports={:?}",
+                                "program name={:?} origin={} inputs={:?} imports={:?} exports={:?}{}",
                                 program.name,
                                 program.origin,
                                 program.inputs,
                                 program.imports,
-                                program.exports
+                                program.exports,
+                                if program.piloted { " piloted" } else { "" }
                             ),
                         );
                     }
@@ -499,7 +549,7 @@ fn start_tail(
     let tag = reqid.to_string();
     let mut probe = ProbeHandle::new();
     let shutdown = interactive::server::host_dataflow(worker, |scope| {
-        let (containers, shutdown) = trace.import_containers(scope, "TailImport", server.import_as_of());
+        let (containers, shutdown) = trace.import_containers(scope, "TailImport", server.read_as_of(name));
         let pending = Arc::new(AtomicUsize::new(0));
         let (mut upper, mut dropped) = (None::<OuterTime>, false);
         containers
@@ -525,8 +575,14 @@ fn start_tail(
                     input.for_each(|_time, data| {
                         let HostContainer { keys, vals, times, diffs } = std::mem::take(data);
                         let updates = Updates { keys, vals, diffs };
-                        // A published trace's times are `(epoch, [])`: its rows go out at their epochs.
-                        let epochs = &times.raw_lanes()[..times.raw_lanes().len().min(1)];
+                        // A published trace's times are `(epoch, [])`: its rows go out at their epochs,
+                        // or for a piloted program's trace at the times its client fed them at.
+                        // Times that are all zero are stored as no lane; the frame still says them.
+                        let zeros;
+                        let epochs = match times.raw_lanes() {
+                            [] => { zeros = [vec![0; times.len()]]; &zeros[..] }
+                            lanes => &lanes[..1],
+                        };
                         match format {
                             ReadFormat::Corgi => out("data", frame::encode(&updates, epochs)),
                             ReadFormat::Columns => {
@@ -555,11 +611,12 @@ fn start_tail(
     });
 
     // A tail's acknowledgement is its initial-replay boundary. Drive the new
-    // import through the current closed epoch before returning. The response
+    // import through the current closed epoch before returning (for a piloted
+    // program's trace, through all that is complete). The response
     // channel is FIFO, so every replayed `data` message precedes dispatch's
     // terminal `ok` and later commands cannot mistake replay for fresh data.
-    let epoch = server.epoch();
-    while probe.less_than(&host_time(epoch)) {
+    let target = server.target(name)?;
+    while behind(&probe, &target) {
         worker.step();
     }
     tails.insert(
@@ -576,8 +633,20 @@ fn start_tail(
 
 fn tick(server: &mut Server, tails: &mut HashMap<TailKey, Tail>, worker: &mut Worker) {
     server.tick(worker);
-    let epoch = server.epoch();
-    while tails.values().any(|tail| tail.probe.less_than(&host_time(epoch))) {
+    settle_tails(server, tails, worker);
+}
+
+/// Whether a reader's `probe` has yet to reach `target`, the frontier of the trace it reads.
+fn behind(probe: &ProbeHandle<HostTime>, target: &timely::progress::Antichain<HostTime>) -> bool {
+    probe.with_frontier(|frontier| frontier.iter().any(|time| !target.less_equal(time)))
+}
+
+/// Run until every tail has sent the changes that the commands so far have made to its trace:
+/// those before the current epoch, or for a piloted program's trace those that are complete.
+/// So a `tick` or an `advance` is answered after the changes it made are sent.
+fn settle_tails(server: &Server, tails: &HashMap<TailKey, Tail>, worker: &mut Worker) {
+    let targets: Vec<_> = tails.values().map(|tail| (tail, server.target(&tail.trace).expect("a tailed trace is published"))).collect();
+    while targets.iter().any(|(tail, target)| behind(&tail.probe, target)) {
         worker.step();
     }
 }
